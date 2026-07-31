@@ -1,0 +1,24 @@
+{
+  "name": "angela",
+  "version": "0.0.5",
+  "private": true,
+  "type": "module",
+  "description": "Thin AGL harness: MCP tools, sessions, events (POC)",
+  "main": "src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "bin": {
+    "angela": "./bin/angela.mjs"
+  },
+  "scripts": {
+    "test": "bun test",
+    "link-global": "bun link"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.4.5",
+    "agl-ai": "file:../agl",
+    "bun-coffeescript": "^1.0.3",
+    "coffeescript": "^2.7.0"
+  }
+}

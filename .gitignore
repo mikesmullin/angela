@@ -1,0 +1,5 @@
+node_modules/
+/test/
+# Optional private plugins (symlinks to angela-plugins)
+plugins/
+
