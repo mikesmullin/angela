@@ -26,6 +26,25 @@ import {
   attachPluginModelClient,
   abortPlugins,
 } from './plugins.mjs';
+import {
+  normalizeToolsEnabled,
+  filterToolNames,
+} from './agent-loader.mjs';
+import {
+  augmentSystemPrompt,
+  normalizeReasoningEffort,
+  isGemma4Model,
+  REASONING_LEVELS,
+} from './think-augment.mjs';
+
+export {
+  augmentSystemPrompt,
+  normalizeReasoningEffort,
+  isGemma4Model,
+  REASONING_LEVELS,
+  GEMMA_REASONING_PHRASES,
+  gemma4ThinkPrefix,
+} from './think-augment.mjs';
 
 function emit(onEvent, type, data = {}) {
   const ev = { type, ts: Date.now(), ...data };
@@ -246,6 +265,12 @@ class Session {
     });
     this.#registerBuiltinTools(agent);
 
+    // Snapshot full tool registry, then apply toolsEnabled (null = all tools).
+    // Disabled tools are removed from agent.tools so they are never sent to the
+    // LLM and cannot be invoked (as if agent.Tool() was never called).
+    snapshotToolCatalog(agent);
+    applyToolsEnabledToAgent(agent, h.toolsEnabled);
+
     // Hydrate agent.context_window from jsonl only on open/resume (once).
     if (h.sessionStore && agent.retain_history && !agent._angelaCtxSeeded) {
       this.#seedAgentContext(agent, h.sessionStore);
@@ -255,6 +280,53 @@ class Session {
 
     this.#agent = agent;
     return agent;
+  }
+
+  /**
+   * Full tool catalog (all registered tools) with enabled flags for the UI.
+   * Ensures the AGL agent is created so MCP + builtins are registered.
+   * @returns {Promise<Array<{ name: string, description: string, enabled: boolean }>>}
+   */
+  async listToolCatalog() {
+    const agent = await this.#ensureAgent();
+    const catalog = agent._angelaToolCatalog || agent.tools || {};
+    const enabledSet = new Set(Object.keys(agent.tools || {}));
+    return Object.keys(catalog)
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => {
+        const fn = catalog[name];
+        return {
+          name,
+          description: fn?._description || '',
+          enabled: enabledSet.has(name),
+        };
+      });
+  }
+
+  /**
+   * Current toolsEnabled selection: null = all tools; string[] = subset.
+   * @returns {string[]|null}
+   */
+  getToolsEnabled() {
+    return this.#harness.toolsEnabled;
+  }
+
+  /**
+   * Restrict which tools exist on the live AGL agent for inference.
+   * null = enable all registered tools; array = only those names.
+   * @param {string[]|null|undefined} enabled
+   */
+  setToolsEnabled(enabled) {
+    this.#harness.setToolsEnabled(enabled);
+  }
+
+  /**
+   * Apply harness.toolsEnabled to this session's agent if already created.
+   * @param {string[]|null|undefined} enabled
+   */
+  applyToolsEnabled(enabled) {
+    if (!this.#agent) return;
+    applyToolsEnabledToAgent(this.#agent, enabled);
   }
 
   /**
@@ -1339,6 +1411,33 @@ function summarizeResult(result) {
   return String(result);
 }
 
+/**
+ * Snapshot agent.tools as the full catalog (before toolsEnabled filtering).
+ * @param {object} agent
+ */
+export function snapshotToolCatalog(agent) {
+  if (!agent || agent._angelaToolCatalog) return;
+  agent._angelaToolCatalog = { ...(agent.tools || {}) };
+}
+
+/**
+ * Rebuild agent.tools from the full catalog using toolsEnabled.
+ * @param {object} agent
+ * @param {string[]|null|undefined} enabled null/undefined = all tools
+ */
+export function applyToolsEnabledToAgent(agent, enabled) {
+  if (!agent) return;
+  snapshotToolCatalog(agent);
+  const catalog = agent._angelaToolCatalog || {};
+  const names = filterToolNames(Object.keys(catalog), enabled);
+  const next = {};
+  for (const name of names) {
+    if (catalog[name]) next[name] = catalog[name];
+  }
+  agent.tools = next;
+  agent._angelaToolsEnabled = enabled == null ? null : [...names];
+}
+
 export class Angela {
   clients = [];
   onEvent = null;
@@ -1347,11 +1446,24 @@ export class Angela {
   /** @type {SessionStore|null} */
   sessionStore = null;
   projectRoot = null;
+  /**
+   * toolsEnabled gate for inference: null = all tools; string[] = subset.
+   * UI overrides should set this via setToolsEnabled (authoritative).
+   * @type {string[]|null}
+   */
+  toolsEnabled = null;
   #config;
   #sessions = new Map();
+  /** Un-augmented system prompt (think prefix applied via #applySystemPrompt). */
+  #systemBase = null;
 
   constructor(config) {
     this.#config = config;
+    // think + reasoning_effort (Angela harness; see think-augment.mjs)
+    this.#config.think = Boolean(config.think);
+    this.#config.reasoning_effort = normalizeReasoningEffort(
+      config.reasoning_effort ?? config.reasoningEffort ?? null,
+    );
     this.onEvent = config.onEvent || null;
     this.projectRoot = resolveProjectRoot(config.projectRoot);
     ensureAngelaLayout(this.projectRoot);
@@ -1365,6 +1477,118 @@ export class Angela {
       mode: config.policyMode || 'ask',
       onEvent: (ev) => emit(this.onEvent, ev.type, ev),
     });
+    // null = all tools; string[] from agent def or UI
+    this.toolsEnabled = normalizeToolsEnabled(config.toolsEnabled);
+    if (config.system != null) this.#systemBase = String(config.system);
+  }
+
+  /**
+   * Update toolsEnabled and re-filter any live session agents.
+   * null/undefined = all tools; array/string = only those names (may be empty).
+   * @param {string[]|string|null|undefined} enabled
+   */
+  setToolsEnabled(enabled) {
+    if (enabled == null) {
+      this.toolsEnabled = null;
+    } else {
+      // Explicit selection (including []) — never collapse back to "all"
+      this.toolsEnabled = normalizeToolsEnabled(enabled) ?? [];
+    }
+    for (const session of this.#sessions.values()) {
+      try {
+        session.applyToolsEnabled?.(this.toolsEnabled);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /**
+   * Set (or replace) the base system prompt used on next Agent.factory / live agent.
+   * Think-token / Gemma effort phrases are applied on top when think is enabled.
+   * Call lazily right before session.run — e.g. to inject fresh system_time.
+   * @param {string|null|undefined} text
+   */
+  setSystemPrompt(text) {
+    this.#systemBase = text == null ? null : String(text);
+    this.#applySystemPrompt();
+  }
+
+  /**
+   * Enable/disable Gemma-4 `<|think|>` system-prompt injection (no-op for other models).
+   * @param {boolean} on
+   */
+  setThink(on) {
+    this.#config.think = Boolean(on);
+    this.#applySystemPrompt();
+  }
+
+  /** @returns {boolean} */
+  getThink() {
+    return Boolean(this.#config.think);
+  }
+
+  /**
+   * Set reasoning effort (low|medium|high|xhigh|max). Passed to AGL providers;
+   * for Gemma 4 + think, also selects the depth phrase after `<|think|>`.
+   * @param {string|null|undefined} level
+   */
+  setReasoningEffort(level) {
+    this.#config.reasoning_effort = normalizeReasoningEffort(level);
+    this.#applySystemPrompt();
+    this.#applyReasoningEffortToAgents();
+  }
+
+  /** @returns {string|null} */
+  getReasoningEffort() {
+    return this.#config.reasoning_effort ?? null;
+  }
+
+  /** @returns {string|null|undefined} augmented system prompt currently in effect */
+  getSystemPrompt() {
+    return this.#config.system;
+  }
+
+  /** @returns {string|null} base system prompt before think augmentation */
+  getSystemPromptBase() {
+    return this.#systemBase;
+  }
+
+  #applySystemPrompt() {
+    const base =
+      this.#systemBase != null
+        ? this.#systemBase
+        : this.#config.system != null
+          ? String(this.#config.system)
+          : '';
+    const augmented = augmentSystemPrompt(base, {
+      model: this.#config.model,
+      think: this.#config.think,
+      reasoning_effort: this.#config.reasoning_effort,
+    });
+    this.#config.system = augmented;
+    for (const session of this.#sessions.values()) {
+      try {
+        const agent = session.agent;
+        if (agent) {
+          agent.system_prompt = augmented || '';
+          agent.reasoning_effort = this.#config.reasoning_effort ?? null;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  #applyReasoningEffortToAgents() {
+    const effort = this.#config.reasoning_effort ?? null;
+    for (const session of this.#sessions.values()) {
+      try {
+        if (session.agent) session.agent.reasoning_effort = effort;
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   static async create(config = {}) {
@@ -1408,9 +1632,21 @@ export class Angela {
     const parsed = parseModelSpec(modelDisplay);
     const modelAgl = parsed.agl || modelDisplay;
 
-    const system =
-      this.#config.system ||
-      'You are a helpful coding assistant. Use tools when needed. Prefer concise answers.';
+    // Prefer base + augment so think/effort stay consistent with setSystemPrompt.
+    const systemBase =
+      this.#systemBase != null
+        ? this.#systemBase
+        : this.#config.system ||
+          'You are a helpful coding assistant. Use tools when needed. Prefer concise answers.';
+    if (this.#systemBase == null && this.#config.system == null) {
+      this.#systemBase = systemBase;
+    }
+    const system = augmentSystemPrompt(systemBase, {
+      model: modelDisplay,
+      think: this.#config.think,
+      reasoning_effort: this.#config.reasoning_effort,
+    });
+    this.#config.system = system;
 
     // Conversational sessions (cowork / TUI) need multi-turn context: each
     // session.run() must resend prior user/assistant/tool turns. AGL default
@@ -1430,12 +1666,15 @@ export class Angela {
     const stream =
       this.#config.stream != null ? Boolean(this.#config.stream) : streamDefault;
 
+    const reasoning_effort = this.#config.reasoning_effort ?? null;
+
     const harness = this;
     const agent = await Agent.factory({
       model: modelAgl,
       system_prompt: system,
       parallel_tools: this.#config.parallel_tools ?? true,
       stream,
+      reasoning_effort,
       // Live tokens for cowork / TUI (word-at-once). meta.channel = content|reasoning.
       on_delta: (tok, meta) => {
         const text = tok == null ? '' : String(tok);
@@ -1622,7 +1861,20 @@ export {
 } from './policy.mjs';
 
 export { ApprovalQueue } from './approval-queue.mjs';
-export { loadAgent, listAgents, resolveAgentPath } from './agent-loader.mjs';
+export {
+  loadAgent,
+  listAgents,
+  resolveAgentPath,
+  normalizeToolsEnabled,
+  filterToolNames,
+  normalizeStarters,
+  defaultAgentFields,
+  materializeAgentDef,
+  setDefaultAgent,
+  getDefaultAgentFactory,
+  invokeDefaultAgent,
+  mergeAgentDefs,
+} from './agent-loader.mjs';
 export { buildMcpPresets, resolveMcpList, defaultMcpRoot } from './mcp-presets.mjs';
 export {
   resolveProjectRoot,

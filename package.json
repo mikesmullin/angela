@@ -6,7 +6,8 @@
   "description": "Thin AGL harness: MCP tools, sessions, events (POC)",
   "main": "src/index.mjs",
   "exports": {
-    ".": "./src/index.mjs"
+    ".": "./src/index.mjs",
+    "./think": "./src/think-augment.mjs"
   },
   "bin": {
     "angela": "./bin/angela.mjs"
