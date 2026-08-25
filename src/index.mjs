@@ -93,7 +93,8 @@ export async function registerMcpTools(
   for (const client of clients) {
     const tools = await client.listTools();
     for (const t of tools) {
-      const name = prefix ? toolName(client.name, t.name) : t.name;
+      const usePrefix = client.prefix !== false && prefix !== false;
+      const name = usePrefix ? toolName(client.name, t.name) : t.name;
       const description = `[${client.name}] ${t.description || t.name}`;
       const properties = t.inputSchema?.properties || {};
       const required = t.inputSchema?.required || [];
@@ -1608,16 +1609,24 @@ export class Angela {
   async #connectMcp() {
     const list = this.#config.mcp || [];
     for (const entry of list) {
-      const client = new McpStdioClient({
-        name: entry.name,
-        command: entry.command,
-        args: entry.args || [],
-        env: entry.env || {},
-        cwd: entry.cwd,
-        onStderr: entry.onStderr,
-      });
-      await client.connect();
-      this.clients.push(client);
+      try {
+        const client = new McpStdioClient({
+          name: entry.name,
+          command: entry.command,
+          args: entry.args || [],
+          env: entry.env || {},
+          cwd: entry.cwd,
+          onStderr: entry.onStderr,
+          prefix: entry.prefix,
+          framing: entry.framing,
+        });
+        await client.connect();
+        this.clients.push(client);
+      } catch (err) {
+        console.error(
+          `angela: MCP ${entry.name || '?'} failed: ${err?.message || err}`,
+        );
+      }
     }
   }
 
@@ -1669,39 +1678,39 @@ export class Angela {
     const reasoning_effort = this.#config.reasoning_effort ?? null;
 
     const harness = this;
+    const wrappedOnDelta = (tok, meta) => {
+      const text = tok == null ? '' : String(tok);
+      if (!text) return;
+      const channel =
+        meta && typeof meta === 'object' && meta.channel
+          ? String(meta.channel)
+          : 'content';
+      try {
+        if (channel === 'reasoning') {
+          emit(harness.onEvent, 'reasoning_delta', { text });
+        } else {
+          emit(harness.onEvent, 'assistant_delta', { text });
+        }
+      } catch {
+        /* ignore */
+      }
+      try {
+        harness.#config.on_delta?.(tok, meta);
+      } catch {
+        /* ignore */
+      }
+    };
+
     const agent = await Agent.factory({
+      ...this.#config,
       model: modelAgl,
       system_prompt: system,
       parallel_tools: this.#config.parallel_tools ?? true,
       stream,
       reasoning_effort,
-      // Live tokens for cowork / TUI (word-at-once). meta.channel = content|reasoning.
-      on_delta: (tok, meta) => {
-        const text = tok == null ? '' : String(tok);
-        if (!text) return;
-        const channel =
-          meta && typeof meta === 'object' && meta.channel
-            ? String(meta.channel)
-            : 'content';
-        try {
-          if (channel === 'reasoning') {
-            emit(harness.onEvent, 'reasoning_delta', { text });
-          } else {
-            emit(harness.onEvent, 'assistant_delta', { text });
-          }
-        } catch {
-          /* ignore */
-        }
-        try {
-          harness.#config.on_delta?.(tok, meta);
-        } catch {
-          /* ignore */
-        }
-      },
+      on_delta: wrappedOnDelta,
       retain_history,
-      ...(context_window_size != null
-        ? { context_window_size }
-        : {}),
+      ...(context_window_size != null ? { context_window_size } : {}),
       ...(this.#config.output_tool ? { output_tool: this.#config.output_tool } : {}),
     });
 

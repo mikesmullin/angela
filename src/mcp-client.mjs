@@ -11,13 +11,17 @@ export class McpStdioClient {
   #name;
   #onStderr;
 
-  constructor({ name, command, args = [], env = {}, cwd, onStderr } = {}) {
+  constructor({ name, command, args = [], env = {}, cwd, onStderr, prefix, framing } = {}) {
     this.#name = name || 'mcp';
     this.#onStderr = onStderr;
     this.command = command;
     this.args = args;
     this.env = env;
     this.cwd = cwd;
+    /** When false, register tools under the MCP name as-is (no server__ prefix). */
+    this.prefix = prefix !== false;
+    /** `newline` = ada/file-io kit; `lsp` = official MCP SDK Content-Length. */
+    this.framing = framing === 'lsp' ? 'lsp' : 'newline';
   }
 
   get name() {
@@ -49,11 +53,18 @@ export class McpStdioClient {
       this.#proc = null;
     });
 
-    await this.#request('initialize', {
+    const init = this.#request('initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
       clientInfo: { name: 'angela', version: '0.0.1' },
     });
+    const timeout = new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error(`MCP ${this.#name} initialize timed out`)),
+        15000,
+      );
+    });
+    await Promise.race([init, timeout]);
     this.#notify('notifications/initialized', {});
   }
 
@@ -87,26 +98,69 @@ export class McpStdioClient {
 
   #onData(chunk) {
     this.#buffer += chunk;
+    if (this.framing === 'lsp') this.#drainLsp();
+    else this.#drainNewlines();
+  }
+
+  #handleMsg(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.id !== undefined && this.#pending.has(msg.id)) {
+      const p = this.#pending.get(msg.id);
+      this.#pending.delete(msg.id);
+      if (msg.error) {
+        p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+      } else {
+        p.resolve(msg.result);
+      }
+    }
+  }
+
+  #drainNewlines() {
     let idx;
     while ((idx = this.#buffer.indexOf('\n')) !== -1) {
       const line = this.#buffer.slice(0, idx).replace(/\r$/, '');
       this.#buffer = this.#buffer.slice(idx + 1);
       if (!line.trim()) continue;
-      let msg;
       try {
-        msg = JSON.parse(line);
+        this.#handleMsg(JSON.parse(line));
       } catch {
+        /* ignore partial/junk */
+      }
+    }
+  }
+
+  #drainLsp() {
+    while (true) {
+      const sep = this.#buffer.indexOf('\r\n\r\n');
+      if (sep < 0) return;
+      const header = this.#buffer.slice(0, sep);
+      const m = /Content-Length:\s*(\d+)/i.exec(header);
+      if (!m) {
+        this.#buffer = this.#buffer.slice(sep + 4);
         continue;
       }
-      if (msg.id !== undefined && this.#pending.has(msg.id)) {
-        const p = this.#pending.get(msg.id);
-        this.#pending.delete(msg.id);
-        if (msg.error) {
-          p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
-        } else {
-          p.resolve(msg.result);
-        }
+      const len = Number(m[1]);
+      const start = sep + 4;
+      if (this.#buffer.length < start + len) return;
+      const body = this.#buffer.slice(start, start + len);
+      this.#buffer = this.#buffer.slice(start + len);
+      try {
+        this.#handleMsg(JSON.parse(body));
+      } catch {
+        /* ignore */
       }
+    }
+  }
+
+  #writeMsg(obj) {
+    if (!this.#proc) return;
+    const json = JSON.stringify(obj);
+    if (this.framing === 'lsp') {
+      const body = Buffer.from(json, 'utf8');
+      this.#proc.stdin.write(`Content-Length: ${body.length}\r\n\r\n`);
+      this.#proc.stdin.write(body);
+    } else {
+      this.#proc.stdin.write(json + '\n');
     }
   }
 
@@ -116,13 +170,12 @@ export class McpStdioClient {
     const payload = { jsonrpc: '2.0', id, method, params };
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
-      this.#proc.stdin.write(JSON.stringify(payload) + '\n');
+      this.#writeMsg(payload);
     });
   }
 
   #notify(method, params) {
-    if (!this.#proc) return;
-    this.#proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
+    this.#writeMsg({ jsonrpc: '2.0', method, params });
   }
 }
 

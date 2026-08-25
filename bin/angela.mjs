@@ -24,7 +24,8 @@ function usage(code = 0) {
 
 Usage:
   angela [options] [prompt...]
-  angela clean [-c path]          remove .angela/sessions/*
+  angela serve [-c path] [--port 8763]   HTTP chat API for gl1 / clients
+  angela clean [-c path]                 remove .angela/sessions/*
 
 Project root (-c / cwd):
   Controls where .angela/ lives (agents + sessions) and the default
@@ -47,12 +48,14 @@ Options:
   --approve                interactive approval
   --approve=auto|deny
   --allowlist <file>
+  --port <n>               serve port (default 8763 / ANGELA_PORT)
   -j, --jsonl
   -h, --help
   -V, --version
 
 Examples:
   cd /path/to/project && angela -a my-agent -t
+  angela serve -c /path/to/project
   angela -c /path/to/project -a my-agent -t "list files in the project"
   angela clean -c /path/to/project
 `;
@@ -77,6 +80,8 @@ function parseArgs(argv) {
     setSystem: false,
     setMcp: false,
     clean: false,
+    serve: false,
+    port: null,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -88,6 +93,14 @@ function parseArgs(argv) {
     }
     if (a === 'clean') {
       opts.clean = true;
+      continue;
+    }
+    if (a === 'serve') {
+      opts.serve = true;
+      continue;
+    }
+    if (a === '--port') {
+      opts.port = Number(argv[++i]);
       continue;
     }
     if (a === '-c' || a === '--config') {
@@ -394,6 +407,18 @@ async function main() {
     const store = new SessionStore(root);
     const n = store.clean();
     console.log(`angela clean: removed ${n} file(s) under ${store.dir}`);
+    return;
+  }
+
+  if (opts.serve) {
+    const { startServe } = await import('../src/serve.mjs');
+    const root = resolveProjectRoot(opts.configPath);
+    startServe({
+      projectRoot: root,
+      port: opts.port || Number(process.env.ANGELA_PORT || 8763),
+      host: process.env.ANGELA_HOST || '127.0.0.1',
+    });
+    // Keep process alive (Bun.serve holds the event loop).
     return;
   }
 
