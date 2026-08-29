@@ -217,6 +217,11 @@ term_local__exec:echo.*
 term_local__exec:pwd
 term_local__exec:true
 term_local__exec:ls.*
+
+# CONTEXT LOOP (mcp-context-loop) — not enabled by default.
+# Add preset context-loop to the agent mcp list, then uncomment:
+# goto
+# loop_start_marker
 `.trim();
 
 export default { isAllowed, regexFull, DEFAULT_LUCY_ALLOWLIST };

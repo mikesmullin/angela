@@ -3,9 +3,10 @@
  * Core package only ships local servers. Remote presets come from plugins.
  *
  * MCP script discovery (first hit wins) — no hard-coded machine paths required:
- *   1. $ANGELA_MCP_ROOT/{file-io,term-local}/server.mjs
+ *   1. $ANGELA_MCP_ROOT/{file-io,term-local,context-loop}/server.mjs
  *   2. Sibling monorepo: <angela>/../mcp/{file-io,term-local}/server.mjs
- *   3. Standalone packages: <angela>/../mcp-file-io/server.mjs (file-io only)
+ *   3. Standalone packages: <angela>/../mcp-file-io/server.mjs,
+ *      <angela>/../mcp-context-loop/server.mjs
  *   4. node_modules: @mikesmullin/mcp-file-io or mcp-file-io
  *   5. Legacy: /workspace/mcp (devcontainer convenience only)
  */
@@ -108,6 +109,18 @@ export function resolveMcpServerScript(preset) {
       candidates.push(join(root, 'term-local/server.mjs'));
     }
     candidates.push(resolve(ANGELA_PKG_ROOT, '../mcp-term-local/server.mjs'));
+  } else if (preset === 'context-loop') {
+    for (const root of mcpRootCandidates()) {
+      candidates.push(join(root, 'context-loop/server.mjs'));
+    }
+    candidates.push(resolve(ANGELA_PKG_ROOT, '../mcp-context-loop/server.mjs'));
+    candidates.push(resolve(process.cwd(), '../mcp-context-loop/server.mjs'));
+    candidates.push(
+      resolve(process.cwd(), 'node_modules/@mikesmullin/mcp-context-loop/server.mjs'),
+    );
+    candidates.push(
+      resolve(ANGELA_PKG_ROOT, 'node_modules/@mikesmullin/mcp-context-loop/server.mjs'),
+    );
   } else {
     // Generic: $root/<preset>/server.mjs
     for (const root of mcpRootCandidates()) {
@@ -158,6 +171,7 @@ export function buildMcpPresets(mcpRoot = defaultMcpRoot(), opts = {}) {
 
   const fileIoScript = resolveMcpServerScript('file-io');
   const termLocalScript = resolveMcpServerScript('term-local');
+  const contextLoopScript = resolveMcpServerScript('context-loop');
 
   const base = {
     'file-io': {
@@ -174,6 +188,18 @@ export function buildMcpPresets(mcpRoot = defaultMcpRoot(), opts = {}) {
       command: bun,
       args: [termLocalScript || join(mcpRoot, 'term-local/server.mjs')],
       env: termLocalEnv,
+    },
+    // Opt-in CONTEXT LOOP tools (goto / loop_start_marker). Not in default
+    // agent mcp lists or DEFAULT_LUCY_ALLOWLIST. prefix:false so the model
+    // still sees tool names `goto` and `loop_start_marker`.
+    'context-loop': {
+      name: 'context-loop',
+      command: bun,
+      args: [
+        contextLoopScript || join(mcpRoot, 'context-loop/server.mjs'),
+      ],
+      env: {},
+      prefix: false,
     },
   };
 
@@ -227,7 +253,7 @@ export function resolveMcpList(list = [], presets = buildMcpPresets()) {
       }
       // Re-resolve script path in case presets were built before install.
       const script =
-        (item === 'file-io' || item === 'term-local'
+        (item === 'file-io' || item === 'term-local' || item === 'context-loop'
           ? resolveMcpServerScript(item)
           : null) || p.args?.[0];
       if (!script || !existsSync(script)) {

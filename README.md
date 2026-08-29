@@ -33,32 +33,50 @@ Override with **`-c` / `--config <path>`**.
 | Path | Role |
 |------|------|
 | `.angela/agents/` | Agent definition files (`-a`) |
-| `.angela/sessions/<id>.json` | Session **metadata only** (agent, model, turns, status — no transcript) |
-| `.angela/sessions/<id>.jsonl` | Append-only **wrapped** events (context window + provider I/O + tools) |
+| `.angela/sessions/<id>.json` | Session **metadata only** (agent, model, turns, status, `logEncoding` — no transcript) |
+| `.angela/sessions/<id>.jsonl` | Append-only **delta** event log (one line per new item; no full-window snapshots) |
 | project root | Default jail for local `file-io` / just-bash (`MCP_FILE_ROOT`) |
 
 #### Session JSONL event shape
 
-Each line is a **wrapper** around a verbatim payload (telemetry stays outside `payload`):
+New sessions stamp `logEncoding: "delta/v1"` on the metadata JSON. Each jsonl line is a wrapper; the transcript is **incremental** (each message / tool / schema stored once). Full `messages[]` windows are not written.
 
 ```json
 {
+  "event_id": "e1a2b3",
   "ts": "2026-07-30T01:00:00.000Z",
-  "event_type": "context_window | provider_request | provider_response | tool_call | tool_result | …",
+  "event_type": "context_window | provider_request | provider_response | tool_call | tool_result | system | tools | context_meta | …",
   "duration_ms": 412.5,
-  "payload": { }
+  "payload": { },
+  "meta": { "visible": true }
 }
 ```
 
 Line order is the event sequence; session id is the filename (`<id>.jsonl`), not repeated per line.
 
-| `event_type` | `payload` (verbatim / unpolluted) |
-|--------------|-------------------------------------|
-| `context_window` | Chat message or messages snapshot for the model |
-| `provider_request` | Exact body passed to the AI provider `inference()` |
-| `provider_response` | Exact provider response (or error object); `duration_ms` on wrapper |
+| `event_type` | `payload` |
+|--------------|-----------|
+| `context_window` | **One** chat message (`role` + `content`). Not a full-window snapshot. |
+| `system` / `tools` | System prompt / tool schemas, written **once** (again only if they change). |
+| `provider_request` | Round header + delta refs (`message_event_ids`, `messages_count`, `system_event_id`, `tools_event_id`). Rebuild the wire body with `SessionStore.reconstructProviderRequest`. |
+| `provider_response` | Provider response (or error object); `duration_ms` on wrapper |
 | `tool_call` / `tool_result` / `policy` | Harness event objects |
-| `session` | Lifecycle (`created`, `turn_complete`, `aborted`) |
+| `context_meta` | Visibility / goto patch (`event_ids` + `visible` / `goto`). Last-write-wins; original lines are not rewritten. |
+| `session` | Lifecycle (`created`, `turn_complete`, `aborted`, `replaced`) |
+
+Full-window snapshots (`kind: "provider_messages_snapshot"`) are **not** written. Set `ANGELA_LOG_SNAPSHOTS=1` only when debugging a single session.
+
+Older logs without `logEncoding` still open: readers skip snapshots if present and treat a `provider_request` that still has `payload.messages` as verbatim.
+
+### Slash commands
+
+The harness intercepts these as the **entire** trimmed user prompt (case-insensitive). They never reach the model.
+
+| Prompt | Effect |
+|--------|--------|
+| `/new` | Close the current session (`status: closed`, jsonl `replaced`) and start a **new empty** session. `session.run` returns `{ command: 'new', sessionId, previousId, session }`. Callers must switch to `result.session`. |
+
+Trailing words (`/new foo`) are a normal prompt, not a command.
 
 ```bash
 cd /path/to/project
@@ -127,6 +145,20 @@ export default function createAgent(ctx) {
 |------|---------|
 | `file-io` | Local files (jailed to project root) |
 | `term-local` | Local just-bash + host `exec` |
+| `context-loop` | **Opt-in.** `goto` + `loop_start_marker` (CONTEXT LOOP). Calls angela's session host to mutate the context window. Not on new agents or `DEFAULT_LUCY_ALLOWLIST`. |
+
+Add CONTEXT LOOP only when you want it:
+
+```coffee
+mcp: ['file-io', 'term-local', 'context-loop']
+allowlist: '''
+  …
+  goto
+  loop_start_marker
+'''
+```
+
+Sibling package: [`mcp-context-loop`](../mcp-context-loop). Angela exposes `session.applyGoto` / `session.applyLoopStartMarker` over `ANGELA_HOST_SOCK`.
 
 Optional **private plugins** under `angela/plugins/*` (gitignored) may register additional presets, model hosts, and AGENTS.md backends. See sibling `angela-plugins` if you maintain private extensions.
 

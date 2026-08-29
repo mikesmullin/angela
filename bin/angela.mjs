@@ -386,6 +386,10 @@ async function runPlain(opts, cfg) {
 
   try {
     const result = await session.run({ prompt: opts.prompt });
+    if (result?.command === 'new') {
+      process.stdout.write(`new session ${result.sessionId}\n`);
+      return;
+    }
     const text =
       typeof result === 'string'
         ? result

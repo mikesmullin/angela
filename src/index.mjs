@@ -27,6 +27,10 @@ import {
   abortPlugins,
 } from './plugins.mjs';
 import {
+  startContextHost,
+  isContextLoopNavToolName,
+} from './context-host.mjs';
+import {
   normalizeToolsEnabled,
   filterToolNames,
 } from './agent-loader.mjs';
@@ -45,6 +49,18 @@ export {
   GEMMA_REASONING_PHRASES,
   gemma4ThinkPrefix,
 } from './think-augment.mjs';
+
+/**
+ * Slash commands the harness handles itself (never sent to the model).
+ * `/new` is the whole trimmed prompt (case-insensitive). Trailing words are not a command.
+ * @param {unknown} prompt
+ * @returns {{ command: 'new' } | null}
+ */
+export function parseSessionCommand(prompt) {
+  const t = String(prompt ?? '').trim();
+  if (/^\/new$/i.test(t)) return { command: 'new' };
+  return null;
+}
 
 function emit(onEvent, type, data = {}) {
   const ev = { type, ts: Date.now(), ...data };
@@ -264,7 +280,6 @@ class Session {
       },
       policy: h.policy,
     });
-    this.#registerBuiltinTools(agent);
 
     // Snapshot full tool registry, then apply toolsEnabled (null = all tools).
     // Disabled tools are removed from agent.tools so they are never sent to the
@@ -285,7 +300,7 @@ class Session {
 
   /**
    * Full tool catalog (all registered tools) with enabled flags for the UI.
-   * Ensures the AGL agent is created so MCP + builtins are registered.
+   * Ensures the AGL agent is created so MCP tools are registered.
    * @returns {Promise<Array<{ name: string, description: string, enabled: boolean }>>}
    */
   async listToolCatalog() {
@@ -331,193 +346,18 @@ class Session {
   }
 
   /**
-   * Native harness tools (all agents) — not MCP.
-   * `goto(label)`: hide every context_window item after the named bookmark.
-   * `loop_start_marker(label)`: enable/move that bookmark on the previous item.
-   */
-  #registerBuiltinTools(agent) {
-    if (!agent || agent._angelaBuiltins) return;
-    agent._angelaBuiltins = true;
-    const session = this;
-    const h = this.#harness;
-
-    /** Emit tool_call/tool_result like MCP tools so cowork UI shows cards + jsonl. */
-    const wrapBuiltin = (name, fn) => async (_ctx, args) => {
-      const raw = args && typeof args === 'object' ? { ...args } : {};
-      const evCall = {
-        type: 'tool_call',
-        server: 'angela',
-        tool: name,
-        name,
-        args: raw,
-      };
-      session.#turnEvents.push(evCall);
-      session.#onHarnessToolEvent(agent, h, evCall);
-      emit(h.onEvent, 'tool_call', evCall);
-      try {
-        const text = await fn(raw);
-        const out = text == null ? '' : String(text);
-        const evRes = {
-          type: 'tool_result',
-          server: 'angela',
-          tool: name,
-          name,
-          ok: !String(out).startsWith(`${name}: error`),
-          text: out,
-          full_chars: out.length,
-          truncated: false,
-        };
-        session.#turnEvents.push(evRes);
-        session.#onHarnessToolEvent(agent, h, evRes);
-        emit(h.onEvent, 'tool_result', evRes);
-        return out;
-      } catch (err) {
-        const msg = err?.message || String(err);
-        const evRes = {
-          type: 'tool_result',
-          server: 'angela',
-          tool: name,
-          name,
-          ok: false,
-          text: `${name}: error — ${msg}`,
-          full_chars: msg.length,
-          truncated: false,
-        };
-        session.#turnEvents.push(evRes);
-        session.#onHarnessToolEvent(agent, h, evRes);
-        emit(h.onEvent, 'tool_result', evRes);
-        return evRes.text;
-      }
-    };
-
-    agent.Tool(
-      'goto',
-      [
-        'CONTEXT LOOP — end of ONE list iteration (loop back-edge).',
-        'Call right after finishing the single unit of work from the latest',
-        'loop_start_marker playbook. Fill EVERY required field with honest',
-        'status for this iteration — the tool response is a plain-English brief',
-        'that primes the NEXT completion (this goto call+result stay visible;',
-        'prior tool noise after the marker is hidden).',
-        'Humans may say: "use CONTEXT LOOP strategy".',
-      ].join('\n'),
-      {
-        label: {
-          type: 'string',
-          description:
-            'Exact label from loop_start_marker (e.g. FRUIT_LOOP). Case-insensitive.',
-        },
-        last_item_attempted: {
-          type: 'string',
-          description:
-            'Which list unit you just tried (e.g. fruit name "nectarine", or line 12).',
-        },
-        last_item_success: {
-          type: 'boolean',
-          description:
-            'true if that unit fully succeeded; false if denied, failed, or skipped.',
-        },
-        items_processed: {
-          type: 'integer',
-          description:
-            'How many units are DONE so far (including this one if successful). Count from source of truth if unsure.',
-        },
-        items_remaining: {
-          type: 'integer',
-          description:
-            'How many units still need work after this iteration (0 if done).',
-        },
-        next_item: {
-          type: 'string',
-          description:
-            'Which unit should be processed next (name/id), or "none" if items_remaining is 0.',
-        },
-        learnings: {
-          type: 'string',
-          description:
-            'Carry-over notes for the next iteration (commands that worked, denials, ' +
-            'sed syntax, edge cases). Empty string if nothing special.',
-        },
-      },
-      [
-        'label',
-        'last_item_attempted',
-        'last_item_success',
-        'items_processed',
-        'items_remaining',
-        'next_item',
-        'learnings',
-      ],
-      wrapBuiltin('goto', (raw) => session.applyGoto(raw)),
-    );
-    agent.Tool(
-      'loop_start_marker',
-      [
-        'CONTEXT LOOP — open (or re-open) one iteration of a list job.',
-        '',
-        'Name: **CONTEXT LOOP** — iterate unbounded lists with a fixed chat context',
-        'by marking a resume point, doing ONE item, then goto(label). Humans may say:',
-        '"use CONTEXT LOOP strategy to iterate this list."',
-        '',
-        'Fill EVERY required field honestly for THIS job. The tool response is a',
-        'ready-made playbook (boilerplate) you MUST follow for this iteration — you',
-        'do not need to invent the protocol; just call this successfully, then obey',
-        'the returned steps, and call goto(label) when the one item is done.',
-        '',
-        'Call at the top of each iteration (before processing the next item). Same',
-        'label again is re-entrant: moves the marker forward. Not a substitute for goto.',
-      ].join('\n'),
-      {
-        label: {
-          type: 'string',
-          description:
-            'Stable CONTEXT LOOP name you will pass to goto after each item ' +
-            '(e.g. FRUIT_LOOP). Reuse every iteration.',
-        },
-        source_of_truth: {
-          type: 'string',
-          description:
-            'Where the live list/state lives — re-read this every iteration ' +
-            '(e.g. path `./tmp/items`, or a query). Never rely on memory alone after goto.',
-        },
-        unit_of_work: {
-          type: 'string',
-          description:
-            'What exactly ONE iteration processes (e.g. "one line of ./tmp/items ' +
-            'that still lacks a sha1 suffix"). Must be a single unit, not the whole list.',
-        },
-        item_action: {
-          type: 'string',
-          description:
-            'What to do to that one unit (e.g. "sha1sum the fruit name and sed -i ' +
-            'update that line"). Keep it to one item.',
-        },
-        done_when: {
-          type: 'string',
-          description:
-            'How a FRESH read of source_of_truth shows the job is complete ' +
-            '(e.g. "every non-empty line ends with a 40-char hex digest").',
-        },
-      },
-      ['label', 'source_of_truth', 'unit_of_work', 'item_action', 'done_when'],
-      wrapBuiltin('loop_start_marker', (raw) =>
-        session.applyLoopStartMarker(raw),
-      ),
-    );
-  }
-
-  /**
    * CONTEXT LOOP nav row? (goto / loop_start_marker tool calls + results)
    * @param {object} m
    */
   #isContextLoopNavRow(m) {
     if (!m || typeof m !== 'object') return false;
-    const nav = new Set(['goto', 'loop_start_marker', 'waypoint']);
     if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-      return m.tool_calls.every((tc) => nav.has(tc?.function?.name));
+      return m.tool_calls.every((tc) =>
+        isContextLoopNavToolName(tc?.function?.name),
+      );
     }
     if (m.role === 'tool') {
-      return nav.has(m.name);
+      return isContextLoopNavToolName(m.name);
     }
     return false;
   }
@@ -748,12 +588,7 @@ class Session {
       const isNavTool =
         m?.role === 'assistant' &&
         names.length > 0 &&
-        names.every(
-          (n) =>
-            n === 'loop_start_marker' ||
-            n === 'waypoint' || // legacy name
-            n === 'goto',
-        );
+        names.every((n) => isContextLoopNavToolName(n));
       if (isNavTool) {
         i--;
         continue;
@@ -793,7 +628,7 @@ class Session {
     }
     const store = this.#harness.sessionStore;
     if (store) {
-      for (const wrap of store.listEvents(this.#id)) {
+      for (const wrap of store.listEventsFolded(this.#id)) {
         const g = wrap.meta?.goto;
         if (!g?.enabled) continue;
         const existingLab = String(g.label || '').trim();
@@ -931,7 +766,9 @@ class Session {
       payload: ev,
       meta: {
         visible: true,
-        ...(snap ? { telemetry: snap } : {}),
+        ...(snap?.gen_info_event_id
+          ? { gen_info_event_id: snap.gen_info_event_id }
+          : {}),
       },
     });
     if (wrap?.event_id) ev.event_id = wrap.event_id;
@@ -1137,7 +974,7 @@ class Session {
     if (!want) return true;
     const store = this.#harness.sessionStore;
     if (!store) return true;
-    for (const wrap of store.listEvents(this.#id)) {
+    for (const wrap of store.listEventsFolded(this.#id)) {
       const g = wrap.meta?.goto;
       if (!g?.enabled) continue;
       const lab = String(g.label || '')
@@ -1155,8 +992,55 @@ class Session {
     return this.#agent;
   }
 
+  /**
+   * `/new` (whole prompt): close this session and return a fresh empty one.
+   * Callers must switch to `result.session` — this object is the previous session.
+   */
+  async #replaceWithEmptySession() {
+    if (this.#running || this.#agent) {
+      try {
+        await this.abort('new session');
+      } catch {
+        /* ignore */
+      }
+    }
+    const store = this.#harness.sessionStore;
+    store?.appendEvent(this.#id, {
+      event_type: 'session',
+      payload: { kind: 'replaced', command: '/new' },
+    });
+    store?.setStatus(this.#id, 'closed');
+    let title = null;
+    try {
+      title = store?.load(this.#id)?.title || null;
+    } catch {
+      /* ignore */
+    }
+    const next = await this.#harness.session.create({ title });
+    emit(this.#harness.onEvent, 'session_new', {
+      command: 'new',
+      sessionId: next.id,
+      previousId: this.#id,
+    });
+    emit(this.#harness.onEvent, 'status', {
+      sessionId: next.id,
+      phase: 'ready',
+      previousId: this.#id,
+    });
+    return {
+      command: 'new',
+      sessionId: next.id,
+      previousId: this.#id,
+      session: next,
+    };
+  }
+
   async run({ prompt, maxTurns, ...ctx } = {}) {
     if (!prompt) throw new Error('session.run requires prompt');
+    const cmd = parseSessionCommand(prompt);
+    if (cmd?.command === 'new') {
+      return this.#replaceWithEmptySession();
+    }
     const agent = await this.#ensureAgent();
     this.#running = true;
     this._aborted = false;
@@ -1362,6 +1246,7 @@ class Session {
  */
 function summarizeResult(result) {
   if (result == null) return '';
+  if (typeof result === 'object' && result.command) return '';
   if (typeof result === 'string') {
     // Guard: if someone already stringified a provider response, don't show it.
     const t = result.trim();
@@ -1457,6 +1342,8 @@ export class Angela {
   #sessions = new Map();
   /** Un-augmented system prompt (think prefix applied via #applySystemPrompt). */
   #systemBase = null;
+  /** @type {{ path: string, close: () => void }|null} */
+  #contextHost = null;
 
   constructor(config) {
     this.#config = config;
@@ -1596,6 +1483,7 @@ export class Angela {
     // Optional private plugins (angela/plugins/*) — no-op if absent
     await loadPlugins();
     const inst = new Angela(config);
+    inst.#contextHost = await startContextHost(inst);
     await inst.#connectMcp();
     emit(inst.onEvent, 'session_init', {
       mcpServers: inst.clients.map((c) => c.name),
@@ -1606,15 +1494,37 @@ export class Angela {
     return inst;
   }
 
+  /**
+   * Session whose agent loop is running, else the most recently created one.
+   * Used by the context-loop MCP host to route goto / loop_start_marker.
+   */
+  activeSession() {
+    for (const s of this.#sessions.values()) {
+      if (s.running) return s;
+    }
+    const ids = [...this.#sessions.keys()];
+    if (!ids.length) return null;
+    return this.#sessions.get(ids[ids.length - 1]) || null;
+  }
+
+  /** Unix socket path for optional MCP context-window calls (`ANGELA_HOST_SOCK`). */
+  get contextHostPath() {
+    return this.#contextHost?.path || null;
+  }
+
   async #connectMcp() {
     const list = this.#config.mcp || [];
+    const hostSock = this.#contextHost?.path || '';
     for (const entry of list) {
       try {
         const client = new McpStdioClient({
           name: entry.name,
           command: entry.command,
           args: entry.args || [],
-          env: entry.env || {},
+          env: {
+            ...(entry.env || {}),
+            ...(hostSock ? { ANGELA_HOST_SOCK: hostSock } : {}),
+          },
           cwd: entry.cwd,
           onStderr: entry.onStderr,
           prefix: entry.prefix,
@@ -1856,6 +1766,12 @@ export class Angela {
   async close() {
     await Promise.all(this.clients.map((c) => c.close()));
     this.clients = [];
+    try {
+      this.#contextHost?.close();
+    } catch {
+      /* ignore */
+    }
+    this.#contextHost = null;
   }
 }
 
@@ -1884,7 +1800,12 @@ export {
   invokeDefaultAgent,
   mergeAgentDefs,
 } from './agent-loader.mjs';
-export { buildMcpPresets, resolveMcpList, defaultMcpRoot } from './mcp-presets.mjs';
+export {
+  buildMcpPresets,
+  resolveMcpList,
+  defaultMcpRoot,
+  resolveMcpServerScript,
+} from './mcp-presets.mjs';
 export {
   resolveProjectRoot,
   ensureAngelaLayout,
@@ -1895,6 +1816,9 @@ export {
   SessionStore,
   extractUsage,
   extractFinishReason,
+  foldEventMetas,
+  eventToProviderMessage,
+  logSnapshotsEnabled,
 } from './session-store.mjs';
 export {
   resolveContextWindow,
@@ -1905,5 +1829,9 @@ export {
   registerRemoteModelHosts,
 } from './model-spec.mjs';
 export { loadPlugins, getPlugins } from './plugins.mjs';
+export {
+  startContextHost,
+  isContextLoopNavToolName,
+} from './context-host.mjs';
 
 export default Angela;

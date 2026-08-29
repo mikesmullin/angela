@@ -6,35 +6,31 @@
  *   <id>.json   — **metadata only** (no context-window / transcript body)
  *   <id>.jsonl  — append-only **wrapped** events
  *
- * JSONL line shape (wrapper keeps telemetry out of the verbatim payload):
+ * JSONL line shape (wrapper keeps telemetry out of the payload):
  *
  *   {
  *     "event_id": "e1a2b3",
  *     "ts": "ISO-8601",
  *     "event_type": "context_window" | "provider_request" | "provider_response"
  *                 | "tool_call" | "tool_result" | "policy" | "session" | "error"
- *                 | "usage" | "gen_info" | …,
+ *                 | "usage" | "gen_info" | "system" | "tools" | "context_meta" | …,
  *     "duration_ms": 12.4 | null,
- *     "payload": { … verbatim original … },
+ *     "payload": { … },
  *     "meta": {
  *       "visible": true,           // context_window: include in next provider request
- *       "telemetry": {             // gen stats for assistant turns / provider rounds
- *         "completion_tokens": 947,
- *         "tok_per_sec": 59.94,
- *         "ttft_ms": 130,
- *         "duration_ms": 15800,
- *         "finish_reason": "stop",
- *         "stop_reason": null,
- *         "error": null
- *       }
+ *       "telemetry": { … }         // gen stats (gen_info + the round's assistant/reasoning)
  *     }
  *   }
  *
- * Line order is the event sequence; session id is the filename stem (not repeated).
+ * Encoding (`logEncoding: "delta/v1"` on the session JSON):
+ *   Each transcript item is stored once (context_window / tool_call / tool_result).
+ *   system prompt + tool schemas are written once (re-emitted only on change).
+ *   provider_request stores headers + event_id pointers, not messages[].
+ *   Full-window snapshots are not written (ANGELA_LOG_SNAPSHOTS=1 to dump them).
+ *   Visibility / goto patches append context_meta (last-write-wins); the original
+ *   line is not rewritten.
  *
- * - context_window  → payload is a chat message (or messages[]) as used for the model
- * - provider_*      → payload is the exact object passed to / returned from the AI provider
- * - other harness events keep their natural payload under `payload`
+ * Line order is the event sequence; session id is the filename stem (not repeated).
  *
  * `angela clean` removes `.angela/sessions/*`
  */
@@ -48,7 +44,7 @@ import {
   writeFileSync,
   readFileSync,
 } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { sessionsDir, ensureAngelaLayout } from './project.mjs';
 
 function nowIso() {
@@ -72,6 +68,124 @@ function safeClone(value) {
       return { _unserializable: String(value) };
     }
   }
+}
+
+function stableHash(value) {
+  try {
+    return createHash('sha256')
+      .update(typeof value === 'string' ? value : JSON.stringify(value ?? null))
+      .digest('hex')
+      .slice(0, 16);
+  } catch {
+    return null;
+  }
+}
+
+/** Debug dumps of the full provider messages[] window. Default off. */
+export function logSnapshotsEnabled() {
+  const v = String(process.env.ANGELA_LOG_SNAPSHOTS || '')
+    .trim()
+    .toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+/**
+ * Fold append-only `context_meta` patches onto earlier events (last-write-wins).
+ * Raw jsonl lines are unchanged; this is the read view for visible/goto.
+ * @param {object[]} events
+ * @returns {object[]}
+ */
+export function foldEventMetas(events) {
+  if (!Array.isArray(events) || !events.length) return events || [];
+  /** @type {Map<string, object>} */
+  const extra = new Map();
+  for (const wrap of events) {
+    if (wrap?.event_type !== 'context_meta') continue;
+    const p = wrap.payload && typeof wrap.payload === 'object' ? wrap.payload : {};
+    const ids = Array.isArray(p.event_ids)
+      ? p.event_ids
+      : p.event_id
+        ? [p.event_id]
+        : [];
+    const { event_id: _eid, event_ids: _eids, ...rest } = p;
+    if (!Object.keys(rest).length) continue;
+    for (const eid of ids) {
+      if (!eid) continue;
+      extra.set(String(eid), { ...(extra.get(String(eid)) || {}), ...rest });
+    }
+  }
+  if (!extra.size) return events;
+  return events.map((wrap) => {
+    const eid = wrap?.event_id;
+    const patch = eid ? extra.get(String(eid)) : null;
+    if (!patch) return wrap;
+    const meta = { ...(wrap.meta || {}), ...patch };
+    if (Object.prototype.hasOwnProperty.call(patch, 'visible')) {
+      meta.visible = Boolean(patch.visible);
+    }
+    return { ...wrap, meta };
+  });
+}
+
+/**
+ * Map one jsonl event to an OpenAI-shaped chat message (for request reconstruct).
+ * @param {object} wrap
+ * @returns {object|null}
+ */
+export function eventToProviderMessage(wrap) {
+  if (!wrap) return null;
+  const p = wrap.payload;
+  if (!p || typeof p !== 'object') return null;
+  if (wrap.event_type === 'system' && p.content != null) {
+    return { role: 'system', content: String(p.content) };
+  }
+  if (
+    wrap.event_type === 'context_window' &&
+    p.role &&
+    p.content != null &&
+    p.kind !== 'provider_messages_snapshot'
+  ) {
+    const msg = { role: p.role, content: String(p.content) };
+    if (p.role === 'assistant' && Array.isArray(p.tool_calls) && p.tool_calls.length) {
+      msg.tool_calls = p.tool_calls;
+      if (!msg.content) msg.content = '';
+    }
+    if (p.role === 'tool' && (p.tool_call_id || p.id)) {
+      msg.tool_call_id = p.tool_call_id || p.id;
+    }
+    return msg;
+  }
+  if (wrap.event_type === 'tool_call' && p.name) {
+    const callId = p.id || p.tool_call_id || wrap.event_id;
+    const args =
+      typeof p.args === 'string' ? p.args : JSON.stringify(p.args ?? {});
+    return {
+      role: 'assistant',
+      content: '',
+      tool_calls: [
+        {
+          id: callId,
+          type: 'function',
+          function: { name: p.name, arguments: args },
+        },
+      ],
+    };
+  }
+  if (
+    wrap.event_type === 'tool_result' &&
+    (p.name || p.text != null || p.content != null)
+  ) {
+    const callId =
+      p.tool_call_id || p.id || p.call_id || wrap.event_id;
+    const content =
+      p.text != null
+        ? String(p.text)
+        : typeof p.content === 'string'
+          ? p.content
+          : JSON.stringify(p.content ?? p);
+    return { role: 'tool', tool_call_id: callId, content };
+  }
+  return null;
 }
 
 export class SessionStore {
@@ -105,6 +219,7 @@ export class SessionStore {
     const state = {
       id,
       apiVersion: 'angela/v1',
+      logEncoding: 'delta/v1',
       kind: 'AgentSession',
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -270,7 +385,7 @@ export class SessionStore {
     return wrapper;
   }
 
-  /** Read all jsonl wrappers for a session (newest last). */
+  /** Read all jsonl wrappers for a session (newest last). Raw lines; no meta fold. */
   listEvents(id) {
     const p = this.logPath(id);
     if (!existsSync(p)) return [];
@@ -286,10 +401,88 @@ export class SessionStore {
     return out;
   }
 
+  /** listEvents with context_meta last-write-wins applied to earlier rows. */
+  listEventsFolded(id) {
+    return foldEventMetas(this.listEvents(id));
+  }
+
+  /**
+   * Rebuild the inference request body from a slim (or legacy verbatim) log line.
+   * @param {string} id
+   * @param {string} requestEventId
+   * @returns {object|null}
+   */
+  reconstructProviderRequest(id, requestEventId) {
+    if (!requestEventId) return null;
+    const events = this.listEventsFolded(id);
+    const idx = events.findIndex(
+      (w) => w.event_id === requestEventId && w.event_type === 'provider_request',
+    );
+    if (idx < 0) return null;
+    const wrap = events[idx];
+    const p = wrap.payload && typeof wrap.payload === 'object' ? wrap.payload : {};
+
+    // Legacy snapshot logs stored the full messages[] on the request.
+    if (Array.isArray(p.messages)) {
+      return {
+        model: p.model ?? null,
+        stream: p.stream,
+        context_window: p.context_window ?? null,
+        messages: p.messages,
+        tools: p.tools ?? null,
+      };
+    }
+
+    /** @type {Map<string, object>} */
+    const byId = new Map();
+    for (const ev of events) {
+      if (ev?.event_id) byId.set(ev.event_id, ev);
+    }
+
+    let messages;
+    if (Array.isArray(p.message_event_ids) && p.message_event_ids.length) {
+      messages = [];
+      for (const eid of p.message_event_ids) {
+        const src = byId.get(eid);
+        const msg = eventToProviderMessage(src);
+        if (msg) messages.push(msg);
+      }
+    } else {
+      // Fall back: fold visible transcript items that occurred before this request.
+      messages = [];
+      let system = null;
+      for (let i = 0; i < idx; i++) {
+        const ev = events[i];
+        if (ev.event_type === 'system') {
+          system = eventToProviderMessage(ev);
+          continue;
+        }
+        if (ev.event_type === 'tools' || ev.event_type === 'context_meta') continue;
+        if (ev.event_type === 'provider_request' || ev.event_type === 'provider_response') {
+          continue;
+        }
+        if (ev.event_type === 'gen_info' || ev.event_type === 'session') continue;
+        if (ev.meta && ev.meta.visible === false) continue;
+        const msg = eventToProviderMessage(ev);
+        if (msg) messages.push(msg);
+      }
+      if (system) messages.unshift(system);
+    }
+
+    const toolsWrap = p.tools_event_id ? byId.get(p.tools_event_id) : null;
+    const tools = toolsWrap?.payload?.tools ?? null;
+    return {
+      model: p.model ?? null,
+      stream: p.stream,
+      context_window: p.context_window ?? null,
+      messages,
+      tools,
+    };
+  }
+
   /**
    * Snapshot of the most recent provider gen_info telemetry for a session.
-   * Used when writing tool/context events so each jsonl line carries its own
-   * frozen metrics (UI must not re-point older bubbles at later rounds).
+   * Assistant/reasoning events freeze a copy; tool events store gen_info_event_id.
    * @returns {object|null}
    */
   lastGenTelemetry(id) {
@@ -353,64 +546,52 @@ export class SessionStore {
   }
 
   /**
-   * Patch `meta` on one or more jsonl events by event_id (one rewrite).
+   * Patch `meta` on one or more events by appending a `context_meta` delta.
+   * Original jsonl lines are left unchanged; readers fold last-write-wins.
    *
    * @param {string} id
    * @param {string|string[]} eventIds
    * @param {object} metaPatch
-   * @returns {object[]|null} updated wrappers (null if none matched)
+   * @returns {object[]|null} folded wrappers for the matched ids (null if none)
    */
   updateEventsMeta(id, eventIds, metaPatch = {}) {
-    const ids = new Set(
-      (Array.isArray(eventIds) ? eventIds : [eventIds]).filter(Boolean),
-    );
-    if (!ids.size) return null;
-    const p = this.logPath(id);
-    if (!existsSync(p)) return null;
-    const lines = readFileSync(p, 'utf8').split('\n');
-    /** @type {object[]} */
-    const updated = [];
-    const out = [];
-    for (const line of lines) {
-      if (!line.trim()) {
-        out.push(line);
-        continue;
-      }
-      let wrap;
-      try {
-        wrap = JSON.parse(line);
-      } catch {
-        out.push(line);
-        continue;
-      }
+    const ids = [
+      ...(Array.isArray(eventIds) ? eventIds : [eventIds]).filter(Boolean),
+    ];
+    if (!ids.length) return null;
+    const want = new Set(ids.map(String));
+    const events = this.listEvents(id);
+    const resolved = [];
+    for (const wrap of events) {
+      if (wrap?.event_type === 'context_meta') continue;
       const match =
-        (wrap.event_id && ids.has(wrap.event_id)) ||
-        (!wrap.event_id && wrap.ts && ids.has(wrap.ts));
-      if (match) {
-        wrap.meta = { ...(wrap.meta || {}), ...metaPatch };
-        if (Object.prototype.hasOwnProperty.call(metaPatch, 'visible')) {
-          wrap.meta.visible = Boolean(metaPatch.visible);
-        }
-        updated.push(wrap);
-        out.push(JSON.stringify(wrap));
-      } else {
-        out.push(line);
+        (wrap.event_id && want.has(String(wrap.event_id))) ||
+        (!wrap.event_id && wrap.ts && want.has(String(wrap.ts)));
+      if (match && wrap.event_id && !resolved.includes(wrap.event_id)) {
+        resolved.push(wrap.event_id);
       }
     }
-    if (!updated.length) return null;
-    writeFileSync(
-      p,
-      out.filter((l) => String(l).trim()).join('\n') + '\n',
-      'utf8',
-    );
-    return updated;
+    if (!resolved.length) return null;
+    const patch = { ...(metaPatch || {}) };
+    if (Object.prototype.hasOwnProperty.call(patch, 'visible')) {
+      patch.visible = Boolean(patch.visible);
+    }
+    this.appendEvent(id, {
+      event_type: 'context_meta',
+      payload: {
+        event_ids: resolved,
+        ...patch,
+      },
+    });
+    const folded = this.listEventsFolded(id);
+    const resolvedSet = new Set(resolved);
+    return folded.filter((w) => w.event_id && resolvedSet.has(w.event_id));
   }
 
   /**
-   * Patch `meta` on one jsonl event by event_id.
-   * Rewrites the whole log file (sessions are small enough).
+   * Patch `meta` on one jsonl event by event_id (append context_meta).
    *
-   * @returns {object|null} updated wrapper
+   * @returns {object|null} folded wrapper
    */
   updateEventMeta(id, eventId, metaPatch = {}) {
     const list = this.updateEventsMeta(id, eventId, metaPatch);
@@ -434,7 +615,7 @@ export class SessionStore {
    */
   listVisibleContextMessages(id) {
     const msgs = [];
-    for (const wrap of this.listEvents(id)) {
+    for (const wrap of this.listEventsFolded(id)) {
       if (wrap.event_type !== 'context_window') continue;
       const p = wrap.payload;
       if (!p || !p.role || p.content == null) continue;
@@ -460,7 +641,7 @@ export class SessionStore {
    */
   buildContextWindowItems(id) {
     const items = [];
-    for (const wrap of this.listEvents(id)) {
+    for (const wrap of this.listEventsFolded(id)) {
       const p = wrap.payload;
       if (!p) continue;
       const visible = !(wrap.meta && wrap.meta.visible === false);
@@ -736,6 +917,88 @@ export function extractReasoningContent(res) {
 export function instrumentProviderLogging(agent, store, sessionId, hooks = {}) {
   if (!agent?.client?.inference || !store || !sessionId) return;
 
+  /** @type {string|null} */
+  let systemEventId = null;
+  /** @type {string|null} */
+  let systemHash = null;
+  /** @type {string|null} */
+  let toolsEventId = null;
+  /** @type {string|null} */
+  let toolsHash = null;
+
+  function persistStableBlobs(req) {
+    const msgs = Array.isArray(req?.messages) ? req.messages : [];
+    const sys = msgs.find((m) => m && m.role === 'system');
+    const sysContent = sys?.content != null ? String(sys.content) : '';
+    if (sysContent) {
+      const h = stableHash(sysContent);
+      if (h && h !== systemHash) {
+        const w = store.appendEvent(sessionId, {
+          event_type: 'system',
+          payload: { content: sysContent, bytes: sysContent.length },
+        });
+        systemEventId = w.event_id;
+        systemHash = h;
+      }
+    }
+    if (Array.isArray(req?.tools) && req.tools.length) {
+      const cloned = safeClone(req.tools);
+      const h = stableHash(cloned);
+      if (h && h !== toolsHash) {
+        const w = store.appendEvent(sessionId, {
+          event_type: 'tools',
+          payload: { tools: cloned, hash: h },
+        });
+        toolsEventId = w.event_id;
+        toolsHash = h;
+      }
+    }
+  }
+
+  function messageEventIdsFromAgent() {
+    const ids = [];
+    if (systemEventId) ids.push(systemEventId);
+    const cw = agent?.context_window;
+    if (Array.isArray(cw)) {
+      for (const row of cw) {
+        if (!row || row.visible === false) continue;
+        if (row.id) ids.push(row.id);
+      }
+    }
+    return ids;
+  }
+
+  function slimRequestPayload(req, wide = false) {
+    persistStableBlobs(req);
+    const c = {};
+    if (req && typeof req === 'object') {
+      for (const [k, v] of Object.entries(req)) {
+        if (
+          k === 'messages' ||
+          k === 'tools' ||
+          k === 'signal' ||
+          k === 'on_delta'
+        ) {
+          continue;
+        }
+        if (typeof v === 'function') continue;
+        c[k] = safeClone(v);
+      }
+    }
+    const messages = Array.isArray(req?.messages) ? req.messages : [];
+    const tools = Array.isArray(req?.tools) ? req.tools : null;
+    c.messages_count = messages.length;
+    c.tools_count = tools ? tools.length : 0;
+    c.system_event_id = systemEventId;
+    c.tools_event_id = toolsEventId;
+    c.message_event_ids = messageEventIdsFromAgent();
+    c.roles = messages.map((m) =>
+      m && typeof m === 'object' ? m.role || null : null,
+    );
+    if (wide) c._wide = true;
+    return c;
+  }
+
   function noteUsageAndTelemetry(res, model, durationMs, ttftMs, errorMsg = null) {
     // Authoritative counts only from the completion response `usage` object.
     // Never invent tokens (no chars/4); omit prompt fields if the provider
@@ -882,16 +1145,9 @@ export function instrumentProviderLogging(agent, store, sessionId, hooks = {}) {
 
             store.appendEvent(sessionId, {
               event_type: 'provider_request',
-              payload: wide
-                ? { ...(safeClone(req) || {}), _wide: true }
-                : // Don't persist huge message bodies twice with stream flag noise
-                  (() => {
-                    const c = safeClone(req) || {};
-                    if (c.on_delta) delete c.on_delta;
-                    return c;
-                  })(),
+              payload: slimRequestPayload(req, wide),
             });
-            if (req?.messages) {
+            if (logSnapshotsEnabled() && req?.messages) {
               store.appendEvent(sessionId, {
                 event_type: 'context_window',
                 payload: {

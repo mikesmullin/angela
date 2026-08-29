@@ -23,6 +23,7 @@ import {
 
 function summarizeResult(result) {
   if (result == null) return '';
+  if (typeof result === 'object' && result.command) return '';
   if (typeof result === 'string') return result;
   if (typeof result === 'object') {
     if (result.summary) return String(result.summary);
@@ -323,6 +324,12 @@ export async function runTui(config) {
       addLine(`You: ${p}`, '#93c5fd');
       setStatus(`model ${model}  ·  running…`);
       const result = await session.run({ prompt: p });
+      if (result?.command === 'new' && result.session) {
+        session = result.session;
+        addLine('(new session)', '#86efac');
+        setStatus(`model ${model}  ·  ready  ·  new session`);
+        return;
+      }
       const text = summarizeResult(result);
       addLine(`Assistant: ${text || '(empty)'}`, '#e7ecf3');
       setStatus(

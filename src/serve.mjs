@@ -196,7 +196,7 @@ function gotoFromMeta(wrap) {
 }
 
 function reconstructMessagesFromLog(id) {
-  const events = store().listEvents(id);
+  const events = store().listEventsFolded(id);
   const messages = [];
   /** @type {object|null} last gen_info payload (for older logs missing meta.telemetry) */
   let lastGen = null;
@@ -318,7 +318,7 @@ async function handleEventMeta(req) {
     // Uniqueness among enabled labels (case-insensitive)
     if (goto.enabled && goto.label) {
       const want = goto.label.toLowerCase();
-      for (const wrap of store().listEvents(sessionId)) {
+      for (const wrap of store().listEventsFolded(sessionId)) {
         const og = wrap.meta?.goto;
         if (!og?.enabled) continue;
         const lab = String(og.label || '')
@@ -934,6 +934,18 @@ async function handleChatStream(req) {
         });
 
         const result = await entry.session.run({ prompt: content });
+        if (result?.command === 'new' && result.session) {
+          entry.session = result.session;
+          send({
+            type: 'session',
+            command: 'new',
+            tabId,
+            sessionId: result.sessionId,
+            previousId: result.previousId,
+          });
+          send({ type: 'done' });
+          return;
+        }
         const text =
           typeof result === 'string'
             ? result
