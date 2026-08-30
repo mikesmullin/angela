@@ -868,6 +868,17 @@ async function handleChatStream(req) {
             });
             return;
           }
+          if (ev.type === 'tool_delta') {
+            send({
+              type: 'tool_delta',
+              name: ev.name,
+              server: ev.server,
+              progressToken: ev.progressToken,
+              output: ev.output || ev.text || '',
+              sessionId: entry.session?.id,
+            });
+            return;
+          }
           if (ev.type === 'reasoning_delta') {
             send({
               type: 'reasoning_delta',

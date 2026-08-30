@@ -201,9 +201,13 @@ export const DEFAULT_LUCY_ALLOWLIST = `
 file_io__list_dir
 file_io__read_file
 file_io__stat
+file_io__grep
+file_io__find
 file_io__list_dir:.*
 file_io__read_file:.*
 file_io__stat:.*
+file_io__grep:.*
+file_io__find:.*
 
 # local term (just-bash + host exec)
 term_local__bash:pwd

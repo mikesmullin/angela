@@ -11,9 +11,10 @@ export class McpStdioClient {
   #name;
   #onStderr;
 
-  constructor({ name, command, args = [], env = {}, cwd, onStderr, prefix, framing } = {}) {
+  constructor({ name, command, args = [], env = {}, cwd, onStderr, onNotification, prefix, framing } = {}) {
     this.#name = name || 'mcp';
     this.#onStderr = onStderr;
+    this.onNotification = onNotification || null;
     this.command = command;
     this.args = args;
     this.env = env;
@@ -73,8 +74,14 @@ export class McpStdioClient {
     return result?.tools || [];
   }
 
-  async callTool(name, args = {}) {
-    return this.#request('tools/call', { name, arguments: args });
+  async callTool(name, args = {}, extra = {}) {
+    const params = { name, arguments: args };
+    if (extra.progressToken != null && extra.progressToken !== '') {
+      params._meta = { ...(extra._meta || {}), progressToken: extra.progressToken };
+    } else if (extra._meta) {
+      params._meta = extra._meta;
+    }
+    return this.#request('tools/call', params);
   }
 
   async close() {
@@ -111,6 +118,14 @@ export class McpStdioClient {
         p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
       } else {
         p.resolve(msg.result);
+      }
+      return;
+    }
+    if (msg.method && msg.id === undefined) {
+      try {
+        this.onNotification?.(msg);
+      } catch {
+        /* ignore */
       }
     }
   }
@@ -179,14 +194,106 @@ export class McpStdioClient {
   }
 }
 
-/** Map MCP tool result content to a plain string for the model. */
+/** Raw MCP content parts (text / image / …). */
+export function mcpResultParts(result) {
+  if (!result) return [];
+  if (typeof result === 'string') return [{ type: 'text', text: result }];
+  if (Array.isArray(result)) return result;
+  if (Array.isArray(result.content)) return result.content;
+  return [];
+}
+
+function imageCaption(part) {
+  const mime = part?.mimeType || 'image';
+  return `Read image file [${mime}]`;
+}
+
+/** Map MCP tool result content to a plain string for the model / UI. */
 export function mcpResultToText(result) {
   if (!result) return '';
   if (typeof result === 'string') return result;
-  const parts = result.content || [];
+  const parts = mcpResultParts(result);
   return parts
-    .map((c) => (c?.type === 'text' ? c.text : JSON.stringify(c)))
+    .map((c) => {
+      if (c?.type === 'text') return c.text;
+      if (c?.type === 'image') return '';
+      return JSON.stringify({ type: c?.type, mimeType: c?.mimeType });
+    })
+    .filter((s) => s != null && s !== '')
     .join('\n');
+}
+
+/**
+ * Convert MCP content parts to AGL/OpenAI tool-message content.
+ * Image parts become `{ type: 'image_url', image_url: { url: data:... } }`.
+ * Returns a string when there are no images (existing tool-result shape).
+ *
+ * @param {object} result
+ * @param {{ supportsImages?: boolean }} [opts]
+ * @returns {string | Array<{ type: string, text?: string, image_url?: { url: string } }>}
+ */
+export function mcpResultToProviderContent(result, opts = {}) {
+  const supportsImages = opts.supportsImages !== false;
+  const parts = mcpResultParts(result);
+  const hasImage = parts.some((p) => p?.type === 'image');
+  if (!hasImage) return mcpResultToText(result);
+
+  const out = [];
+  let sawImage = false;
+  for (const p of parts) {
+    if (p?.type === 'text') {
+      out.push({ type: 'text', text: String(p.text ?? '') });
+      continue;
+    }
+    if (p?.type === 'image') {
+      sawImage = true;
+      if (!supportsImages) continue;
+      const mime = p.mimeType || 'image/png';
+      const data = p.data || '';
+      out.push({
+        type: 'image_url',
+        image_url: { url: `data:${mime};base64,${data}` },
+      });
+    }
+  }
+  if (sawImage && !supportsImages) {
+    out.push({
+      type: 'text',
+      text: '[Current model does not support images. The image will be omitted from this request.]',
+    });
+  }
+  if (out.length === 1 && out[0].type === 'text') return out[0].text || '';
+  if (!out.length) return mcpResultToText(result) || imageCaption(parts.find((p) => p?.type === 'image'));
+  return out;
+}
+
+/** Compact image metadata for jsonl / UI (no base64 payload). */
+export function mcpResultImageMeta(result) {
+  const img = mcpResultParts(result).find((p) => p?.type === 'image');
+  if (!img) return null;
+  const data = img.data || '';
+  let bytes = 0;
+  try {
+    bytes = Buffer.byteLength(data, 'base64');
+  } catch {
+    bytes = data.length;
+  }
+  return { mimeType: img.mimeType || 'image', bytes };
+}
+
+/**
+ * Best-effort: omit images only when the model is a known text-only id.
+ * Unknown models keep the image attached (provider may drop it).
+ */
+export function modelSupportsImages(model) {
+  const s = String(model || '').toLowerCase();
+  if (!s) return true;
+  if (/\b(vision|vl-|vl\b|gpt-4o|gpt-4\.1|gpt-5|claude|gemini|omni)\b/.test(s)) return true;
+  if (/gemma/.test(s) && !/vision|vl/.test(s)) return false;
+  if (/\b(llama-?3|qwen2(?:\.5)?|mistral|deepseek|coder)\b/.test(s) && !/vision|vl/.test(s)) {
+    return false;
+  }
+  return true;
 }
 
 /**

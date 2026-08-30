@@ -17,7 +17,14 @@ import {
   resolveContextWindow,
   resolveContextWindowAsync,
 } from './model-spec.mjs';
-import { McpStdioClient, mcpResultToText, toolName } from './mcp-client.mjs';
+import {
+  McpStdioClient,
+  mcpResultToText,
+  mcpResultToProviderContent,
+  mcpResultImageMeta,
+  modelSupportsImages,
+  toolName,
+} from './mcp-client.mjs';
 import { PolicyEngine, DEFAULT_LUCY_ALLOWLIST } from './policy.mjs';
 import { SessionStore, instrumentProviderLogging } from './session-store.mjs';
 import { resolveProjectRoot, ensureAngelaLayout } from './project.mjs';
@@ -106,7 +113,23 @@ export async function registerMcpTools(
   { onEvent, prefix = true, policy = null } = {},
 ) {
   const registered = [];
+  const supportsImages = modelSupportsImages(agent?.model);
+  let progressSeq = 0;
+  const inFlight = new Map();
   for (const client of clients) {
+    client.onNotification = (msg) => {
+      if (msg?.method !== 'notifications/progress') return;
+      const p = msg.params || {};
+      const meta = inFlight.get(p.progressToken);
+      emit(onEvent, 'tool_delta', {
+        server: client.name,
+        name: meta?.name,
+        tool: meta?.tool,
+        progressToken: p.progressToken,
+        output: p.output,
+        text: p.output,
+      });
+    };
     const tools = await client.listTools();
     for (const t of tools) {
       const usePrefix = client.prefix !== false && prefix !== false;
@@ -191,9 +214,18 @@ export async function registerMcpTools(
           }
 
           try {
-            const result = await client.callTool(t.name, toolArgs);
+            const progressToken = `${name}:${++progressSeq}:${Date.now()}`;
+            inFlight.set(progressToken, { name, server: client.name, tool: t.name });
+            let result;
+            try {
+              result = await client.callTool(t.name, toolArgs, { progressToken });
+            } finally {
+              inFlight.delete(progressToken);
+            }
             // Full tool body to model + UI — no ANGELA_TOOL_RESULT_CAP.
             const text = mcpResultToText(result);
+            const image = mcpResultImageMeta(result);
+            const content = mcpResultToProviderContent(result, { supportsImages });
             emit(onEvent, 'tool_result', {
               server: client.name,
               tool: t.name,
@@ -202,9 +234,10 @@ export async function registerMcpTools(
               text,
               full_chars: text.length,
               truncated: false,
+              ...(image ? { image } : {}),
               ...(explanation ? { explanation } : {}),
             });
-            return text;
+            return content;
           } catch (err) {
             const msg = err?.message || String(err);
             emit(onEvent, 'tool_result', {
@@ -1774,6 +1807,15 @@ export class Angela {
     this.#contextHost = null;
   }
 }
+
+export {
+  mcpResultToText,
+  mcpResultParts,
+  mcpResultToProviderContent,
+  mcpResultImageMeta,
+  modelSupportsImages,
+  toolName,
+} from './mcp-client.mjs';
 
 export {
   PolicyEngine,

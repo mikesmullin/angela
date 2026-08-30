@@ -254,13 +254,25 @@ export async function runTui(config) {
     );
   }
 
+  let liveToolLine = null;
+
   function handleEvent(ev) {
     if (ev.type === 'tool_call') {
+      liveToolLine = null;
       addLine(
         `→ ${ev.name} ${preview(JSON.stringify(ev.args || {}))}`,
         '#64748b',
       );
+    } else if (ev.type === 'tool_delta') {
+      const tail = preview(ev.output || ev.text || '', 80);
+      const line = `… ${ev.name || ev.progressToken || 'tool'} ${tail}`;
+      if (liveToolLine) {
+        liveToolLine.content = line;
+      } else {
+        liveToolLine = addLine(line, '#64748b');
+      }
     } else if (ev.type === 'tool_result') {
+      liveToolLine = null;
       const tag = ev.denied ? 'DENIED' : ev.ok === false ? 'ERR' : 'ok';
       const color =
         ev.denied || ev.ok === false ? '#fca5a5' : '#86efac';
