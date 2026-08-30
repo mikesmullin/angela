@@ -232,4 +232,5 @@ await harness.close();
 cd /workspace/angela && bun install && bun test
 ```
 
-Live model tests need LM Studio (or override `FAV_LOCAL_LLM`).
+Live model tests need llama-server (or whatever `default_model` is in
+`~/.config/agl/config.yaml`). Override with an explicit `model` in the test.

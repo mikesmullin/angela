@@ -9,8 +9,8 @@
  * Agent def shape (all optional except name recommended):
  *   {
  *     name: 'my-agent',
- *     // model: optional — if omitted, Angela fills FAV_LOCAL_LLM / COWORK_MODEL /
- *     // a sensible lm-studio default (see defaultAgentFields).
+ *     // model: optional — if omitted, AGL reads ~/.config/agl/config.yaml
+ *     // default_model on every inference (see defaultAgentFields).
  *     model: 'lm-studio:google/gemma-4-12b-qat',
  *     system: '...',                 // base system prompt
  *     mcp: ['file-io', 'term-local'], // preset names and/or raw objects
@@ -43,18 +43,14 @@
  * Reasonable defaults for agent defs. Agent coffee return values are merged
  * on top of this (agent keys win; omitted keys keep these defaults).
  *
- * Model resolution matches the angela CLI:
- *   FAV_LOCAL_LLM → COWORK_MODEL → lm-studio fallback
+ * Model omitted → empty string so AGL resolves ~/.config/agl/config.yaml
+ * `default_model` on every inference (no process restart needed).
  *
  * @returns {{ model: string, policyMode: string, parallel_tools: boolean }}
  */
 export function defaultAgentFields() {
-  const model =
-    (process.env.FAV_LOCAL_LLM && String(process.env.FAV_LOCAL_LLM).trim()) ||
-    (process.env.COWORK_MODEL && String(process.env.COWORK_MODEL).trim()) ||
-    'lm-studio:google/gemma-4-12b-qat';
   return {
-    model,
+    model: '',
     policyMode: 'ask',
     parallel_tools: true,
   };
@@ -355,7 +351,7 @@ export async function materializeAgentDef(
   { mcpRoot, projectRoot, skipAgentsMd = false } = {},
 ) {
   const root = resolveProjectRoot(projectRoot);
-  // Agent return value overlays harness defaults (omit model → FAV_LOCAL_LLM, etc.)
+  // Agent return value overlays harness defaults (omit model → AGL default_model).
   const defaults = defaultAgentFields();
   let d = { ...defaults, ...(def && typeof def === 'object' ? def : {}) };
   // Empty string model is treated as "use default"

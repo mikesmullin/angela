@@ -233,11 +233,7 @@ async function buildRunConfig(opts) {
     model = opts.model;
     overrides.model = { from: agent?.model || null, to: model };
   } else {
-    model =
-      agent?.model ||
-      process.env.FAV_LOCAL_LLM ||
-      process.env.COWORK_MODEL ||
-      'lm-studio:google/gemma-4-12b-qat';
+    model = agent?.model || '';
   }
 
   // --- system ---

@@ -11,7 +11,7 @@
  * Always uses a real AGL Agent (no mock agent path). The harness tames the
  * model via system prompt, tool schemas (MCP), max turns, and events.
  */
-import Agent from 'agl-ai';
+import Agent, { resolveDefaultModel } from 'agl-ai';
 import {
   parseModelSpec,
   resolveContextWindow,
@@ -1419,11 +1419,7 @@ export class Angela {
 
   /** Whether the configured model is expected to accept image parts. */
   get supportsImages() {
-    const model =
-      this.#config?.model ||
-      process.env.FAV_LOCAL_LLM ||
-      process.env.COWORK_MODEL ||
-      '';
+    const model = (this.#config?.model && String(this.#config.model).trim()) || '';
     return modelSupportsImages(model);
   }
 
@@ -1543,7 +1539,8 @@ export class Angela {
     inst.#contextHost = await startContextHost(inst);
     await inst.#connectMcp();
     const initModel =
-      config.model || process.env.FAV_LOCAL_LLM || Agent.default.model;
+      (config.model && String(config.model).trim()) ||
+      (await resolveDefaultModel());
     emit(inst.onEvent, 'session_init', {
       mcpServers: inst.clients.map((c) => c.name),
       model: initModel,
@@ -1601,15 +1598,15 @@ export class Angela {
   }
 
   async _createAgent() {
-    const modelDisplay =
-      this.#config.model ||
-      process.env.FAV_LOCAL_LLM ||
-      process.env.COWORK_MODEL ||
-      'lm-studio:google/gemma-4-12b-qat';
+    const configured = this.#config.model;
+    const blank = configured == null || String(configured).trim() === '';
+    const modelDisplay = blank
+      ? await resolveDefaultModel()
+      : String(configured).trim();
 
     // host:provider:model (e.g. laptop:copilot:gpt-5.6-luna) — strip host for AGL
     const parsed = parseModelSpec(modelDisplay);
-    const modelAgl = parsed.agl || modelDisplay;
+    const modelAgl = blank ? '' : parsed.agl || modelDisplay;
 
     // Prefer base + augment so think/effort stay consistent with setSystemPrompt.
     const systemBase =
