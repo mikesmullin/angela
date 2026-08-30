@@ -84,6 +84,29 @@ export class McpStdioClient {
     return this.#request('tools/call', params);
   }
 
+  /**
+   * Cancel in-flight `tools/call` requests (Stop / new prompt).
+   * Sends MCP `notifications/cancelled` so the server can kill children, and
+   * rejects the local pending promises so the agent turn is not stuck if the
+   * server ignores cancel (browser MCP, etc.).
+   */
+  abort(reason = 'aborted') {
+    const err = mcpAbortError(reason);
+    for (const [id, p] of [...this.#pending]) {
+      if (p.method && p.method !== 'tools/call') continue;
+      this.#pending.delete(id);
+      this.#notify('notifications/cancelled', {
+        requestId: id,
+        reason: reason || 'aborted',
+      });
+      try {
+        p.reject(err);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   async close() {
     if (!this.#proc) return;
     try {
@@ -184,7 +207,7 @@ export class McpStdioClient {
     const id = this.#nextId++;
     const payload = { jsonrpc: '2.0', id, method, params };
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
+      this.#pending.set(id, { resolve, reject, method });
       this.#writeMsg(payload);
     });
   }
@@ -192,6 +215,12 @@ export class McpStdioClient {
   #notify(method, params) {
     this.#writeMsg({ jsonrpc: '2.0', method, params });
   }
+}
+
+export function mcpAbortError(reason = 'aborted') {
+  const e = new Error(reason || 'aborted');
+  e.aborted = true;
+  return e;
 }
 
 /** Raw MCP content parts (text / image / …). */

@@ -240,15 +240,20 @@ export async function registerMcpTools(
             });
             return content;
           } catch (err) {
-            const msg = err?.message || String(err);
+            const aborted = Boolean(err?.aborted);
+            const msg = aborted
+              ? 'Command aborted'
+              : err?.message || String(err);
             emit(onEvent, 'tool_result', {
               server: client.name,
               tool: t.name,
               name,
               ok: false,
+              aborted,
               text: msg,
               ...(explanation ? { explanation } : {}),
             });
+            if (aborted) throw err;
             return `ERROR: ${msg}`;
           }
         },
@@ -1259,6 +1264,14 @@ class Session {
     // AGL: abort in-flight provider stream (AbortController on inference)
     if (this.#agent?.abort) {
       this.#agent.abort(reason);
+    }
+    // Cancel in-flight MCP tools/call (term-local exec, browser, …)
+    for (const client of this.#harness?.clients || []) {
+      try {
+        client.abort?.(reason);
+      } catch {
+        /* ignore */
+      }
     }
     // Kill in-flight remote / plugin tool work (optional plugins)
     await abortPlugins(reason);
