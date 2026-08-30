@@ -3,3 +3,5 @@ node_modules/
 # Optional private plugins (symlinks to angela-plugins)
 plugins/
 
+# temporary
+/tmp/
