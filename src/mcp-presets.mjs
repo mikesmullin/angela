@@ -288,13 +288,16 @@ export function resolveMcpList(list = [], presets = buildMcpPresets()) {
       continue;
     }
     if (typeof item === 'object' && item.name && item.command) {
-      out.push({
+      const entry = {
         name: item.name,
         command: item.command,
         args: item.args || [],
         env: { ...(item.env || {}) },
         cwd: item.cwd,
-      });
+      };
+      if (item.prefix != null) entry.prefix = item.prefix;
+      if (item.onStderr) entry.onStderr = item.onStderr;
+      out.push(entry);
       continue;
     }
     throw new Error(`Invalid MCP entry: ${JSON.stringify(item)}`);
