@@ -113,7 +113,6 @@ export async function registerMcpTools(
   { onEvent, prefix = true, policy = null } = {},
 ) {
   const registered = [];
-  const supportsImages = modelSupportsImages(agent?.model);
   let progressSeq = 0;
   const inFlight = new Map();
   for (const client of clients) {
@@ -225,7 +224,9 @@ export async function registerMcpTools(
             // Full tool body to model + UI — no ANGELA_TOOL_RESULT_CAP.
             const text = mcpResultToText(result);
             const image = mcpResultImageMeta(result);
-            const content = mcpResultToProviderContent(result, { supportsImages });
+            const content = mcpResultToProviderContent(result, {
+              supportsImages: modelSupportsImages(agent?.model),
+            });
             emit(onEvent, 'tool_result', {
               server: client.name,
               tool: t.name,
@@ -1403,6 +1404,16 @@ export class Angela {
     if (config.system != null) this.#systemBase = String(config.system);
   }
 
+  /** Whether the configured model is expected to accept image parts. */
+  get supportsImages() {
+    const model =
+      this.#config?.model ||
+      process.env.FAV_LOCAL_LLM ||
+      process.env.COWORK_MODEL ||
+      '';
+    return modelSupportsImages(model);
+  }
+
   /**
    * Update toolsEnabled and re-filter any live session agents.
    * null/undefined = all tools; array/string = only those names (may be empty).
@@ -1518,9 +1529,12 @@ export class Angela {
     const inst = new Angela(config);
     inst.#contextHost = await startContextHost(inst);
     await inst.#connectMcp();
+    const initModel =
+      config.model || process.env.FAV_LOCAL_LLM || Agent.default.model;
     emit(inst.onEvent, 'session_init', {
       mcpServers: inst.clients.map((c) => c.name),
-      model: config.model || process.env.FAV_LOCAL_LLM || Agent.default.model,
+      model: initModel,
+      supportsImages: modelSupportsImages(initModel),
       policyMode: inst.policy.mode,
       projectRoot: inst.projectRoot,
     });
@@ -1706,6 +1720,7 @@ export class Angela {
             overrides: cfg.overrides || null,
             config: {
               model: cfg.model,
+              supportsImages: modelSupportsImages(cfg.model),
               mcp: (self.clients || []).map((c) => c.name),
               policyMode: cfg.policyMode || 'ask',
               approveMode: cfg.approveMode ?? null,
