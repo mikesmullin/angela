@@ -222,6 +222,10 @@ term_local__exec:pwd
 term_local__exec:true
 term_local__exec:ls.*
 
+# session checklist (mcp-todo) — add preset todo to the agent mcp list
+todo_read
+todo_write
+
 # CONTEXT LOOP (mcp-context-loop) — not enabled by default.
 # Add preset context-loop to the agent mcp list, then uncomment:
 # goto

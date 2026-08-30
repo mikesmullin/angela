@@ -3,10 +3,10 @@
  * Core package only ships local servers. Remote presets come from plugins.
  *
  * MCP script discovery (first hit wins) — no hard-coded machine paths required:
- *   1. $ANGELA_MCP_ROOT/{file-io,term-local,context-loop}/server.mjs
- *   2. Sibling monorepo: <angela>/../mcp/{file-io,term-local}/server.mjs
+ *   1. $ANGELA_MCP_ROOT/{file-io,term-local,context-loop,todo}/server.mjs
+ *   2. Sibling monorepo: <angela>/../mcp/{file-io,term-local,todo}/server.mjs
  *   3. Standalone packages: <angela>/../mcp-file-io/server.mjs,
- *      <angela>/../mcp-context-loop/server.mjs
+ *      <angela>/../mcp-context-loop/server.mjs, <angela>/../mcp-todo/server.mjs
  *   4. node_modules: @mikesmullin/mcp-file-io or mcp-file-io
  *   5. Legacy: /workspace/mcp (devcontainer convenience only)
  */
@@ -121,6 +121,18 @@ export function resolveMcpServerScript(preset) {
     candidates.push(
       resolve(ANGELA_PKG_ROOT, 'node_modules/@mikesmullin/mcp-context-loop/server.mjs'),
     );
+  } else if (preset === 'todo') {
+    for (const root of mcpRootCandidates()) {
+      candidates.push(join(root, 'todo/server.mjs'));
+    }
+    candidates.push(resolve(ANGELA_PKG_ROOT, '../mcp-todo/server.mjs'));
+    candidates.push(resolve(process.cwd(), '../mcp-todo/server.mjs'));
+    candidates.push(
+      resolve(process.cwd(), 'node_modules/@mikesmullin/mcp-todo/server.mjs'),
+    );
+    candidates.push(
+      resolve(ANGELA_PKG_ROOT, 'node_modules/@mikesmullin/mcp-todo/server.mjs'),
+    );
   } else {
     // Generic: $root/<preset>/server.mjs
     for (const root of mcpRootCandidates()) {
@@ -172,6 +184,7 @@ export function buildMcpPresets(mcpRoot = defaultMcpRoot(), opts = {}) {
   const fileIoScript = resolveMcpServerScript('file-io');
   const termLocalScript = resolveMcpServerScript('term-local');
   const contextLoopScript = resolveMcpServerScript('context-loop');
+  const todoScript = resolveMcpServerScript('todo');
 
   const base = {
     'file-io': {
@@ -198,6 +211,15 @@ export function buildMcpPresets(mcpRoot = defaultMcpRoot(), opts = {}) {
       args: [
         contextLoopScript || join(mcpRoot, 'context-loop/server.mjs'),
       ],
+      env: {},
+      prefix: false,
+    },
+    // Opt-in session checklist (todo_read / todo_write). prefix:false so the
+    // model sees the Copilot/Claude-style names. In-memory unless MCP_TODO_PATH.
+    todo: {
+      name: 'todo',
+      command: bun,
+      args: [todoScript || join(mcpRoot, 'todo/server.mjs')],
       env: {},
       prefix: false,
     },
@@ -253,7 +275,10 @@ export function resolveMcpList(list = [], presets = buildMcpPresets()) {
       }
       // Re-resolve script path in case presets were built before install.
       const script =
-        (item === 'file-io' || item === 'term-local' || item === 'context-loop'
+        (item === 'file-io' ||
+        item === 'term-local' ||
+        item === 'context-loop' ||
+        item === 'todo'
           ? resolveMcpServerScript(item)
           : null) || p.args?.[0];
       if (!script || !existsSync(script)) {

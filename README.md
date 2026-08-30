@@ -145,7 +145,16 @@ export default function createAgent(ctx) {
 |------|---------|
 | `file-io` | Local files (jailed to project root) |
 | `term-local` | Local just-bash + host `exec` |
+| `todo` | **Opt-in.** Session checklist: `todo_read` / `todo_write` (full-list replace; `merge: true` patches by id). `prefix: false`. |
 | `context-loop` | **Opt-in.** `goto` + `loop_start_marker` (CONTEXT LOOP). Calls angela's session host to mutate the context window. Not on new agents or `DEFAULT_LUCY_ALLOWLIST`. |
+
+Add a session checklist (`todo_read` / `todo_write`) when you want the model to keep a plan:
+
+```coffee
+mcp: ['file-io', 'term-local', 'todo']
+```
+
+`todo_read` / `todo_write` are on `DEFAULT_LUCY_ALLOWLIST` (harmless in-memory list). A custom allowlist must include them. Sibling package: [`mcp-todo`](../mcp-todo).
 
 Add CONTEXT LOOP only when you want it:
 
