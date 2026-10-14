@@ -893,6 +893,26 @@ export function extractFinishReason(res) {
  * Model "thinking" / reasoning from a completion (Gemma 4 via LM Studio, etc.).
  * @returns {string|null}
  */
+export function extractAssistantText(res) {
+  // The round's final assistant TEXT (content only — tool_call-only rounds
+  // carry no prose and yield null). String content passes through; a
+  // content-parts array joins its text parts.
+  if (!res || typeof res !== 'object') return null;
+  const msg = res.choices?.[0]?.message || res.message || null;
+  if (!msg || typeof msg !== 'object' || msg.tool_calls?.length) return null;
+  const c = msg.content;
+  if (typeof c === 'string') return c.trim() ? c : null;
+  if (Array.isArray(c)) {
+    const s = c
+      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+      .map((part) => part.text)
+      .join('\n')
+      .trim();
+    return s ? s : null;
+  }
+  return null;
+}
+
 export function extractReasoningContent(res) {
   if (!res || typeof res !== 'object') return null;
   const msg = res.choices?.[0]?.message || res.message || null;
@@ -1098,6 +1118,16 @@ export function instrumentProviderLogging(agent, store, sessionId, hooks = {}) {
         event_id: wrap.event_id,
         sessionId,
       });
+      const assistantText = extractAssistantText(res);
+      if (assistantText) {
+        hooks.onAssistant?.({
+          type: 'assistant',
+          text: assistantText,
+          event_id: wrap.event_id,
+          sessionId,
+          telemetry,
+        });
+      }
       if (reasoningText) {
         hooks.onReasoning?.({
           type: 'reasoning',

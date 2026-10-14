@@ -120,6 +120,21 @@ export function parseModelSpec(spec) {
   if (isRemote || isLocal) {
     const i2 = rest.indexOf(':');
     if (i2 <= 0 || i2 >= rest.length - 1) {
+      // A 2-segment `local:model` is ALSO a legal classic provider:model —
+      // AGL's dynamic `endpoints` map may well carry a provider literally
+      // named `local` (the psicom layout does). Only 3-segment forms are
+      // host-prefixed; a bare host with no provider stays an error.
+      if (isLocal && i2 < 0 && rest.trim() !== '') {
+        return {
+          host: 'local',
+          provider: firstLower,
+          model: rest,
+          agl: display,
+          display,
+          viaRsh: false,
+          viaRemote: false,
+        };
+      }
       throw new Error(
         `Invalid host-prefixed model "${display}". Expected host:provider:model ` +
           `(e.g. local:copilot:gpt-5.6-luna).`,

@@ -26,6 +26,7 @@ import {
   toolName,
 } from './mcp-client.mjs';
 import { PolicyEngine, DEFAULT_LUCY_ALLOWLIST } from './policy.mjs';
+import { McpHttpClient } from './mcp-http-client.mjs';
 import { SessionStore, instrumentProviderLogging } from './session-store.mjs';
 import { resolveProjectRoot, ensureAngelaLayout } from './project.mjs';
 import {
@@ -308,6 +309,9 @@ class Session {
             });
           }
           emit(h.onEvent, 'reasoning', r);
+        },
+        onAssistant: (a) => {
+          emit(h.onEvent, 'assistant', a);
         },
       });
     }
@@ -1574,19 +1578,31 @@ export class Angela {
     const hostSock = this.#contextHost?.path || '';
     for (const entry of list) {
       try {
-        const client = new McpStdioClient({
-          name: entry.name,
-          command: entry.command,
-          args: entry.args || [],
-          env: {
-            ...(entry.env || {}),
-            ...(hostSock ? { ANGELA_HOST_SOCK: hostSock } : {}),
-          },
-          cwd: entry.cwd,
-          onStderr: entry.onStderr,
-          prefix: entry.prefix,
-          framing: entry.framing,
-        });
+        let client;
+        if (entry.url && !entry.command) {
+          // HTTP (streamable) MCP transport — remote/URL servers.
+          client = new McpHttpClient({
+            name: entry.name,
+            url: entry.url,
+            headers: entry.headers || {},
+            prefix: entry.prefix,
+            timeoutMs: entry.timeoutMs,
+          });
+        } else {
+          client = new McpStdioClient({
+            name: entry.name,
+            command: entry.command,
+            args: entry.args || [],
+            env: {
+              ...(entry.env || {}),
+              ...(hostSock ? { ANGELA_HOST_SOCK: hostSock } : {}),
+            },
+            cwd: entry.cwd,
+            onStderr: entry.onStderr,
+            prefix: entry.prefix,
+            framing: entry.framing,
+          });
+        }
         await client.connect();
         this.clients.push(client);
       } catch (err) {

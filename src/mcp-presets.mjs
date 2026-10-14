@@ -287,6 +287,20 @@ export function resolveMcpList(list = [], presets = buildMcpPresets()) {
       out.push({ ...p, args: [script, ...(p.args || []).slice(1)], env: { ...p.env } });
       continue;
     }
+    if (typeof item === 'object' && item.name && item.url && !item.command) {
+      // HTTP (streamable) MCP server — e.g. psicom sandbox cua-driver /mcp or
+      // execd exec facade. Header values may carry ${ENV_VAR} references.
+      const entry = {
+        name: item.name,
+        url: item.url,
+        headers: { ...(item.headers || {}) },
+        transport: 'http',
+      };
+      if (item.prefix != null) entry.prefix = item.prefix;
+      if (item.timeoutMs != null) entry.timeoutMs = item.timeoutMs;
+      out.push(entry);
+      continue;
+    }
     if (typeof item === 'object' && item.name && item.command) {
       const entry = {
         name: item.name,
