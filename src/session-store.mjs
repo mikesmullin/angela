@@ -1203,6 +1203,15 @@ export function instrumentProviderLogging(agent, store, sessionId, hooks = {}) {
             } catch (err) {
               const durationMs = performance.now() - t0;
               const msg = err?.message || String(err);
+              // Keep the server's own error body (e.g. vision_disabled vs
+              // context_length_exceeded) — the message alone swallows it and
+              // misdiagnoses follow. Truncated: bodies are small, but be safe.
+              const errBody =
+                typeof err?.body === 'string'
+                  ? err.body.slice(0, 2000)
+                  : err?.body != null
+                    ? String(err.body).slice(0, 2000)
+                    : undefined;
               store.appendEvent(sessionId, {
                 event_type: 'provider_response',
                 duration_ms: durationMs,
@@ -1211,6 +1220,7 @@ export function instrumentProviderLogging(agent, store, sessionId, hooks = {}) {
                   message: msg,
                   name: err?.name,
                   status: err?.status,
+                  ...(errBody !== undefined ? { body: errBody } : {}),
                   ...(wide ? { _wide: true } : {}),
                 },
               });

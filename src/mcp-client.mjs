@@ -318,6 +318,16 @@ export function mcpResultImageMeta(result) {
  * 12B QAT and 26B-A4B). Do not require a "vision" / "vl" suffix — that
  * was a Gemma 2 vs PaliGemma split and wrongly omitted Gemma 4 images.
  */
+/**
+ * Resolve the effective image-input flag: explicit boolean wins (harness or
+ * agent config, e.g. a vision-less local server behind a multimodal label);
+ * otherwise fall back to the label heuristic.
+ */
+export function resolveSupportsImages(explicit, model) {
+  if (typeof explicit === 'boolean') return explicit;
+  return modelSupportsImages(model);
+}
+
 export function modelSupportsImages(model) {
   const s = String(model || '').toLowerCase();
   if (!s) return true;

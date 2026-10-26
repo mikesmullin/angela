@@ -23,6 +23,7 @@ import {
   mcpResultToProviderContent,
   mcpResultImageMeta,
   modelSupportsImages,
+  resolveSupportsImages,
   toolName,
 } from './mcp-client.mjs';
 import { PolicyEngine, DEFAULT_LUCY_ALLOWLIST } from './policy.mjs';
@@ -111,7 +112,7 @@ export function isTerminalCommandTool(serverName, mcpToolName, fullName = '') {
 export async function registerMcpTools(
   agent,
   clients,
-  { onEvent, prefix = true, policy = null } = {},
+  { onEvent, prefix = true, policy = null, supportsImages = null } = {},
 ) {
   const registered = [];
   let progressSeq = 0;
@@ -226,7 +227,7 @@ export async function registerMcpTools(
             const text = mcpResultToText(result);
             const image = mcpResultImageMeta(result);
             const content = mcpResultToProviderContent(result, {
-              supportsImages: modelSupportsImages(agent?.model),
+              supportsImages: resolveSupportsImages(supportsImages, agent?.model),
             });
             emit(onEvent, 'tool_result', {
               server: client.name,
@@ -322,6 +323,7 @@ class Session {
         h.onEvent?.(ev);
       },
       policy: h.policy,
+      supportsImages: h.supportsImages,
     });
 
     // Snapshot full tool registry, then apply toolsEnabled (null = all tools).
@@ -1424,7 +1426,7 @@ export class Angela {
   /** Whether the configured model is expected to accept image parts. */
   get supportsImages() {
     const model = (this.#config?.model && String(this.#config.model).trim()) || '';
-    return modelSupportsImages(model);
+    return resolveSupportsImages(this.#config?.supportsImages, model);
   }
 
   /**
@@ -1548,7 +1550,7 @@ export class Angela {
     emit(inst.onEvent, 'session_init', {
       mcpServers: inst.clients.map((c) => c.name),
       model: initModel,
-      supportsImages: modelSupportsImages(initModel),
+      supportsImages: resolveSupportsImages(config.supportsImages, initModel),
       policyMode: inst.policy.mode,
       projectRoot: inst.projectRoot,
     });
@@ -1694,6 +1696,7 @@ export class Angela {
       on_delta: wrappedOnDelta,
       retain_history,
       ...(context_window_size != null ? { context_window_size } : {}),
+      ...(this.#config.maxImages != null ? { max_images: this.#config.maxImages } : {}),
       ...(this.#config.output_tool ? { output_tool: this.#config.output_tool } : {}),
     });
 
@@ -1746,7 +1749,7 @@ export class Angela {
             overrides: cfg.overrides || null,
             config: {
               model: cfg.model,
-              supportsImages: modelSupportsImages(cfg.model),
+              supportsImages: resolveSupportsImages(cfg.supportsImages, cfg.model),
               mcp: (self.clients || []).map((c) => c.name),
               policyMode: cfg.policyMode || 'ask',
               approveMode: cfg.approveMode ?? null,
@@ -1855,6 +1858,7 @@ export {
   mcpResultToProviderContent,
   mcpResultImageMeta,
   modelSupportsImages,
+  resolveSupportsImages,
   toolName,
 } from './mcp-client.mjs';
 
