@@ -1,0 +1,768 @@
+//! The turn loop — the part of `angela/src/index.mjs` that drives agl and
+//! turns a model turn into session events plus a card stream.
+//!
+//! ## How a turn runs
+//!
+//! 1. Resolve the tab's session (resume, or create one).
+//! 2. Title a fresh session from its first user message.
+//! 3. Persist the user message as a `context_window` event.
+//! 4. Hydrate the agent's context window **from the log**, then run agl with
+//!    streaming deltas.
+//! 5. Persist reasoning and the assistant reply as events.
+//! 6. Record the completed turn.
+//!
+//! Hydrating from the log rather than from a live in-process agent is what
+//! `build_context_window_items` was written for ("session open / resume"), and
+//! it means a server restart does not amnesia the conversation — the JS keeps
+//! a live harness per tab *and* can rehydrate; this port starts from the
+//! durable half.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use agl::agent::{Agent, Factory};
+use agl::agent::TurnEvent;
+use agl::provider::{Channel, Message};
+use serde_json::{json, Value};
+
+use crate::agent_loader::AgentDef;
+use crate::allowlist;
+use crate::mcp::McpServer;
+use crate::mcp_presets;
+use crate::session_store::{ContextItem, NewEvent, NewSession, SessionStore};
+
+/// How long one tool call may take before the turn gives up on it.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Starting a server should be fast; a hang here would stall the first turn.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Which session a UI tab is currently pointed at.
+#[derive(Debug, Clone, Default)]
+pub struct TabEntry {
+    pub session_id: String,
+    pub agent: Option<String>,
+    pub model: String,
+    pub last_prompt_tokens: Option<u64>,
+    pub last_total_tokens: Option<u64>,
+}
+
+/// `liveTabs` — tab id → the session it is driving.
+#[derive(Default)]
+pub struct LiveTabs {
+    map: Mutex<HashMap<String, TabEntry>>,
+}
+
+impl LiveTabs {
+    pub fn get(&self, tab_id: &str) -> Option<TabEntry> {
+        self.map.lock().unwrap().get(tab_id).cloned()
+    }
+
+    pub fn set(&self, tab_id: &str, entry: TabEntry) {
+        self.map.lock().unwrap().insert(tab_id.to_string(), entry);
+    }
+
+    pub fn clear(&self, tab_id: &str) -> Option<TabEntry> {
+        self.map.lock().unwrap().remove(tab_id)
+    }
+
+    /// Forget every tab pointing at a session — used when it is deleted.
+    pub fn forget_session(&self, session_id: &str) {
+        self.map
+            .lock()
+            .unwrap()
+            .retain(|_, e| e.session_id != session_id);
+    }
+}
+
+/// Connected MCP servers, started on demand and reused across turns.
+///
+/// Spawning a server per turn would pay process startup on every prompt and
+/// throw away whatever state the server holds; the JS keeps them on the live
+/// tab for the same reason.
+#[derive(Default)]
+pub struct McpPool {
+    servers: Mutex<HashMap<String, Arc<McpServer>>>,
+}
+
+impl McpPool {
+    /// Connect (or reuse) the named presets, returning those that came up.
+    ///
+    /// A server that fails to start is reported and skipped rather than
+    /// failing the turn: losing shell access should not cost you the chat.
+    pub fn ensure(
+        &self,
+        names: &[String],
+        project_root: &std::path::Path,
+    ) -> (Vec<Arc<McpServer>>, Vec<String>) {
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        for name in names {
+            if let Some(existing) = self.servers.lock().unwrap().get(name) {
+                out.push(Arc::clone(existing));
+                continue;
+            }
+            let Some(spec) = mcp_presets::preset(name, project_root) else {
+                errors.push(format!("unknown or uninstalled MCP preset `{name}`"));
+                continue;
+            };
+            match McpServer::connect(&spec, CONNECT_TIMEOUT) {
+                Ok(srv) => {
+                    self.servers
+                        .lock()
+                        .unwrap()
+                        .insert(name.clone(), Arc::clone(&srv));
+                    out.push(srv);
+                }
+                Err(e) => errors.push(format!("MCP `{name}`: {e}")),
+            }
+        }
+        (out, errors)
+    }
+
+    pub fn shutdown(&self) {
+        for (_, s) in self.servers.lock().unwrap().drain() {
+            s.close();
+        }
+    }
+}
+
+/// The default when the client names no model. Matches the JS fallback chain
+/// ending at the user's `~/.config/agl/config.yaml` `default_model`.
+pub const DEFAULT_MODEL: &str = "llama-server:default";
+
+/// What a turn needs.
+pub struct TurnRequest {
+    pub tab_id: String,
+    pub content: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    /// Force a brand-new session rather than resuming the tab's.
+    pub new_session: bool,
+    /// Resume a specific session (the history rail clicking an old one).
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum TurnError {
+    EmptyContent,
+    Store(String),
+    Agent(String),
+}
+
+impl std::fmt::Display for TurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TurnError::EmptyContent => write!(f, "empty content"),
+            TurnError::Store(m) => write!(f, "session store: {m}"),
+            TurnError::Agent(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Map one hydrated context row back to a provider message.
+///
+/// Tool rows carry their call id; a tool-call row carries the calls. Rows the
+/// provider has no use for (`reasoning`) are dropped here, mirroring
+/// `messages_for_provider` in agl.
+fn item_to_message(item: &ContextItem) -> Option<Message> {
+    match item.role.as_str() {
+        "user" | "assistant" if item.tool_calls.is_none() => Some(Message::text(
+            &item.role,
+            item.content.clone(),
+        )),
+        "assistant" => {
+            let calls = serde_json::from_value(item.tool_calls.clone()?).ok()?;
+            Some(Message {
+                role: "assistant".into(),
+                content: Some(Value::String(item.content.clone())),
+                tool_calls: Some(calls),
+                tool_call_id: None,
+                reasoning_content: None,
+            })
+        }
+        "tool" => Some(Message::tool_result(
+            item.tool_call_id.clone()?,
+            item.content.clone(),
+        )),
+        _ => None, // reasoning is UI-only
+    }
+}
+
+/// Resolve which session this turn belongs to, creating one if needed.
+pub fn resolve_session(
+    store: &SessionStore,
+    tabs: &LiveTabs,
+    req: &TurnRequest,
+) -> Result<String, TurnError> {
+    if !req.new_session {
+        // An explicit resume wins over whatever the tab was on.
+        if let Some(sid) = req.session_id.as_deref().filter(|s| !s.is_empty()) {
+            if store.load(sid).is_some() {
+                return Ok(sid.to_string());
+            }
+        }
+        if let Some(entry) = tabs.get(&req.tab_id) {
+            if store.load(&entry.session_id).is_some() {
+                return Ok(entry.session_id);
+            }
+        }
+    }
+    let state = store
+        .create(NewSession {
+            agent: req.agent.clone(),
+            model: Some(req.model.clone().unwrap_or_else(|| DEFAULT_MODEL.into())),
+            ..Default::default()
+        })
+        .map_err(|e| TurnError::Store(e.to_string()))?;
+    Ok(state["id"].as_str().unwrap_or_default().to_string())
+}
+
+/// Give a fresh session a title from its first user message.
+///
+/// 64 characters plus an ellipsis, as the JS does — the history rail shows
+/// this, so the truncation point is user-visible.
+pub fn title_from_first_message(store: &SessionStore, session_id: &str, content: &str) {
+    let Some(state) = store.load(session_id) else {
+        return;
+    };
+    let has_title = state
+        .get("title")
+        .map(crate::session_store::js_truthy)
+        .unwrap_or(false);
+    if has_title {
+        return;
+    }
+    let chars: Vec<char> = content.chars().collect();
+    let title = if chars.len() > 64 {
+        format!("{}…", chars[..64].iter().collect::<String>())
+    } else {
+        content.to_string()
+    };
+    let mut patch = serde_json::Map::new();
+    patch.insert("title".into(), json!(title));
+    store.update_meta(session_id, patch);
+}
+
+/// Register every tool the connected servers advertise.
+///
+/// Names are prefixed `file_io__read_file` style, matching the JS, so a
+/// definition's `toolsEnabled` / `allowlist` entries carry over unchanged and
+/// two servers cannot collide on a common name like `read_file`.
+///
+/// Every call is gated by the allowlist **before** it reaches the server. A
+/// denied call returns text the model can read, so it can choose a different
+/// approach rather than failing the turn — and, critically, deny is the
+/// default: an empty allowlist permits nothing.
+pub fn register_tools(
+    agent: &mut Agent,
+    servers: &[Arc<McpServer>],
+    enabled: Option<&Vec<String>>,
+    allow_text: &str,
+    policy_mode: &str,
+) -> usize {
+    // `auto` is the documented escape hatch for a trusted project; anything
+    // else (including the default `ask`) enforces the list.
+    let enforce = !policy_mode.eq_ignore_ascii_case("auto");
+    let allow_text = allow_text.to_string();
+    let mut n = 0;
+    for srv in servers {
+        for tool in &srv.tools {
+            let name = mcp_presets::prefixed_tool_name(&srv.name, &tool.name);
+            if let Some(list) = enabled {
+                if !list.iter().any(|e| e == &name || e == &tool.name) {
+                    continue;
+                }
+            }
+            let (props, required) = crate::mcp::schema_parts(&tool.input_schema);
+            let srv = Arc::clone(srv);
+            let remote = tool.name.clone();
+            let gate_name = name.clone();
+            let allow_text = allow_text.clone();
+            let ok = agent.tool(
+                &name,
+                &tool.description,
+                props,
+                required,
+                move |args: &Value| {
+                    if enforce {
+                        let cmd = allowlist::command_line(&gate_name, args);
+                        if !allowlist::is_allowed(&allow_text, &gate_name, &cmd) {
+                            // Denied calls never reach the server.
+                            return Ok(format!(
+                                "denied: `{gate_name}`{} is not on this session's allowlist. \
+                                 Ask the user to allow it, or use a permitted tool.",
+                                if cmd.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" with `{cmd}`")
+                                }
+                            ));
+                        }
+                    }
+                    match srv.call_tool(&remote, args, TOOL_TIMEOUT) {
+                        Ok(text) => Ok(text),
+                        Err(e) => Ok(format!("error: {e}")),
+                    }
+                },
+            );
+            if ok.is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Build an agl agent seeded with the session's prior conversation.
+pub fn build_agent(
+    store: &SessionStore,
+    session_id: &str,
+    model: &str,
+    system_prompt: Option<String>,
+) -> Result<Agent, TurnError> {
+    let agent = Agent::factory(Factory {
+        model: Some(model.to_string()),
+        system_prompt,
+        retain_history: Some(true),
+        parallel_tools: Some(true),
+        ..Default::default()
+    })
+    .map_err(|e| TurnError::Agent(e.to_string()))?;
+
+    // Hydrate from the durable log. Hidden rows stay hidden from the
+    // provider but are not deleted — the eye toggle in the UI.
+    for item in store.build_context_window_items(session_id) {
+        if !item.visible {
+            continue;
+        }
+        if let Some(msg) = item_to_message(&item) {
+            agent.push_context(msg);
+        }
+    }
+    Ok(agent)
+}
+
+/// Run one turn, emitting protocol rows through `emit`.
+///
+/// `emit` returns `false` when the client has gone away, which stops the
+/// turn rather than finishing work nobody will see.
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn(
+    store: &SessionStore,
+    tabs: &LiveTabs,
+    rt: &tokio::runtime::Runtime,
+    project_root: &str,
+    pool: &McpPool,
+    def: &AgentDef,
+    req: TurnRequest,
+    emit: &mut dyn FnMut(&Value) -> bool,
+) -> Result<(), TurnError> {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return Err(TurnError::EmptyContent);
+    }
+    // Precedence: the request, then the agent definition, then the default.
+    // An empty model is meaningful — it lets agl resolve `default_model`
+    // from its config on every inference.
+    let model = req
+        .model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| Some(def.model.clone()).filter(|m| !m.trim().is_empty()))
+        .unwrap_or_else(|| DEFAULT_MODEL.into());
+    let session_id = resolve_session(store, tabs, &req)?;
+
+    tabs.set(
+        &req.tab_id,
+        TabEntry {
+            session_id: session_id.clone(),
+            agent: req.agent.clone(),
+            model: model.clone(),
+            ..Default::default()
+        },
+    );
+    title_from_first_message(store, &session_id, &content);
+    store.set_status(&session_id, "running");
+
+    // The user's message is durable before any inference runs: if the model
+    // call fails, the prompt is still in the transcript.
+    let _ = store.append_event(
+        &session_id,
+        NewEvent::new(
+            "context_window",
+            json!({ "role": "user", "content": content }),
+        ),
+    );
+
+    let context_window = store
+        .load(&session_id)
+        .and_then(|s| s.get("contextWindow").and_then(|v| v.as_u64()));
+
+    // Tools come up before the model is told they exist.
+    let root = std::path::Path::new(project_root);
+    let (servers, mcp_errors) = pool.ensure(&def.mcp, root);
+    for e in &mcp_errors {
+        let _ = store.append_event(&session_id, NewEvent::new("error", json!({ "message": e })));
+        emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
+    }
+
+    let mut agent = build_agent(
+        store,
+        &session_id,
+        &model,
+        Some(def.system.clone()).filter(|p| !p.trim().is_empty()),
+    )?;
+    // The session's own allowlist (set from the UI) overrides the agent
+    // definition's; `allowlistSource` records which one is in force.
+    let session_state = store.load(&session_id);
+    let overridden = session_state
+        .as_ref()
+        .and_then(|s| s.get("allowlist"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let allow_text = overridden.clone().unwrap_or_else(|| def.allowlist.clone());
+    let tool_count = register_tools(
+        &mut agent,
+        &servers,
+        def.tools_enabled.as_ref(),
+        &allow_text,
+        &def.policy_mode,
+    );
+    let tool_names: Vec<String> = agent.tools.keys().cloned().collect();
+
+    emit(&json!({
+        "type": "session",
+        "tabId": req.tab_id,
+        "sessionId": session_id,
+        "agent": def.name,
+        "model": model,
+        "contextWindow": context_window,
+        "tokensUsed": 0,
+        "tools": tool_names,
+        "mcp": def.mcp,
+        "allowlist": allow_text,
+        "allowlistSource": if overridden.is_some() { "ui" } else { "agent" },
+        "allowlistOverridden": overridden.is_some(),
+        "policyMode": def.policy_mode,
+        "projectRoot": project_root,
+    }));
+    let _ = tool_count;
+
+    // ---- the inference ----------------------------------------------------
+    let mut reasoning = String::new();
+    let answer = {
+        let sid = session_id.clone();
+        let mut on_event = |e: TurnEvent<'_>| match e {
+            TurnEvent::Delta { text, channel } => match channel {
+                Channel::Reasoning => {
+                    reasoning.push_str(text);
+                    emit(&json!({ "type": "reasoning_delta", "text": text, "sessionId": sid }));
+                }
+                Channel::Content => {
+                    emit(&json!({ "type": "assistant_delta", "text": text, "sessionId": sid }));
+                }
+            },
+            // A tool call is durable and on screen the moment it is made,
+            // not after the turn settles — a long shell command would
+            // otherwise look like a hang.
+            TurnEvent::ToolCall { id, name, args } => {
+                let w = store.append_event(
+                    &sid,
+                    NewEvent::new(
+                        "tool_call",
+                        json!({ "id": id, "name": name, "args": args }),
+                    ),
+                );
+                let event_id = w.map(|x| x.event_id).unwrap_or_default();
+                emit(&json!({
+                    "type": "card",
+                    "card": { "kind": "tool_call", "name": name, "args": args,
+                              "eventId": event_id, "visible": true },
+                }));
+            }
+            TurnEvent::ToolResult { id, name, text } => {
+                // A denial is a failure from the UI's point of view, even
+                // though it is a well-formed result the model can read.
+                let ok = !text.starts_with("error:") && !text.starts_with("denied:");
+                let w = store.append_event(
+                    &sid,
+                    NewEvent::new(
+                        "tool_result",
+                        json!({ "tool_call_id": id, "name": name, "text": text, "ok": ok,
+                                "denied": text.starts_with("denied:") }),
+                    ),
+                );
+                let event_id = w.map(|x| x.event_id).unwrap_or_default();
+                emit(&json!({
+                    "type": "card",
+                    "card": { "kind": "tool_result", "name": name, "text": text,
+                              "ok": ok, "denied": text.starts_with("denied:"),
+                              "eventId": event_id, "visible": true },
+                }));
+            }
+        };
+        rt.block_on(agent.run_events(&content, true, &mut on_event))
+    };
+
+    let answer = match answer {
+        Ok(a) => a,
+        Err(e) => {
+            store.set_status(&session_id, "error");
+            let msg = e.to_string();
+            let _ = store.append_event(
+                &session_id,
+                NewEvent::new("error", json!({ "message": msg })),
+            );
+            emit(&json!({ "type": "card", "card": { "kind": "error", "text": msg } }));
+            emit(&json!({ "type": "done", "ok": false, "error": msg, "sessionId": session_id }));
+            return Err(TurnError::Agent(msg));
+        }
+    };
+
+    // ---- persist + finalize ----------------------------------------------
+    if !reasoning.trim().is_empty() {
+        let w = store.append_event(
+            &session_id,
+            NewEvent::new("reasoning", json!({ "text": reasoning })),
+        );
+        if let Ok(w) = w {
+            emit(&json!({
+                "type": "card",
+                "card": { "kind": "reasoning", "text": reasoning, "eventId": w.event_id, "visible": true },
+            }));
+        }
+    }
+
+    let usage = agent.last_usage.lock().unwrap().clone();
+    let telemetry = match &usage {
+        Some(u) => json!({
+            "prompt_tokens": u.prompt_tokens,
+            "completion_tokens": u.completion_tokens,
+            "total_tokens": u.total_tokens,
+            "model": model,
+        }),
+        None => Value::Null,
+    };
+    if let Some(u) = &usage {
+        if let Some(p) = u.prompt_tokens {
+            emit(&json!({
+                "type": "usage",
+                "prompt_tokens": p,
+                "total_tokens": u.total_tokens,
+                "sessionId": session_id,
+            }));
+            let mut patch = serde_json::Map::new();
+            patch.insert("lastPromptTokens".into(), json!(p));
+            patch.insert("lastTotalTokens".into(), json!(u.total_tokens));
+            patch.insert("lastCompletionTokens".into(), json!(u.completion_tokens));
+            store.update_meta(&session_id, patch);
+        }
+    }
+
+    let text = answer.trim().to_string();
+    if !text.is_empty() {
+        let _ = store.append_event(
+            &session_id,
+            NewEvent::new(
+                "context_window",
+                json!({ "role": "assistant", "content": text }),
+            ),
+        );
+    }
+    // Always finalize the bubble, even when empty, so a client streaming into
+    // a live bubble knows the turn is sealed.
+    emit(&json!({
+        "type": "card",
+        "card": { "kind": "assistant", "text": text, "telemetry": telemetry, "streaming": false },
+    }));
+
+    store.record_turn_complete(&session_id, None);
+    emit(&json!({ "type": "done", "ok": true, "sessionId": session_id }));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, SessionStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = SessionStore::new(tmp.path()).unwrap();
+        (tmp, s)
+    }
+
+    #[test]
+    fn a_fresh_tab_gets_a_new_session_and_reuses_it() {
+        let (_t, s) = store();
+        let tabs = LiveTabs::default();
+        let req = TurnRequest {
+            tab_id: "1".into(),
+            content: "hi".into(),
+            agent: None,
+            model: None,
+            new_session: false,
+            session_id: None,
+        };
+        let a = resolve_session(&s, &tabs, &req).unwrap();
+        tabs.set(
+            "1",
+            TabEntry {
+                session_id: a.clone(),
+                ..Default::default()
+            },
+        );
+        let b = resolve_session(&s, &tabs, &req).unwrap();
+        assert_eq!(a, b, "the tab stays on its session");
+    }
+
+    #[test]
+    fn new_session_forces_a_fresh_one() {
+        let (_t, s) = store();
+        let tabs = LiveTabs::default();
+        let first = resolve_session(
+            &s,
+            &tabs,
+            &TurnRequest {
+                tab_id: "1".into(),
+                content: "hi".into(),
+                agent: None,
+                model: None,
+                new_session: false,
+                session_id: None,
+            },
+        )
+        .unwrap();
+        tabs.set(
+            "1",
+            TabEntry {
+                session_id: first.clone(),
+                ..Default::default()
+            },
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = resolve_session(
+            &s,
+            &tabs,
+            &TurnRequest {
+                tab_id: "1".into(),
+                content: "hi".into(),
+                agent: None,
+                model: None,
+                new_session: true,
+                session_id: None,
+            },
+        )
+        .unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn an_explicit_session_id_resumes_it() {
+        let (_t, s) = store();
+        let tabs = LiveTabs::default();
+        let target = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let got = resolve_session(
+            &s,
+            &tabs,
+            &TurnRequest {
+                tab_id: "9".into(),
+                content: "hi".into(),
+                agent: None,
+                model: None,
+                new_session: false,
+                session_id: Some(target.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(got, target);
+    }
+
+    #[test]
+    fn an_unknown_session_id_falls_through_to_a_new_one() {
+        let (_t, s) = store();
+        let tabs = LiveTabs::default();
+        let got = resolve_session(
+            &s,
+            &tabs,
+            &TurnRequest {
+                tab_id: "9".into(),
+                content: "hi".into(),
+                agent: None,
+                model: None,
+                new_session: false,
+                session_id: Some("does-not-exist".into()),
+            },
+        )
+        .unwrap();
+        assert!(s.load(&got).is_some());
+    }
+
+    #[test]
+    fn the_title_comes_from_the_first_message_and_sticks() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        title_from_first_message(&s, &id, "Migrate the auth service");
+        assert_eq!(s.load(&id).unwrap()["title"], "Migrate the auth service");
+        // a second message must not rename the session
+        title_from_first_message(&s, &id, "something else");
+        assert_eq!(s.load(&id).unwrap()["title"], "Migrate the auth service");
+    }
+
+    #[test]
+    fn a_long_title_is_truncated_with_an_ellipsis() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let long = "x".repeat(100);
+        title_from_first_message(&s, &id, &long);
+        let t = s.load(&id).unwrap()["title"].as_str().unwrap().to_string();
+        assert_eq!(t.chars().count(), 65, "64 chars + the ellipsis");
+        assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn titles_truncate_by_character_not_byte() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // multi-byte input must not be cut mid-character
+        title_from_first_message(&s, &id, &"é".repeat(100));
+        let t = s.load(&id).unwrap()["title"].as_str().unwrap().to_string();
+        assert_eq!(t.chars().count(), 65);
+    }
+
+    #[test]
+    fn hydration_skips_hidden_rows_and_reasoning() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        s.append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"one"}))).unwrap();
+        let hidden = s
+            .append_event(&id, NewEvent::new("context_window", json!({"role":"assistant","content":"hidden"})))
+            .unwrap();
+        s.append_event(&id, NewEvent::new("reasoning", json!({"text":"ui only"}))).unwrap();
+        s.append_event(&id, NewEvent::new("context_meta", json!({"event_id": hidden.event_id, "visible": false}))).unwrap();
+
+        let msgs: Vec<_> = s
+            .build_context_window_items(&id)
+            .iter()
+            .filter(|i| i.visible)
+            .filter_map(item_to_message)
+            .collect();
+        assert_eq!(msgs.len(), 1, "hidden and reasoning rows are not sent");
+        assert_eq!(msgs[0].role, "user");
+    }
+}

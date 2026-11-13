@@ -1,0 +1,19 @@
+{"event_id":"eea7cfb2e","ts":"2026-11-13T05:20:46.454Z","event_type":"session","duration_ms":null,"payload":{"kind":"created","agent":"lucy","model":"m","mcp":[],"overrides":null,"config":null},"meta":{}}
+{"event_id":"e03cbb20f","ts":"2026-11-13T05:20:46.454Z","event_type":"context_window","duration_ms":null,"payload":{"role":"user","content":"hello there"},"meta":{}}
+{"event_id":"e7f6830e9","ts":"2026-11-13T05:20:46.454Z","event_type":"context_window","duration_ms":null,"payload":{"role":"assistant","content":"hidden reply"},"meta":{}}
+{"event_id":"e9c6ecb2d","ts":"2026-11-13T05:20:46.454Z","event_type":"context_window","duration_ms":null,"payload":{"role":"assistant","content":"visible reply"},"meta":{}}
+{"event_id":"eaab4a89f","ts":"2026-11-13T05:20:46.454Z","event_type":"context_window","duration_ms":null,"payload":{"kind":"provider_messages_snapshot","role":"system","content":"DUMP"},"meta":{}}
+{"event_id":"e1cc085fe","ts":"2026-11-13T05:20:46.454Z","event_type":"reasoning","duration_ms":null,"payload":{"text":"thinking hard"},"meta":{}}
+{"event_id":"ebb3e3de1","ts":"2026-11-13T05:20:46.454Z","event_type":"context_window","duration_ms":null,"payload":{"type":"reasoning","content":"second thought"},"meta":{}}
+{"event_id":"ef8ec5c0a","ts":"2026-11-13T05:20:46.455Z","event_type":"tool_call","duration_ms":null,"payload":{"name":"read","args":{"file":"a.py"},"explanation":"why"},"meta":{}}
+{"event_id":"ea2551f3d","ts":"2026-11-13T05:20:46.455Z","event_type":"tool_call","duration_ms":null,"payload":{"name":"bash","args":"ls -la","id":"explicit_call_1"},"meta":{}}
+{"event_id":"e1e825f97","ts":"2026-11-13T05:20:46.455Z","event_type":"tool_call","duration_ms":null,"payload":{"name":"noargs"},"meta":{}}
+{"event_id":"ee712230b","ts":"2026-11-13T05:20:46.455Z","event_type":"tool_result","duration_ms":null,"payload":{"name":"read","tool_call_id":"explicit_call_1","text":"312 lines","ok":true},"meta":{}}
+{"event_id":"e5b045d55","ts":"2026-11-13T05:20:46.455Z","event_type":"tool_result","duration_ms":null,"payload":{"name":"bash","content":"stdout here","ok":false,"denied":true},"meta":{}}
+{"event_id":"e92386bd4","ts":"2026-11-13T05:20:46.455Z","event_type":"tool_result","duration_ms":null,"payload":{"name":"weird","content":{"nested":[1,2]}},"meta":{}}
+{"event_id":"e288cd413","ts":"2026-11-13T05:20:46.455Z","event_type":"tool_result","duration_ms":null,"payload":{"name":"nocontent","note":"falls back to whole payload"},"meta":{}}
+{"event_id":"ed7355308","ts":"2026-11-13T05:20:46.455Z","event_type":"tool_call","duration_ms":null,"payload":{},"meta":{}}
+{"event_id":"efbb91da9","ts":"2026-11-13T05:20:46.455Z","event_type":"context_window","duration_ms":null,"payload":{"role":"user"},"meta":{}}
+{"event_id":"e5e60b683","ts":"2026-11-13T05:20:46.455Z","event_type":"usage","duration_ms":null,"payload":{"prompt_tokens":5},"meta":{}}
+{"event_id":"e67c5a1b9","ts":"2026-11-13T05:20:46.455Z","event_type":"context_meta","duration_ms":null,"payload":{"event_id":"e7f6830e9","visible":false},"meta":{}}
+{"event_id":"e675b7beb","ts":"2026-11-13T05:20:46.455Z","event_type":"context_meta","duration_ms":null,"payload":{"event_ids":["e7f6830e9"],"goto":{"enabled":1,"label":"jump"}},"meta":{}}

@@ -1,0 +1,150 @@
+{
+  "id": "2026-11-13T05-20-46_c69809",
+  "items": [
+    {
+      "role": "user",
+      "content": "hello there",
+      "id": "e03cbb20f",
+      "visible": true
+    },
+    {
+      "role": "assistant",
+      "content": "hidden reply",
+      "id": "e7f6830e9",
+      "visible": false,
+      "goto": {
+        "enabled": true,
+        "label": "jump"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "visible reply",
+      "id": "e9c6ecb2d",
+      "visible": true
+    },
+    {
+      "role": "reasoning",
+      "content": "thinking hard",
+      "id": "e1cc085fe",
+      "visible": true
+    },
+    {
+      "role": "reasoning",
+      "content": "second thought",
+      "id": "ebb3e3de1",
+      "visible": true
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "ef8ec5c0a",
+          "type": "function",
+          "function": {
+            "name": "read",
+            "arguments": "{\"file\":\"a.py\"}"
+          }
+        }
+      ],
+      "id": "ef8ec5c0a",
+      "visible": true,
+      "name": "read",
+      "args": {
+        "file": "a.py"
+      },
+      "explanation": "why"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "explicit_call_1",
+          "type": "function",
+          "function": {
+            "name": "bash",
+            "arguments": "ls -la"
+          }
+        }
+      ],
+      "id": "ea2551f3d",
+      "visible": true,
+      "name": "bash",
+      "args": "ls -la",
+      "explanation": null
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "e1e825f97",
+          "type": "function",
+          "function": {
+            "name": "noargs",
+            "arguments": "{}"
+          }
+        }
+      ],
+      "id": "e1e825f97",
+      "visible": true,
+      "name": "noargs",
+      "explanation": null
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "explicit_call_1",
+      "content": "312 lines",
+      "id": "ee712230b",
+      "visible": true,
+      "name": "read",
+      "ok": true,
+      "explanation": null
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "e5b045d55",
+      "content": "stdout here",
+      "id": "e5b045d55",
+      "visible": true,
+      "name": "bash",
+      "ok": false,
+      "denied": true,
+      "explanation": null
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "e92386bd4",
+      "content": "{\"nested\":[1,2]}",
+      "id": "e92386bd4",
+      "visible": true,
+      "name": "weird",
+      "explanation": null
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "e288cd413",
+      "content": "{\"name\":\"nocontent\",\"note\":\"falls back to whole payload\"}",
+      "id": "e288cd413",
+      "visible": true,
+      "name": "nocontent",
+      "explanation": null
+    }
+  ],
+  "msgs": [
+    {
+      "event_id": "e03cbb20f",
+      "role": "user",
+      "content": "hello there",
+      "meta": {}
+    },
+    {
+      "event_id": "e9c6ecb2d",
+      "role": "assistant",
+      "content": "visible reply",
+      "meta": {}
+    }
+  ]
+}
