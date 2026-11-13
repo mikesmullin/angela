@@ -351,6 +351,8 @@ impl Server {
                                 "messages": reconstruct_messages_from_log(&st.store, id),
                                 "allowlist": override_text.clone().unwrap_or(agent_default),
                                 "allowlistOverridden": override_text.is_some(),
+                                "allowlistMode": meta.get("allowlistMode")
+                                    .cloned().unwrap_or(json!("allowlist")),
                             }),
                         )
                     }
@@ -447,10 +449,20 @@ impl Server {
                     .to_string();
 
                 let mut patch = Map::new();
-                if overridden {
+                // `mode` is independent of the rules: setting unrestricted
+                // must not touch `allowlist`, or the rules are lost.
+                if let Some(mode) = body.get("mode").and_then(|v| v.as_str()) {
+                    let mode = if mode == "unrestricted" {
+                        "unrestricted"
+                    } else {
+                        "allowlist"
+                    };
+                    patch.insert("allowlistMode".into(), json!(mode));
+                }
+                if body.get("allowlist").is_some() && overridden {
                     patch.insert("allowlist".into(), json!(text));
                     patch.insert("allowlistSource".into(), json!("ui"));
-                } else {
+                } else if body.get("allowlist").is_some() {
                     patch.insert("allowlist".into(), Value::Null);
                     patch.insert("allowlistSource".into(), json!("agent"));
                 }
@@ -462,6 +474,9 @@ impl Server {
                         "sessionId": sid,
                         "allowlistSource": if overridden { "ui" } else { "agent" },
                         "overridden": overridden,
+                        "allowlistMode": st.store.load(&sid)
+                            .and_then(|s| s.get("allowlistMode").cloned())
+                            .unwrap_or(json!("allowlist")),
                         "bytes": text.len(),
                     }),
                 )

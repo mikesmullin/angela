@@ -407,6 +407,9 @@ pub fn run_turn(
         emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
     }
 
+    // Timed from before the agent is built so the number covers the whole
+    // turn the user waited through, not just the final inference.
+    let started = std::time::Instant::now();
     let mut agent = build_agent(
         store,
         &session_id,
@@ -421,7 +424,23 @@ pub fn run_turn(
         .and_then(|s| s.get("allowlist"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    let allow_text = overridden.clone().unwrap_or_else(|| def.allowlist.clone());
+    let rules = overridden.clone().unwrap_or_else(|| def.allowlist.clone());
+
+    // `unrestricted` is a temporary override, NOT an edit: it runs the turn
+    // with `*` while leaving the rules exactly as written, so switching back
+    // restores them. Storing `*` into `allowlist` would destroy them.
+    let mode = session_state
+        .as_ref()
+        .and_then(|s| s.get("allowlistMode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("allowlist")
+        .to_string();
+    let unrestricted = mode == "unrestricted";
+    let allow_text = if unrestricted {
+        "*".to_string()
+    } else {
+        rules.clone()
+    };
     let tool_count = register_tools(
         &mut agent,
         &servers,
@@ -441,7 +460,11 @@ pub fn run_turn(
         "tokensUsed": 0,
         "tools": tool_names,
         "mcp": def.mcp,
-        "allowlist": allow_text,
+        // `allowlist` is the rules as written; `effectiveAllowlist` is what
+        // actually gated this turn. They differ only in unrestricted mode.
+        "allowlist": rules,
+        "effectiveAllowlist": allow_text,
+        "allowlistMode": mode,
         "allowlistSource": if overridden.is_some() { "ui" } else { "agent" },
         "allowlistOverridden": overridden.is_some(),
         "policyMode": def.policy_mode,
@@ -451,10 +474,17 @@ pub fn run_turn(
 
     // ---- the inference ----------------------------------------------------
     let mut reasoning = String::new();
+    // Time to first token: the latency the user actually feels before
+    // anything appears, which total duration hides entirely.
+    let mut first_token_at: Option<std::time::Duration> = None;
     let answer = {
         let sid = session_id.clone();
         let mut on_event = |e: TurnEvent<'_>| match e {
-            TurnEvent::Delta { text, channel } => match channel {
+            TurnEvent::Delta { text, channel } => {
+                if first_token_at.is_none() {
+                    first_token_at = Some(started.elapsed());
+                }
+                match channel {
                 Channel::Reasoning => {
                     reasoning.push_str(text);
                     emit(&json!({ "type": "reasoning_delta", "text": text, "sessionId": sid }));
@@ -462,7 +492,8 @@ pub fn run_turn(
                 Channel::Content => {
                     emit(&json!({ "type": "assistant_delta", "text": text, "sessionId": sid }));
                 }
-            },
+                }
+            }
             // A tool call is durable and on screen the moment it is made,
             // not after the turn settles — a long shell command would
             // otherwise look like a hang.
@@ -535,11 +566,24 @@ pub fn run_turn(
     }
 
     let usage = agent.last_usage.lock().unwrap().clone();
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // Generation rate over the whole turn. Tool execution is included, so a
+    // tool-heavy turn reads slower than the model actually generated — the
+    // honest number for "how long did this take me", which is what the
+    // metric is for.
+    let tok_per_sec = usage
+        .as_ref()
+        .and_then(|u| u.completion_tokens)
+        .filter(|_| elapsed_ms > 0.0)
+        .map(|ct| ct as f64 / (elapsed_ms / 1000.0));
     let telemetry = match &usage {
         Some(u) => json!({
             "prompt_tokens": u.prompt_tokens,
             "completion_tokens": u.completion_tokens,
             "total_tokens": u.total_tokens,
+            "tok_per_sec": tok_per_sec,
+            "duration_ms": elapsed_ms,
+            "ttft_ms": first_token_at.map(|d| d.as_secs_f64() * 1000.0),
             "model": model,
         }),
         None => Value::Null,
@@ -560,6 +604,25 @@ pub fn run_turn(
         }
     }
 
+    // `gen_info` MUST be appended before the assistant row it describes:
+    // `reconstruct_messages_from_log` carries `lastGen` FORWARD onto later
+    // rows, so a gen_info written afterwards would never reach the message
+    // and a reloaded transcript would show no metrics.
+    let _ = store.append_event(
+        &session_id,
+        NewEvent {
+            event_type: "gen_info".into(),
+            payload: telemetry.clone(),
+            duration_ms: Some(elapsed_ms),
+            meta: Some({
+                let mut m = serde_json::Map::new();
+                m.insert("telemetry".into(), telemetry.clone());
+                m
+            }),
+            ..Default::default()
+        },
+    );
+
     let text = answer.trim().to_string();
     if !text.is_empty() {
         let _ = store.append_event(
@@ -577,7 +640,7 @@ pub fn run_turn(
         "card": { "kind": "assistant", "text": text, "telemetry": telemetry, "streaming": false },
     }));
 
-    store.record_turn_complete(&session_id, None);
+    store.record_turn_complete(&session_id, Some(elapsed_ms));
     emit(&json!({ "type": "done", "ok": true, "sessionId": session_id }));
     Ok(())
 }
