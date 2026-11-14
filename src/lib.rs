@@ -12,18 +12,37 @@
 //! | JS source | Rust module | state |
 //! |---|---|---|
 //! | `src/project.mjs` | [`project`] | ported |
-//! | `src/session-store.mjs` | [`session_store`] | in progress |
-//! | `src/serve.mjs` | `serve` | todo |
-//! | `src/index.mjs` | `harness` | todo |
-//! | `src/agent-loader.mjs` | `agent_loader` | todo (`.coffee` → declarative) |
-//! | `src/allowlist.mjs`, `policy.mjs` | `policy` | todo |
-//! | `src/mcp-*.mjs` | `mcp` | todo |
+//! | `src/session-store.mjs` | [`session_store`] | ported — now the **legacy reader** only (see below) |
+//! | `src/serve.mjs` | [`serve`] | ported |
+//! | `src/index.mjs` | [`harness`] | ported |
+//! | `src/agent-loader.mjs` | [`agent_loader`] | ported (`.coffee` → declarative JSON) |
+//! | `src/allowlist.mjs`, `policy.mjs` | [`allowlist`] | ported |
+//! | `src/mcp-*.mjs` | [`mcp`] | ported |
+//!
+//! Beyond the port, storage moved from the per-session `.json`/`.jsonl` pair
+//! to a single `.angela/conversations.db`, which is what makes three things
+//! possible that a flat log cannot express:
+//!
+//! | module | what it adds |
+//! |---|---|
+//! | [`db`], [`conv_store`] | the conversation as a **tree**: nodes name a parent, a cursor names the active leaf, and forking is "move the cursor, then append" |
+//! | [`group`] | **N participants** — each agent in its own context, reading the room as flattened text (the hermes shape), with watermarks, rounds and `@mentions` |
+//! | [`memory`] | an **unbounded history in a bounded window**: a binary tree of summaries, coarse with age, where any line opens into the two it was merged from, down to the original message |
+//! | [`migrate`] | the one-shot, idempotent, non-destructive import of the old files — which is also the rollback plan |
+//!
+//! [`session_store`] is deliberately kept: it is the importer's reader and
+//! the reference the differential tests measure the port against.
 
 pub mod agent_loader;
+pub mod conv_store;
+pub mod db;
 pub mod allowlist;
+pub mod group;
 pub mod harness;
 pub mod http;
 pub mod mcp;
+pub mod memory;
+pub mod migrate;
 pub mod mcp_presets;
 pub mod project;
 pub mod serve;

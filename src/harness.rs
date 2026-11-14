@@ -30,7 +30,8 @@ use crate::agent_loader::AgentDef;
 use crate::allowlist;
 use crate::mcp::McpServer;
 use crate::mcp_presets;
-use crate::session_store::{ContextItem, NewEvent, NewSession, SessionStore};
+use crate::conv_store::ConvStore;
+use crate::session_store::{ContextItem, NewEvent, NewSession};
 
 /// How long one tool call may take before the turn gives up on it.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -191,7 +192,7 @@ fn item_to_message(item: &ContextItem) -> Option<Message> {
 
 /// Resolve which session this turn belongs to, creating one if needed.
 pub fn resolve_session(
-    store: &SessionStore,
+    store: &ConvStore,
     tabs: &LiveTabs,
     req: &TurnRequest,
 ) -> Result<String, TurnError> {
@@ -222,7 +223,7 @@ pub fn resolve_session(
 ///
 /// 64 characters plus an ellipsis, as the JS does — the history rail shows
 /// this, so the truncation point is user-visible.
-pub fn title_from_first_message(store: &SessionStore, session_id: &str, content: &str) {
+pub fn title_from_first_message(store: &ConvStore, session_id: &str, content: &str) {
     let Some(state) = store.load(session_id) else {
         return;
     };
@@ -316,7 +317,7 @@ pub fn register_tools(
 
 /// Build an agl agent seeded with the session's prior conversation.
 pub fn build_agent(
-    store: &SessionStore,
+    store: &ConvStore,
     session_id: &str,
     model: &str,
     system_prompt: Option<String>,
@@ -349,7 +350,7 @@ pub fn build_agent(
 /// turn rather than finishing work nobody will see.
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn(
-    store: &SessionStore,
+    store: &ConvStore,
     tabs: &LiveTabs,
     rt: &tokio::runtime::Runtime,
     project_root: &str,
@@ -649,9 +650,9 @@ pub fn run_turn(
 mod tests {
     use super::*;
 
-    fn store() -> (tempfile::TempDir, SessionStore) {
+    fn store() -> (tempfile::TempDir, ConvStore) {
         let tmp = tempfile::tempdir().unwrap();
-        let s = SessionStore::new(tmp.path()).unwrap();
+        let s = ConvStore::memory(tmp.path()).unwrap();
         (tmp, s)
     }
 
@@ -827,5 +828,464 @@ mod tests {
             .collect();
         assert_eq!(msgs.len(), 1, "hidden and reasoning rows are not sent");
         assert_eq!(msgs[0].role, "user");
+    }
+}
+
+// ===========================================================================
+// Group conversations: more than one agent seated in the same room
+// ===========================================================================
+
+/// Run a whole discussion: one user message, then every addressed
+/// participant speaks, then anyone they pulled in, until the round settles.
+///
+/// This is the N-participant path. It exists beside [`run_turn`] rather than
+/// replacing it because the two have genuinely different shapes: with one
+/// agent the provider-side history *is* the transcript, and that is both
+/// cheaper and what every existing session already contains. With two or
+/// more, no such shared history can exist (see [`crate::group`]) — each
+/// agent gets its own stable system prompt, its own private history, and the
+/// room as flattened text. `/api/chat` picks by roster size, so a two-seat
+/// conversation behaves exactly as it did.
+///
+/// Participants speak **one at a time, in seat order**, and each one's
+/// prompt is assembled after the previous reply is durable. That sequencing
+/// is the only reason a later speaker can see an earlier one: the room log
+/// is the channel between them.
+#[allow(clippy::too_many_arguments)]
+pub fn run_round(
+    store: &ConvStore,
+    tabs: &LiveTabs,
+    rt: &tokio::runtime::Runtime,
+    project_root: &str,
+    pool: &McpPool,
+    def: &AgentDef,
+    req: TurnRequest,
+    emit: &mut dyn FnMut(&Value) -> bool,
+) -> Result<(), TurnError> {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return Err(TurnError::EmptyContent);
+    }
+    let conv = resolve_session(store, tabs, &req)?;
+    tabs.set(
+        &req.tab_id,
+        TabEntry {
+            session_id: conv.clone(),
+            agent: req.agent.clone(),
+            model: req.model.clone().unwrap_or_default(),
+            ..Default::default()
+        },
+    );
+    title_from_first_message(store, &conv, &content);
+    store.set_status(&conv, "running");
+
+    // The user's message is durable before any model runs.
+    let user_node = store
+        .append_event(
+            &conv,
+            NewEvent::new("context_window", json!({ "role": "user", "content": content })),
+        )
+        .map_err(|e| TurnError::Store(e.to_string()))?;
+
+    let roster = store.participants(&conv);
+    let header = store.load(&conv).unwrap_or(Value::Null);
+    let routing = header
+        .get("routing")
+        .and_then(|v| v.as_str())
+        .unwrap_or("everyone")
+        .to_string();
+
+    emit(&json!({
+        "type": "session",
+        "tabId": req.tab_id,
+        "sessionId": conv,
+        "participants": roster.iter().map(|p| p.to_json()).collect::<Vec<_>>(),
+        "routing": routing,
+        "projectRoot": project_root,
+    }));
+
+    let root = std::path::Path::new(project_root);
+    let (servers, mcp_errors) = pool.ensure(&def.mcp, root);
+    for e in &mcp_errors {
+        let _ = store.append_event(&conv, NewEvent::new("error", json!({ "message": e })));
+        emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
+    }
+
+    // --- round 0 responders -------------------------------------------------
+    let mut responders: Vec<i64> = if routing == "lead" {
+        lead_assignment(store, rt, &conv, &roster, &content, emit)
+    } else {
+        crate::group::responders(&roster, &content, 0, &[], &[])
+    };
+    let mut round_index: i64 = 0;
+    let mut published: usize = 0;
+
+    // The loop yields *why* it stopped, so there is no window in which
+    // "settled" holds a value nobody chose.
+    let settled = loop {
+        if let Some(s) = crate::group::check_bounds(round_index, published, responders.len()) {
+            break s;
+        }
+        let mut round_texts: Vec<(i64, String)> = Vec::new();
+        let mut replied: Vec<i64> = Vec::new();
+
+        for pid in responders.clone() {
+            let Some(me) = roster.iter().find(|p| p.id == pid).cloned() else { continue };
+            // Directly addressed in round 0 must answer; a later-round
+            // mention is an invitation, and "(pass)" is a legitimate reply.
+            let reply_required = round_index == 0;
+            let how = if round_index == 0 {
+                if crate::group::mentions(&content).contains(&me.handle) {
+                    "The user directly addressed you."
+                } else {
+                    "The conversation picked you to answer the user's message."
+                }
+            } else {
+                ""
+            };
+            let Some(task) = crate::group::plan(store, &conv, &me, round_index, reply_required, how)
+            else {
+                continue;
+            };
+
+            emit(&json!({
+                "type": "speaking",
+                "sessionId": conv,
+                "participantId": me.id,
+                "handle": me.handle,
+                "round": round_index,
+                "taskId": task.task_id,
+            }));
+
+            let model = me
+                .model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .or_else(|| header.get("model").and_then(|v| v.as_str()).map(String::from))
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_MODEL.into());
+            let reply = match run_participant(
+                store, rt, &servers, def, &conv, &me, &task, &model, emit,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let _ = store.append_event(
+                        &conv,
+                        NewEvent {
+                            event_type: "error".into(),
+                            payload: json!({ "message": msg, "handle": me.handle }),
+                            speaker: Some(me.id),
+                            ..Default::default()
+                        },
+                    );
+                    emit(&json!({ "type": "card", "card": { "kind": "error", "text": msg } }));
+                    continue;
+                }
+            };
+
+            // A pass is silence, not an empty message: publishing it would
+            // clutter the room and show every other agent a blank turn.
+            if crate::group::is_pass(&reply) {
+                store.append_own_turn(&conv, me.id, &task.prompt, &reply, Some(&task.task_id));
+                advance(store, &conv, &me.id, task.seen_through_seq, round_index, &task.task_id);
+                emit(&json!({
+                    "type": "passed",
+                    "sessionId": conv,
+                    "participantId": me.id,
+                    "handle": me.handle,
+                    "round": round_index,
+                }));
+                replied.push(me.id);
+                continue;
+            }
+
+            let text = crate::group::clamp_message(&reply);
+            let node = store
+                .append_event(
+                    &conv,
+                    NewEvent {
+                        event_type: "context_window".into(),
+                        payload: json!({ "role": "assistant", "content": text }),
+                        speaker: Some(me.id),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| TurnError::Store(e.to_string()))?;
+            // The prompt is stored with the reply so this participant's own
+            // history is byte-stable on the next turn, whatever the room does.
+            store.append_own_turn(&conv, me.id, &task.prompt, &text, Some(&task.task_id));
+            let seq = store.node(&node.event_id).map(|n| n.seq).unwrap_or(task.seen_through_seq);
+            advance(store, &conv, &me.id, seq, round_index, &task.task_id);
+
+            emit(&json!({
+                "type": "card",
+                "card": {
+                    "kind": "assistant", "text": text, "eventId": node.event_id,
+                    "participantId": me.id, "handle": me.handle,
+                    "round": round_index, "streaming": false, "visible": true,
+                },
+            }));
+            round_texts.push((me.id, text));
+            replied.push(me.id);
+            published += 1;
+            if published >= crate::group::MAX_MESSAGES {
+                break;
+            }
+        }
+
+        round_index += 1;
+        responders = crate::group::responders(&roster, &content, round_index, &round_texts, &replied);
+        if responders.is_empty() {
+            break crate::group::Settled::SilentRound;
+        }
+    };
+
+    let s = settled;
+    let mut patch = serde_json::Map::new();
+    patch.insert("roundIndex".into(), json!(round_index));
+    patch.insert("roundStatus".into(), json!(s.status()));
+    store.update_meta(&conv, patch);
+    // Settle every participant too, not just the header: a view left
+    // `running` would make a restarted server think a round is still in
+    // flight and wait for a reply nobody is generating.
+    for p in roster.iter().filter(|p| p.is_agent()) {
+        let (seq, _, _, _) = store.participant_view(&conv, p.id);
+        store.set_participant_view(&conv, p.id, seq, round_index, false, None, Some(s.status()));
+    }
+    store.record_turn_complete(&conv, None);
+    emit(&json!({
+        "type": "done",
+        "ok": true,
+        "sessionId": conv,
+        "rounds": round_index,
+        "messages": published,
+        "roundStatus": s.status(),
+        "reason": s.reason(),
+        "userEventId": user_node.event_id,
+    }));
+    Ok(())
+}
+
+/// Advance a participant's watermark past what it has now seen.
+fn advance(store: &ConvStore, conv: &str, pid: &i64, seq: i64, round: i64, task_id: &str) {
+    store.set_participant_view(conv, *pid, seq, round, false, Some(task_id), Some("running"));
+}
+
+/// One participant's inference, in its own context.
+///
+/// The agent is built with **that participant's** system prompt, seeded with
+/// **that participant's** own `(prompt, reply)` pairs, and asked the
+/// flattened room prompt. Nothing from the shared transcript is pushed as a
+/// role, which is the invariant the whole group design rests on.
+#[allow(clippy::too_many_arguments)]
+fn run_participant(
+    store: &ConvStore,
+    rt: &tokio::runtime::Runtime,
+    servers: &[Arc<McpServer>],
+    def: &AgentDef,
+    conv: &str,
+    me: &crate::conv_store::Participant,
+    task: &crate::group::Task,
+    model: &str,
+    emit: &mut dyn FnMut(&Value) -> bool,
+) -> Result<String, TurnError> {
+    let system = if task.system_prompt.trim().is_empty() {
+        // Fall back to the agent definition, with the participant's identity
+        // appended: an agent that does not know its own handle cannot be
+        // told apart from its peers in the flattened room.
+        let base = def.system.clone();
+        format!(
+            "{base}\n\nYou are @{} in a conversation with other participants. \
+             Reply as yourself only.",
+            me.handle
+        )
+        .trim()
+        .to_string()
+    } else {
+        task.system_prompt.clone()
+    };
+    let mut agent = Agent::factory(Factory {
+        model: Some(model.to_string()),
+        system_prompt: Some(system),
+        // The history is pushed explicitly below, and must not also
+        // accumulate across participants.
+        retain_history: Some(true),
+        parallel_tools: Some(true),
+        ..Default::default()
+    })
+    .map_err(|e| TurnError::Agent(e.to_string()))?;
+    for (prompt, reply) in &task.history {
+        agent.push_context(Message::user(prompt.clone()));
+        agent.push_context(Message::assistant(reply.clone()));
+    }
+
+    let session_state = store.load(conv);
+    let overridden = session_state
+        .as_ref()
+        .and_then(|s| s.get("allowlist"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let rules = overridden.unwrap_or_else(|| def.allowlist.clone());
+    let unrestricted = session_state
+        .as_ref()
+        .and_then(|s| s.get("allowlistMode"))
+        .and_then(|v| v.as_str())
+        == Some("unrestricted");
+    let allow_text = if unrestricted { "*".to_string() } else { rules };
+    register_tools(
+        &mut agent,
+        servers,
+        def.tools_enabled.as_ref(),
+        &allow_text,
+        &def.policy_mode,
+    );
+
+    let mut reasoning = String::new();
+    let handle = me.handle.clone();
+    let pid = me.id;
+    let answer = {
+        let mut on_event = |e: TurnEvent<'_>| match e {
+            TurnEvent::Delta { text, channel } => match channel {
+                Channel::Reasoning => {
+                    reasoning.push_str(text);
+                    emit(&json!({ "type": "reasoning_delta", "text": text,
+                                  "sessionId": conv, "handle": handle, "participantId": pid }));
+                }
+                Channel::Content => {
+                    emit(&json!({ "type": "assistant_delta", "text": text,
+                                  "sessionId": conv, "handle": handle, "participantId": pid }));
+                }
+            },
+            TurnEvent::ToolCall { id, name, args } => {
+                let w = store.append_event(
+                    conv,
+                    NewEvent {
+                        event_type: "tool_call".into(),
+                        payload: json!({ "id": id, "name": name, "args": args }),
+                        speaker: Some(pid),
+                        ..Default::default()
+                    },
+                );
+                let event_id = w.map(|x| x.event_id).unwrap_or_default();
+                emit(&json!({
+                    "type": "card",
+                    "card": { "kind": "tool_call", "name": name, "args": args,
+                              "eventId": event_id, "participantId": pid,
+                              "handle": handle, "visible": true },
+                }));
+            }
+            TurnEvent::ToolResult { id, name, text } => {
+                let ok = !text.starts_with("error:") && !text.starts_with("denied:");
+                let w = store.append_event(
+                    conv,
+                    NewEvent {
+                        event_type: "tool_result".into(),
+                        payload: json!({ "tool_call_id": id, "name": name, "text": text,
+                                         "ok": ok, "denied": text.starts_with("denied:") }),
+                        speaker: Some(pid),
+                        ..Default::default()
+                    },
+                );
+                let event_id = w.map(|x| x.event_id).unwrap_or_default();
+                emit(&json!({
+                    "type": "card",
+                    "card": { "kind": "tool_result", "name": name, "text": text, "ok": ok,
+                              "denied": text.starts_with("denied:"), "eventId": event_id,
+                              "participantId": pid, "handle": handle, "visible": true },
+                }));
+            }
+        };
+        rt.block_on(agent.run_events(&task.prompt, true, &mut on_event))
+            .map_err(|e| TurnError::Agent(e.to_string()))?
+    };
+
+    if !reasoning.trim().is_empty() {
+        let w = store.append_event(
+            conv,
+            NewEvent {
+                event_type: "reasoning".into(),
+                payload: json!({ "text": reasoning }),
+                speaker: Some(pid),
+                ..Default::default()
+            },
+        );
+        if let Ok(w) = w {
+            emit(&json!({
+                "type": "card",
+                "card": { "kind": "reasoning", "text": reasoning, "eventId": w.event_id,
+                          "participantId": pid, "handle": me.handle, "visible": true },
+            }));
+        }
+    }
+    Ok(answer)
+}
+
+/// Lead routing: ask the designated lead who should answer, parse its JSON.
+///
+/// On an unparseable reply the lead answers alone rather than the message
+/// going nowhere — a routing failure must not swallow the user's turn.
+fn lead_assignment(
+    store: &ConvStore,
+    rt: &tokio::runtime::Runtime,
+    conv: &str,
+    roster: &[crate::conv_store::Participant],
+    content: &str,
+    emit: &mut dyn FnMut(&Value) -> bool,
+) -> Vec<i64> {
+    let agents: Vec<&crate::conv_store::Participant> =
+        roster.iter().filter(|p| p.is_agent() && p.active).collect();
+    let Some(lead) = agents
+        .iter()
+        .find(|p| p.role.as_deref() == Some("lead"))
+        .or_else(|| agents.first())
+    else {
+        return Vec::new();
+    };
+    let header = store.load(conv).unwrap_or(Value::Null);
+    let prompt = crate::group::routing_prompt(
+        header.get("title").and_then(|v| v.as_str()).unwrap_or("untitled"),
+        header.get("purpose").and_then(|v| v.as_str()),
+        lead,
+        roster,
+        content,
+    );
+    let model = lead
+        .model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| header.get("model").and_then(|v| v.as_str()).map(String::from))
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL.into());
+    let routed = Agent::factory(Factory {
+        model: Some(model),
+        system_prompt: Some("You route messages. Reply with JSON only.".into()),
+        retain_history: Some(false),
+        ..Default::default()
+    })
+    .ok()
+    .and_then(|a| rt.block_on(a.run(&prompt)).ok())
+    .and_then(|r| crate::group::parse_assignment(&r));
+
+    match routed {
+        Some(handles) if !handles.is_empty() => {
+            let ids: Vec<i64> = agents
+                .iter()
+                .filter(|p| handles.contains(&p.handle))
+                .map(|p| p.id)
+                .collect();
+            emit(&json!({ "type": "routed", "sessionId": conv, "by": lead.handle,
+                          "assigned": handles }));
+            if ids.is_empty() {
+                vec![lead.id]
+            } else {
+                ids
+            }
+        }
+        _ => {
+            emit(&json!({ "type": "routed", "sessionId": conv, "by": lead.handle,
+                          "assigned": [lead.handle.clone()], "fallback": true }));
+            vec![lead.id]
+        }
     }
 }

@@ -6,7 +6,7 @@
 
 use angela::agent_loader;
 use angela::harness::{run_turn, LiveTabs, McpPool, TurnRequest};
-use angela::session_store::SessionStore;
+use angela::conv_store::ConvStore;
 use serde_json::Value;
 
 fn endpoint_up() -> bool {
@@ -35,7 +35,7 @@ fn a_turn_streams_persists_and_is_remembered() {
         .unwrap_or_else(|_| "llama-server:default".into());
 
     let tmp = tempfile::tempdir().unwrap();
-    let store = SessionStore::new(tmp.path()).unwrap();
+    let store = ConvStore::new(tmp.path()).unwrap();
     let tabs = LiveTabs::default();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -93,7 +93,7 @@ fn a_turn_streams_persists_and_is_remembered() {
         "titled from the first user message"
     );
 
-    let msgs = angela::serve::reconstruct_messages_from_log(&store, &sid);
+    let msgs = angela::serve::reconstruct_messages(&store, &sid);
     assert_eq!(msgs.first().unwrap()["kind"], "user");
     assert!(
         msgs.iter().any(|m| m["kind"] == "assistant"),
@@ -138,7 +138,7 @@ fn a_turn_streams_persists_and_is_remembered() {
 #[test]
 fn an_empty_prompt_is_refused_before_any_session_is_made() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = SessionStore::new(tmp.path()).unwrap();
+    let store = ConvStore::new(tmp.path()).unwrap();
     let tabs = LiveTabs::default();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

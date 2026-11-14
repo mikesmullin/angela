@@ -103,6 +103,12 @@ pub fn new_session_id() -> String {
     format!("{stem}_{}", rand_hex(3))
 }
 
+/// `new_event_id` for other modules: the tree store mints node ids with the
+/// same scheme, so an id tells you nothing about which store wrote it.
+pub fn new_event_id_pub() -> String {
+    new_event_id()
+}
+
 fn new_event_id() -> String {
     format!("e{}", rand_hex(4))
 }
@@ -139,6 +145,10 @@ pub struct NewEvent {
     pub ts: Option<String>,
     pub meta: Option<Map<String, Value>>,
     pub event_id: Option<String>,
+    /// Which participant authored this event, for the tree store. `None`
+    /// lets it infer from the payload's role, which is right whenever the
+    /// conversation has a single agent — i.e. everywhere the file store ran.
+    pub speaker: Option<i64>,
 }
 
 impl NewEvent {
@@ -1041,9 +1051,21 @@ impl SessionStore {
     /// Full-window provider snapshots are debug telemetry and are **never**
     /// used as a seed, so they are skipped.
     pub fn build_context_window_items(&self, id: &str) -> Vec<ContextItem> {
+        context_items_from_events(self.list_events_folded(id))
+    }
+}
+
+/// The hydration itself, over any already-folded event list.
+///
+/// Split out of [`SessionStore`] so the SQLite store reuses it verbatim:
+/// the JS-era coercions below (`String(x)`, `p.explanation || null`, the
+/// `tool_call_id` fallback chain) are pinned by a differential test against
+/// the real JS, and a second copy of them would drift.
+pub fn context_items_from_events(events: Vec<EventWrapper>) -> Vec<ContextItem> {
+    {
         let mut items: Vec<ContextItem> = Vec::new();
 
-        for wrap in self.list_events_folded(id) {
+        for wrap in events {
             let Some(p) = wrap.payload.as_object() else {
                 continue;
             };

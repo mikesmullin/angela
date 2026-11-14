@@ -27,13 +27,14 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use crate::agent_loader;
+use crate::conv_store::ConvStore;
 use crate::harness::{self, LiveTabs, McpPool, TurnRequest};
 use crate::http::{Handler, Request, Responder, ResponseSink, SocketSink};
-use crate::session_store::{NewSession, SessionStore};
+use crate::session_store::{EventWrapper, NewSession, SessionStore};
 
 /// Server-wide state.
 pub struct AppState {
-    pub store: SessionStore,
+    pub store: ConvStore,
     pub project_root: String,
     pub port: u16,
     pub auto_approve: bool,
@@ -49,9 +50,30 @@ pub struct AppState {
 impl AppState {
     pub fn new(project_root: impl AsRef<std::path::Path>, port: u16) -> std::io::Result<Self> {
         let root = project_root.as_ref().to_path_buf();
-        let store = SessionStore::new(&root)?;
-        // Number any sessions that predate the `ordinal` field, so the tab
-        // strip has a stable 1-based label for every one of them.
+        let store = ConvStore::new(&root)
+            .map_err(|e| std::io::Error::other(format!("conversations.db: {e}")))?;
+        // Bring any pre-SQLite sessions in. Idempotent and non-destructive:
+        // the `.jsonl` files are read and left alone, so this is also the
+        // rollback plan — delete the db and they import again.
+        let report = crate::migrate::run(&store, &root);
+        if report.imported > 0 {
+            eprintln!(
+                "angela: imported {} session(s) ({} nodes) into conversations.db",
+                report.imported, report.nodes
+            );
+            // The gate: the tree must render what the files rendered. A
+            // mismatch here means the parent chain is wrong, and shipping it
+            // would quietly reorder someone's transcript.
+            match crate::migrate::verify(&store, &root) {
+                Ok(n) => eprintln!("angela: verified {n} imported transcript(s) against the files"),
+                Err(e) => eprintln!("angela: MIGRATION VERIFY FAILED — {e}"),
+            }
+        }
+        for f in &report.failed {
+            eprintln!("angela: import failed — {f}");
+        }
+        // Number any conversation that predates the `ordinal` field, so the
+        // tab strip has a stable 1-based label for every one of them.
         let backfilled = store.backfill_ordinals();
         if backfilled > 0 {
             eprintln!("angela: numbered {backfilled} pre-existing session(s)");
@@ -96,7 +118,53 @@ fn goto_from_meta(meta: &Map<String, Value>) -> Value {
 /// Emits `kind: user | assistant | reasoning | tool_call | tool_result` —
 /// the five card kinds the chat UI renders.
 pub fn reconstruct_messages_from_log(store: &SessionStore, id: &str) -> Vec<Value> {
-    let events = store.list_events_folded(id);
+    reconstruct_from_events(store.list_events_folded(id))
+}
+
+/// The same transcript, from the conversation tree's rendered path.
+///
+/// The two functions share [`reconstruct_from_events`] rather than each
+/// having their own copy of the card-shaping rules, which is what lets the
+/// migration verifier compare them meaningfully: a difference in the output
+/// can only come from a difference in the events, which is exactly what it
+/// is checking.
+pub fn reconstruct_messages(store: &ConvStore, id: &str) -> Vec<Value> {
+    let mut rows = reconstruct_from_events(store.list_events_folded(id));
+    // Attribute each row to the seat that produced it.
+    //
+    // The event wrapper has no author — it never needed one when `assistant`
+    // could only mean one agent. The node does, so the handle is joined back
+    // on here rather than threaded through the event shape, which the JS-era
+    // logs also have to parse. Without this a reloaded group conversation
+    // renders three agents as one anonymous voice.
+    let roster: std::collections::HashMap<i64, String> = store
+        .participants(id)
+        .into_iter()
+        .map(|p| (p.id, p.handle))
+        .collect();
+    let authors: std::collections::HashMap<String, String> = store
+        .path(id)
+        .into_iter()
+        .filter_map(|n| {
+            let pid = n.participant_id?;
+            Some((n.id, roster.get(&pid)?.clone()))
+        })
+        .collect();
+    for row in &mut rows {
+        let Some(eid) = row.get("eventId").and_then(|v| v.as_str()).map(String::from) else {
+            continue;
+        };
+        if let Some(handle) = authors.get(&eid) {
+            if let Some(o) = row.as_object_mut() {
+                o.insert("handle".into(), json!(handle));
+            }
+        }
+    }
+    rows
+}
+
+/// Shape a folded event list into the five card kinds the UI renders.
+pub fn reconstruct_from_events(events: Vec<EventWrapper>) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::new();
     // Older logs lack `meta.telemetry`, so a trailing gen_info is the
     // fallback for the round it belongs to.
@@ -206,6 +274,64 @@ pub fn reconstruct_messages_from_log(store: &SessionStore, id: &str) -> Vec<Valu
         }
     }
     messages
+}
+
+/// Split `/api/sessions/<id>/<rest>` into its id and sub-path.
+///
+/// The bare `/api/sessions/<id>` form returns an empty `rest`, so one
+/// matcher handles both and the sub-routes cannot be shadowed by the
+/// catch-all the way a `starts_with` chain would shadow them.
+fn session_route(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/api/sessions/")?;
+    match rest.split_once('/') {
+        Some((id, tail)) => Some((id, tail)),
+        None => Some((rest, "")),
+    }
+}
+
+/// The transcript rows that are the memory tree's leaves, in leaf order.
+///
+/// Not the same list as [`reconstruct_messages`]: the tree's leaves are the
+/// user/assistant messages, while a transcript also carries reasoning and
+/// tool rows. Looking a leaf up by its position in the raw transcript puts
+/// every leaf after the first reasoning row against the wrong message — so
+/// the lookup is by **node id**, and the result is aligned to leaf index.
+pub fn leaf_messages(store: &ConvStore, id: &str) -> Vec<Value> {
+    let msgs = reconstruct_messages(store, id);
+    let by_id: std::collections::HashMap<&str, &Value> = msgs
+        .iter()
+        .filter_map(|m| m.get("eventId").and_then(|v| v.as_str()).map(|k| (k, m)))
+        .collect();
+    store
+        .memory_leaves(id)
+        .into_iter()
+        .map(|node_id| {
+            by_id
+                .get(node_id.as_str())
+                .map(|m| (*m).clone())
+                .unwrap_or(Value::Null)
+        })
+        .collect()
+}
+
+/// The memory tree's view as the UI reads it: one entry per thread or
+/// message, oldest first.
+fn memory_view_json(store: &ConvStore, id: &str) -> Value {
+    let msgs = leaf_messages(store, id);
+    let parts = crate::memory::view(store, id);
+    let count = crate::memory::count(store, id);
+    json!({
+        "sessionId": id,
+        "count": count,
+        // True once anything has been merged: the UI shows the "compact"
+        // affordance differently for a conversation that is still flat.
+        "compacted": parts.iter().any(|p| p.coord.width() > 1),
+        "parts": parts.iter().map(|p| p.to_json(Some(&msgs))).collect::<Vec<_>>(),
+        "roots": crate::memory::roots(count)
+            .iter()
+            .map(|c| c.reference())
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// The route table.
@@ -328,6 +454,219 @@ impl Server {
                 }
             }
 
+            // ---- the conversation tree ------------------------------------
+            //
+            // Moving the cursor IS the fork primitive: point it at any node,
+            // then POST /api/chat, and the new message becomes that node's
+            // child. Nothing is rewritten, so the branch you came from is
+            // still there and still reachable by pointing back at it.
+            ("POST", path) if matches!(session_route(path), Some((_, "cursor"))) => {
+                let (id, _) = session_route(path).unwrap();
+                let body = req.json();
+                let target = body
+                    .get("eventId")
+                    .or_else(|| body.get("event_id"))
+                    .and_then(|v| v.as_str());
+                if st.store.load(id).is_none() {
+                    sink.json(404, &json!({ "error": "not found" }));
+                    return;
+                }
+                let ok = st.store.set_cursor(id, target);
+                sink.json(
+                    if ok { 200 } else { 400 },
+                    &json!({ "ok": ok, "sessionId": id, "cursor": st.store.cursor(id),
+                             "messages": if ok { reconstruct_messages(&st.store, id) } else { vec![] } }),
+                )
+            }
+
+            // The whole forest, not just the rendered path — this is what a
+            // branch picker draws.
+            ("GET", path) if matches!(session_route(path), Some((_, "tree"))) => {
+                let (id, _) = session_route(path).unwrap();
+                if st.store.load(id).is_none() {
+                    sink.json(404, &json!({ "error": "not found" }));
+                    return;
+                }
+                let nodes = st.store.all_nodes(id);
+                let on_path: Vec<String> =
+                    st.store.path(id).into_iter().map(|n| n.id).collect();
+                sink.json(
+                    200,
+                    &json!({
+                        "sessionId": id,
+                        "cursor": st.store.cursor(id),
+                        "onPath": on_path,
+                        "nodes": nodes.iter().map(|n| n.to_json()).collect::<Vec<_>>(),
+                    }),
+                )
+            }
+
+            ("GET", path) if matches!(session_route(path), Some((_, "participants"))) => {
+                let (id, _) = session_route(path).unwrap();
+                sink.json(
+                    200,
+                    &json!({
+                        "sessionId": id,
+                        "participants": st.store.participants(id)
+                            .iter().map(|p| p.to_json()).collect::<Vec<_>>(),
+                    }),
+                )
+            }
+
+            // Seat another agent. Two or more active agents is what switches
+            // /api/chat onto the group path.
+            ("POST", path) if matches!(session_route(path), Some((_, "participants"))) => {
+                let (id, _) = session_route(path).unwrap();
+                if st.store.load(id).is_none() {
+                    sink.json(404, &json!({ "error": "not found" }));
+                    return;
+                }
+                let body = req.json();
+                let gs = |k: &str| body.get(k).and_then(|v| v.as_str());
+                let kind = gs("kind").unwrap_or("agent");
+                let agent_name = gs("agentName").or_else(|| gs("agent"));
+                // An agent definition supplies the system prompt and model
+                // unless the request overrides them, so seating a configured
+                // agent takes one field.
+                let root = std::path::Path::new(&st.project_root);
+                let def = agent_name.and_then(|n| agent_loader::load(root, n));
+                let system = gs("systemPrompt")
+                    .map(String::from)
+                    .or_else(|| def.as_ref().map(|d| d.system.clone()))
+                    .unwrap_or_default();
+                let model = gs("model")
+                    .map(String::from)
+                    .or_else(|| def.as_ref().map(|d| d.model.clone()).filter(|m| !m.is_empty()));
+                match st.store.add_participant(
+                    id,
+                    kind,
+                    gs("handle").unwrap_or(""),
+                    gs("displayName"),
+                    agent_name,
+                    model.as_deref(),
+                    &system,
+                    gs("avatar"),
+                    gs("role"),
+                ) {
+                    Some(p) => sink.json(200, &json!({ "ok": true, "participant": p.to_json() })),
+                    None => sink.json(400, &json!({ "error": "could not seat participant" })),
+                }
+            }
+
+            // ---- the memory tree ------------------------------------------
+            //
+            // Run compaction: build every summary the tree is missing, then
+            // fit the view to the budget. `high` lets the caller compact a
+            // short conversation on purpose, which is the only way to see
+            // threading before a chat is genuinely large.
+            ("POST", path) if matches!(session_route(path), Some((_, "compact"))) => {
+                let (id, _) = session_route(path).unwrap();
+                let Some(meta) = st.store.load(id) else {
+                    sink.json(404, &json!({ "error": "not found" }));
+                    return;
+                };
+                let body = req.json();
+                let high = body
+                    .get("high")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| meta.get("memoryHigh").and_then(|v| v.as_u64()))
+                    .unwrap_or(crate::memory::HIGH as u64) as usize;
+                let model = meta
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or(crate::harness::DEFAULT_MODEL);
+                let compactor = crate::memory::AglCompactor::new(&st.rt, model);
+                let built = crate::memory::build_all(&st.store, id, &compactor);
+                crate::memory::fit(&st.store, id, high);
+                sink.json(
+                    200,
+                    &json!({
+                        "ok": true,
+                        "built": built.to_json(),
+                        "high": high,
+                        "view": memory_view_json(&st.store, id),
+                    }),
+                )
+            }
+
+            ("GET", path) if matches!(session_route(path), Some((_, "view"))) => {
+                let (id, _) = session_route(path).unwrap();
+                if st.store.load(id).is_none() {
+                    sink.json(404, &json!({ "error": "not found" }));
+                    return;
+                }
+                sink.json(200, &memory_view_json(&st.store, id))
+            }
+
+            // Open one thread, one level. Lazy by design: a client walks down
+            // only the branch someone actually asked about.
+            ("GET", path) if matches!(session_route(path), Some((_, "zoom"))) => {
+                let (id, _) = session_route(path).unwrap();
+                if st.store.load(id).is_none() {
+                    sink.json(404, &json!({ "error": "not found" }));
+                    return;
+                }
+                let num = |k: &str| req.query_param(k).and_then(|v| v.parse::<u64>().ok());
+                let (Some(from), Some(n)) = (num("id"), num("n")) else {
+                    sink.json(400, &json!({ "error": "id and n are required" }));
+                    return;
+                };
+                match crate::memory::zoom(&st.store, id, from, n) {
+                    Ok(crate::memory::Zoom::Halves(parts)) => {
+                        let msgs = leaf_messages(&st.store, id);
+                        sink.json(
+                            200,
+                            &json!({
+                                "kind": "halves",
+                                "ref": format!("{from}+{n}"),
+                                "parts": parts.iter()
+                                    .map(|p| p.to_json(Some(&msgs))).collect::<Vec<_>>(),
+                            }),
+                        )
+                    }
+                    Ok(crate::memory::Zoom::Message { index, node_id }) => {
+                        // The bottom of the tree: the original message, whole.
+                        // Aligned to leaf index, so the fallback below lands
+                        // on the same row the node id names.
+                        let msgs = leaf_messages(&st.store, id);
+                        let row = msgs
+                            .iter()
+                            .find(|m| m.get("eventId").and_then(|v| v.as_str()) == Some(&node_id))
+                            .cloned()
+                            .or_else(|| msgs.get(index as usize).cloned())
+                            .unwrap_or(Value::Null);
+                        sink.json(
+                            200,
+                            &json!({ "kind": "message", "ref": format!("{from}+{n}"),
+                                     "index": index, "nodeId": node_id, "message": row }),
+                        )
+                    }
+                    Err(e) => sink.json(400, &json!({ "error": e })),
+                }
+            }
+
+            // Room framing: purpose and notes are the shared header every
+            // participant's prompt carries; routing picks everyone-vs-lead.
+            ("POST", path) if matches!(session_route(path), Some((_, "settings"))) => {
+                let (id, _) = session_route(path).unwrap();
+                if st.store.load(id).is_none() {
+                    sink.json(404, &json!({ "error": "not found" }));
+                    return;
+                }
+                let body = req.json();
+                let mut patch = Map::new();
+                for key in ["purpose", "notes", "routing", "memoryHigh", "title"] {
+                    if let Some(v) = body.get(key) {
+                        patch.insert(key.to_string(), v.clone());
+                    }
+                }
+                sink.json(
+                    200,
+                    &json!({ "ok": true, "session": st.store.update_meta(id, patch) }),
+                )
+            }
+
             ("GET", path) if path.starts_with("/api/sessions/") => {
                 let id = &path["/api/sessions/".len()..];
                 match st.store.load(id) {
@@ -344,11 +683,22 @@ impl Server {
                             .unwrap_or_default();
                         let override_text =
                             meta.get("allowlist").and_then(|v| v.as_str()).map(String::from);
+                        let roster: Vec<Value> = st
+                            .store
+                            .participants(id)
+                            .iter()
+                            .map(|p| p.to_json())
+                            .collect();
                         sink.json(
                             200,
                             &json!({
                                 "session": meta,
-                                "messages": reconstruct_messages_from_log(&st.store, id),
+                                "messages": reconstruct_messages(&st.store, id),
+                                // The roster and the cursor are what the
+                                // multi-participant UI draws from; a
+                                // two-seat chat simply has two entries.
+                                "participants": roster,
+                                "cursor": st.store.cursor(id),
                                 "allowlist": override_text.clone().unwrap_or(agent_default),
                                 "allowlistOverridden": override_text.is_some(),
                                 "allowlistMode": meta.get("allowlistMode")
@@ -400,19 +750,34 @@ impl Server {
                     })
                     .unwrap_or_else(agent_loader::default_agent);
 
+                // One agent or several? With one, the provider-side history
+                // IS the transcript, which is cheaper and is what every
+                // existing session already holds. With two or more there can
+                // be no shared history (see `group.rs`), so each agent runs
+                // in its own context with the room flattened into text. The
+                // roster decides, so a two-seat chat is untouched.
+                let seated = turn
+                    .session_id
+                    .clone()
+                    .or_else(|| st.tabs.get(&turn.tab_id).map(|e| e.session_id))
+                    .filter(|_| !turn.new_session)
+                    .map(|sid| st.store.agent_participants(&sid).len())
+                    .unwrap_or(1);
+
                 sink.begin_ndjson();
                 {
                     let mut emit = |v: &Value| sink.row(v);
-                    let _ = harness::run_turn(
-                        &st.store,
-                        &st.tabs,
-                        &st.rt,
-                        &st.project_root,
-                        &st.mcp,
-                        &def,
-                        turn,
-                        &mut emit,
-                    );
+                    let _ = if seated > 1 {
+                        harness::run_round(
+                            &st.store, &st.tabs, &st.rt, &st.project_root,
+                            &st.mcp, &def, turn, &mut emit,
+                        )
+                    } else {
+                        harness::run_turn(
+                            &st.store, &st.tabs, &st.rt, &st.project_root,
+                            &st.mcp, &def, turn, &mut emit,
+                        )
+                    };
                 }
                 sink.end();
                 return;
@@ -482,11 +847,94 @@ impl Server {
                 )
             }
 
+            ("POST", path) if path.starts_with("/api/participants/") => {
+                let Some(pid) = path["/api/participants/".len()..].parse::<i64>().ok() else {
+                    sink.json(400, &json!({ "error": "bad participant id" }));
+                    return;
+                };
+                let body = req.json();
+                let patch = body.as_object().cloned().unwrap_or_default();
+                match st.store.update_participant(pid, &patch) {
+                    Some(p) => sink.json(200, &json!({ "ok": true, "participant": p.to_json() })),
+                    None => sink.json(404, &json!({ "error": "not found" })),
+                }
+            }
+
+            ("DELETE", path) if path.starts_with("/api/participants/") => {
+                let Some(pid) = path["/api/participants/".len()..].parse::<i64>().ok() else {
+                    sink.json(400, &json!({ "error": "bad participant id" }));
+                    return;
+                };
+                // An agent that has spoken is deactivated, not deleted: its
+                // nodes are in the tree and must keep their author.
+                let ok = st.store.remove_participant(pid);
+                sink.json(200, &json!({ "ok": ok, "id": pid }))
+            }
+
+            // Visibility and go-to: a column write now, where the JSONL
+            // format needed a whole appended `context_meta` line that every
+            // reader then had to fold forward.
+            ("POST", path) if path.starts_with("/api/nodes/") && path.ends_with("/visibility") => {
+                let node = &path["/api/nodes/".len()..path.len() - "/visibility".len()];
+                let body = req.json();
+                let visible = body
+                    .get("visible")
+                    .map(crate::session_store::js_truthy)
+                    .unwrap_or(true);
+                let ok = st.store.set_visibility(node, visible);
+                sink.json(if ok { 200 } else { 404 }, &json!({ "ok": ok, "id": node, "visible": visible }))
+            }
+
+            ("POST", path) if path.starts_with("/api/nodes/") && path.ends_with("/goto") => {
+                let node = &path["/api/nodes/".len()..path.len() - "/goto".len()];
+                let body = req.json();
+                let enabled = body
+                    .get("enabled")
+                    .map(crate::session_store::js_truthy)
+                    .unwrap_or(true);
+                let label = body.get("label").and_then(|v| v.as_str());
+                let ok = st.store.set_goto(node, enabled, label);
+                sink.json(if ok { 200 } else { 404 }, &json!({ "ok": ok, "id": node }))
+            }
+
+            // The old append-a-patch route, now backed by the columns. Kept
+            // at its original path so an older client keeps working.
+            ("POST", "/api/event/meta") => {
+                let body = req.json();
+                let ids: Vec<String> = match body.get("eventIds").and_then(|v| v.as_array()) {
+                    Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+                    None => body
+                        .get("eventId")
+                        .and_then(|v| v.as_str())
+                        .map(|s| vec![s.to_string()])
+                        .unwrap_or_default(),
+                };
+                if ids.is_empty() {
+                    sink.json(400, &json!({ "error": "eventId or eventIds is required" }));
+                    return;
+                }
+                let mut n = 0;
+                for target in &ids {
+                    if let Some(v) = body.get("visible") {
+                        if st.store.set_visibility(target, crate::session_store::js_truthy(v)) {
+                            n += 1;
+                        }
+                    }
+                    if let Some(g) = body.get("goto").and_then(|g| g.as_object()) {
+                        st.store.set_goto(
+                            target,
+                            g.get("enabled").map(crate::session_store::js_truthy).unwrap_or(false),
+                            g.get("label").and_then(|v| v.as_str()),
+                        );
+                    }
+                }
+                sink.json(200, &json!({ "ok": true, "patched": n, "eventIds": ids }))
+            }
+
             // Not ported yet — answered explicitly so the UI sees a clear
             // signal rather than a 404 it would read as a routing bug.
             ("POST", "/api/approve")
             | ("POST", "/api/abort")
-            | ("POST", "/api/event/meta")
             | ("GET", "/api/pending")
             | ("GET", "/api/context-window") => sink.json(
                 501,

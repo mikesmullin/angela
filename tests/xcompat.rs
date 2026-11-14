@@ -269,8 +269,11 @@ fn the_sessions_list_shape_matches_the_js() {
     assert_eq!(
         keys,
         vec![
-            "id", "title", "agent", "model", "createdAt", "updatedAt", "status", "turns",
-            "contextWindow"
+            // `ordinal` is ours, not the JS's: the tab strip needs a stable
+            // 1-based label, and deriving one at read time would reshuffle
+            // it as sessions come and go.
+            "id", "ordinal", "title", "agent", "model", "createdAt", "updatedAt", "status",
+            "turns", "contextWindow"
         ]
     );
 }
