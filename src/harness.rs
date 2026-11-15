@@ -315,6 +315,13 @@ pub fn register_tools(
     n
 }
 
+/// Session rules add to each agent's own rules, one rule per line.
+fn combined_allowlist(agent: &str, session: Option<&str>) -> String {
+    [agent, session.unwrap_or("")].into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>().join("\n")
+}
+
 /// Build an agl agent seeded with the session's prior conversation.
 pub fn build_agent(
     store: &ConvStore,
@@ -561,7 +568,8 @@ pub fn run_turn(
 
     // Tools come up before the model is told they exist.
     let root = std::path::Path::new(project_root);
-    let (servers, mcp_errors) = pool.ensure(&def.mcp, root);
+    let configured = if def.mcp.is_empty() { mcp_presets::names() } else { def.mcp.clone() };
+    let (servers, mcp_errors) = pool.ensure(&configured, root);
     for e in &mcp_errors {
         let _ = store.append_event(&session_id, NewEvent::new("error", json!({ "message": e })));
         emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
@@ -613,15 +621,14 @@ pub fn run_turn(
             }
         }
     }
-    // The session's own allowlist (set from the UI) overrides the agent
-    // definition's; `allowlistSource` records which one is in force.
+    // Session rules supplement this agent's own rules.
     let session_state = store.load(&session_id);
     let overridden = session_state
         .as_ref()
         .and_then(|s| s.get("allowlist"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    let rules = overridden.clone().unwrap_or_else(|| def.allowlist.clone());
+    let rules = combined_allowlist(&def.allowlist, overridden.as_deref());
 
     // `unrestricted` is a temporary override, NOT an edit: it runs the turn
     // with `*` while leaving the rules exactly as written, so switching back
@@ -662,7 +669,7 @@ pub fn run_turn(
         "allowlist": rules,
         "effectiveAllowlist": allow_text,
         "allowlistMode": mode,
-        "allowlistSource": if overridden.is_some() { "ui" } else { "agent" },
+        "allowlistSource": if overridden.is_some() { "agent + session" } else { "agent" },
         "allowlistOverridden": overridden.is_some(),
         "policyMode": def.policy_mode,
         "projectRoot": project_root,
@@ -879,6 +886,17 @@ pub fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_rules_add_to_each_agents_own_rules() {
+        let researcher = combined_allowlist("web_researcher__search", Some("file_io__read_file"));
+        let joker = combined_allowlist("", Some("file_io__read_file"));
+        assert!(allowlist::is_allowed(&researcher, "web_researcher__search", ""));
+        assert!(allowlist::is_allowed(&researcher, "file_io__read_file", ""));
+        assert!(allowlist::is_allowed(&joker, "file_io__read_file", ""));
+        assert!(!allowlist::is_allowed(&joker, "web_researcher__search", ""));
+        assert!(allowlist::is_allowed(&combined_allowlist("web_researcher__search", None), "web_researcher__search", ""));
+    }
 
     fn store() -> (tempfile::TempDir, ConvStore) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1154,13 +1172,6 @@ pub fn run_round(
         "projectRoot": project_root,
     }));
 
-    let root = std::path::Path::new(project_root);
-    let (servers, mcp_errors) = pool.ensure(&def.mcp, root);
-    for e in &mcp_errors {
-        let _ = store.append_event(&conv, NewEvent::new("error", json!({ "message": e })));
-        emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
-    }
-
     // --- round 0 responders -------------------------------------------------
     //
     // Who speaks is each agent's own `engagement`, not a property of the
@@ -1244,8 +1255,18 @@ pub fn run_round(
             {
                 continue;
             }
+            let participant_def = me.agent_name.as_deref()
+                .and_then(|name| store.agents().get(name))
+                .unwrap_or_else(|| def.clone());
+            let root = std::path::Path::new(project_root);
+            let configured = if participant_def.mcp.is_empty() { mcp_presets::names() } else { participant_def.mcp.clone() };
+            let (servers, mcp_errors) = pool.ensure(&configured, root);
+            for e in &mcp_errors {
+                let _ = store.append_event(&conv, mark.ev("error", json!({ "message": e })));
+                emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
+            }
             let reply = match run_participant(
-                store, rt, &servers, def, &conv, &me, &task, &model, &mark, emit,
+                store, rt, &servers, &participant_def, &conv, &me, &task, &model, &mark, emit,
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1399,7 +1420,7 @@ fn run_participant(
         .and_then(|s| s.get("allowlist"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    let rules = overridden.unwrap_or_else(|| def.allowlist.clone());
+    let rules = combined_allowlist(&def.allowlist, overridden.as_deref());
     let unrestricted = session_state
         .as_ref()
         .and_then(|s| s.get("allowlistMode"))

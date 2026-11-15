@@ -1,123 +1,53 @@
-//! Port of `angela/src/mcp-presets.mjs`, narrowed to the two local presets.
-//!
-//! The MCP **servers themselves are not ported** — they run as-is from
-//! `/workspace/mcp/*` under bun. This only works out where they live and with
-//! what environment to launch them.
-//!
-//! Search order, matching the JS:
-//!   1. `$ANGELA_MCP_ROOT/{file-io,term-local}/server.mjs`
-//!   2. sibling monorepo `<angela>/../mcp/…`
-//!   3. standalone packages `<angela>/../mcp-file-io/server.mjs`
-//!   4. `/workspace/mcp` (devcontainer convenience)
+//! MCP server launch definitions from the chat user's configuration.
 
 use std::path::{Path, PathBuf};
 
 use crate::mcp::{Framing, ServerSpec};
 
-/// Directories that may hold `file-io/` and `term-local/` subdirectories.
-pub fn mcp_root_candidates() -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut add = |p: PathBuf| {
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    };
-    if let Ok(v) = std::env::var("ANGELA_MCP_ROOT") {
-        if !v.trim().is_empty() {
-            add(PathBuf::from(v.trim()));
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(parent) = cwd.parent() {
-            add(parent.join("mcp"));
-        }
-        add(cwd.join("mcp"));
-    }
-    add(PathBuf::from("/workspace/mcp"));
-    out
-}
-
-/// Absolute path to one preset's `server.mjs`, if it exists.
-pub fn resolve_server_script(preset: &str) -> Option<PathBuf> {
-    for root in mcp_root_candidates() {
-        let direct = root.join(preset).join("server.mjs");
-        if direct.is_file() {
-            return Some(direct);
-        }
-        // standalone package layout: ../mcp-file-io/server.mjs
-        if let Some(parent) = root.parent() {
-            let standalone = parent.join(format!("mcp-{preset}")).join("server.mjs");
-            if standalone.is_file() {
-                return Some(standalone);
-            }
-        }
-    }
-    None
-}
-
-/// The runtime that executes an `.mjs` MCP server.
-fn bun() -> String {
-    std::env::var("ANGELA_BUN").unwrap_or_else(|_| "bun".into())
-}
-
-/// The preset names the agent editor offers.
-///
-/// Hard-coded rather than discovered from `mcp_root_candidates()`: these are
-/// the two this build knows how to jail (`MCP_FILE_ROOT`, `MCP_TERM_JB_ROOT`),
-/// and offering a name whose sandbox is not configured would hand someone an
-/// unjailed server from a dropdown.
-pub fn names() -> Vec<&'static str> {
-    vec!["file-io", "term-local"]
-}
-
-/// Build the spec for a preset name, jailed to `project_root`.
-///
-/// Both servers are sandboxed to the project: `MCP_FILE_ROOT` for file-io and
-/// `MCP_TERM_JB_ROOT` for term-local. That jail is the whole safety story for
-/// these tools, so it is always set, never left to the server's default.
-pub fn preset(name: &str, project_root: &Path) -> Option<ServerSpec> {
-    let jail = std::env::var("MCP_FILE_ROOT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| project_root.to_string_lossy().into_owned());
-    let script = resolve_server_script(name)?;
-
-    let env = match name {
-        "file-io" => vec![("MCP_FILE_ROOT".to_string(), jail)],
-        "term-local" => vec![
-            ("MCP_TERM_CWD".to_string(), jail.clone()),
-            ("MCP_TERM_JB_ROOT".to_string(), jail),
-            (
-                // Without a PATH the sandbox cannot find even the commands
-                // the allow-list permits: `uname` came back "command not
-                // found" until this was passed through.
-                "MCP_TERM_PATH".to_string(),
-                std::env::var("MCP_TERM_PATH")
-                    .ok()
-                    .filter(|p| !p.trim().is_empty())
-                    .or_else(|| std::env::var("PATH").ok())
-                    .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into()),
-            ),
-            (
-                "MCP_TERM_ALLOW".to_string(),
-                std::env::var("MCP_TERM_ALLOW").unwrap_or_else(|_| {
-                    // The JS default allow-list. Deliberately conservative:
-                    // anything beyond this needs an explicit opt-in.
-                    "echo,pwd,ls,true,uname,date,cat,head,wc,which,bun,node".into()
-                }),
-            ),
-        ],
-        _ => Vec::new(),
-    };
-
-    Some(ServerSpec {
-        name: name.to_string(),
-        command: bun(),
-        args: vec![script.to_string_lossy().into_owned()],
-        cwd: Some(project_root.to_string_lossy().into_owned()),
-        env,
-        framing: Framing::Newline,
+/// The chat MCP configuration is re-read whenever servers are selected.
+pub fn config_path() -> PathBuf {
+    std::env::var_os("CHAT_MCP_CONFIG").map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("ANGELA_ROOT").map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .join(".angela/mcp.json")
     })
+}
+
+fn servers() -> serde_json::Map<String, serde_json::Value> {
+    let path = config_path();
+    match std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+        Some(v) => v.get("mcpServers").and_then(|v| v.as_object()).cloned().unwrap_or_default(),
+        None => { eprintln!("[mcp] could not read MCP configuration: {}", path.display()); Default::default() }
+    }
+}
+
+pub fn names() -> Vec<String> {
+    servers().into_iter().filter(|(_, v)| v.get("disabled").and_then(|v| v.as_bool()) != Some(true))
+        .map(|(name, _)| name).collect()
+}
+
+fn expand(value: &str, project_root: &Path) -> String {
+    let mut s = value.replace("${projectRoot}", &project_root.to_string_lossy());
+    while let Some(start) = s.find("${env:") {
+        let Some(end_offset) = s[start..].find('}') else { break };
+        let end = start + end_offset;
+        let val = std::env::var(&s[start + 6..end]).unwrap_or_default();
+        s.replace_range(start..=end, &val);
+    }
+    s
+}
+
+/// Translate a configured stdio server into the MCP client's launch spec.
+pub fn preset(name: &str, project_root: &Path) -> Option<ServerSpec> {
+    let entries = servers();
+    let v = entries.get(name)?;
+    if v.get("disabled").and_then(|v| v.as_bool()) == Some(true) { return None; }
+    let command = expand(v.get("command")?.as_str()?, project_root);
+    let args = v.get("args").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).map(|v| expand(v, project_root)).collect()).unwrap_or_default();
+    let env = v.get("env").and_then(|v| v.as_object()).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), expand(v, project_root)))).collect()).unwrap_or_default();
+    let cwd = v.get("cwd").and_then(|v| v.as_str()).map(|s| expand(s, project_root)).or_else(|| Some(project_root.to_string_lossy().into_owned()));
+    let framing = match v.get("framing").and_then(|v| v.as_str()) { Some("lsp") | Some("content-length") => Framing::Lsp, _ => Framing::Newline };
+    Some(ServerSpec { name: name.to_string(), command, args, cwd, env, framing })
 }
 
 /// `file-io` → `file_io`, the prefix the JS gives a server's tools
@@ -162,29 +92,6 @@ mod tests {
     #[test]
     fn an_unprefixed_name_has_no_split() {
         assert!(split_tool_name("bash").is_none());
-    }
-
-    #[test]
-    fn the_two_local_presets_resolve_when_installed() {
-        // Skips rather than fails where /workspace/mcp is absent.
-        if resolve_server_script("file-io").is_none() {
-            eprintln!("no local mcp checkout; skipping");
-            return;
-        }
-        let root = Path::new("/tmp");
-        let f = preset("file-io", root).unwrap();
-        assert!(f.args[0].ends_with("file-io/server.mjs"), "{:?}", f.args);
-        assert_eq!(f.env[0].0, "MCP_FILE_ROOT");
-        assert_eq!(f.env[0].1, "/tmp", "jailed to the project root");
-
-        let t = preset("term-local", root).unwrap();
-        let keys: Vec<&str> = t.env.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(keys.contains(&"MCP_TERM_JB_ROOT"));
-        assert!(keys.contains(&"MCP_TERM_ALLOW"));
-        // Without a PATH even an allow-listed command is "not found".
-        assert!(keys.contains(&"MCP_TERM_PATH"));
-        let path = t.env.iter().find(|(k, _)| k == "MCP_TERM_PATH").unwrap();
-        assert!(!path.1.is_empty());
     }
 
     #[test]

@@ -953,15 +953,8 @@ impl Server {
                 let id = &path["/api/sessions/".len()..];
                 match st.store.load(id) {
                     Some(meta) => {
-                        // The UI seeds its textarea from here: the session's
-                        // override when present, else the agent default.
-                        let agent_default = meta
-                            .get("agent")
-                            .and_then(|v| v.as_str())
-                            .and_then(|n| st.store.agents().get(n))
-                            .or_else(|| st.store.agents().list().into_iter().next())
-                            .map(|d| d.allowlist)
-                            .unwrap_or_default();
+                        // The editor holds session rules; agent rules are
+                        // combined with them separately for each turn.
                         let override_text =
                             meta.get("allowlist").and_then(|v| v.as_str()).map(String::from);
                         let roster: Vec<Value> = roster_json(&st.store, id);
@@ -975,7 +968,7 @@ impl Server {
                                 // two-seat chat simply has two entries.
                                 "participants": roster,
                                 "cursor": st.store.cursor(id),
-                                "allowlist": override_text.clone().unwrap_or(agent_default),
+                                "allowlist": override_text.clone().unwrap_or_default(),
                                 "allowlistOverridden": override_text.is_some(),
                                 "allowlistMode": meta.get("allowlistMode")
                                     .cloned().unwrap_or(json!("allowlist")),
