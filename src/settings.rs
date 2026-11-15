@@ -20,7 +20,10 @@ use crate::session_store::now_iso;
 /// Anything else sent to `POST /api/settings` is ignored rather than stored:
 /// an unrecognised key is a typo or an older client, and keeping it would
 /// mean a row nothing reads and nobody can find.
-pub const KEYS: &[(&str, &str)] = &[("user__full_name", "The user's full name")];
+pub const KEYS: &[(&str, &str)] = &[
+    ("user__full_name", "The user's full name"),
+    ("location", "Where the user is, e.g. \"City, State\""),
+];
 
 pub fn is_known(key: &str) -> bool {
     KEYS.iter().any(|(k, _)| *k == key)

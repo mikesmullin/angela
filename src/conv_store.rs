@@ -84,15 +84,21 @@ impl Participant {
         self.to_json_with(None)
     }
 
-    /// The seat, with its agent's colour folded in.
+    /// The seat, with how its agent is drawn folded in.
     ///
     /// Resolved from the definition at read time rather than copied at seat
-    /// time, like the system prompt and `engagement`: recolouring an agent
-    /// has to recolour it in the conversations it is already in.
-    pub fn to_json_with(&self, accent: Option<&str>) -> Value {
+    /// time, like the system prompt and `engagement`: recolouring an agent —
+    /// or giving it a different icon — has to change it in the conversations
+    /// it is already seated in.
+    ///
+    /// Takes the whole definition rather than one appearance field per
+    /// parameter, so the caller looks the agent up once however many of
+    /// these the roster ends up carrying.
+    pub fn to_json_with(&self, def: Option<&crate::agent_loader::AgentDef>) -> Value {
         json!({
             "id": self.id,
-            "accentColor": accent,
+            "accentColor": def.and_then(|d| d.accent_color.as_deref()),
+            "icon": def.and_then(|d| d.icon.as_deref()),
             "kind": self.kind,
             "handle": self.handle,
             "displayName": self.display_name,
@@ -258,9 +264,10 @@ impl ConvStore {
                 "INSERT INTO conversation
                    (id, ordinal, api_version, kind, title, agent, agent_file, model, status,
                     policy_mode, approve_mode, allowlist, allowlist_source, context_window,
-                    mcp, project_root, config, overrides, turns, created_at, updated_at)
+                    mcp, project_root, config, overrides, allowlist_mode, turns,
+                    created_at, updated_at)
                  VALUES (?1, ?2, 'conv/v1', 'conversation', ?3, ?4, ?5, ?6, 'ready',
-                         ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16, ?16)",
+                         ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, 0, ?16, ?16)",
                 params![
                     id,
                     ordinal,
@@ -278,6 +285,13 @@ impl ConvStore {
                     meta.config.as_ref().and_then(to_json_text),
                     meta.overrides.as_ref().and_then(to_json_text),
                     now,
+                    // Written here rather than left NULL for the reader to
+                    // default, because the reader cannot tell a session
+                    // created under this default from one created before it.
+                    // Changing the fallback instead would silently move every
+                    // existing conversation to `unrestricted`, which is not a
+                    // thing to do retroactively to a tool policy.
+                    meta.allowlist_mode.clone().unwrap_or_else(|| "unrestricted".into()),
                 ],
             )?;
             c.execute(
@@ -1732,6 +1746,40 @@ mod tests {
         assert_eq!(meta["allowlistMode"], "unrestricted");
         assert_eq!(meta["contextWindow"], 8192);
         assert!(meta["lastPromptTokens"].is_null());
+    }
+
+    #[test]
+    fn a_new_conversation_starts_unrestricted() {
+        let store = store();
+        let v = store.create(NewSession::default()).unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+        assert_eq!(store.load(&id).unwrap()["allowlistMode"], "unrestricted");
+
+        // Written to the row, not inferred by the reader: a session made
+        // before this default must keep reading as `allowlist`, and a NULL
+        // is the only way to tell the two apart.
+        let legacy = store.create(NewSession::default()).unwrap();
+        let lid = legacy["id"].as_str().unwrap().to_string();
+        store
+            .with(|c| {
+                c.execute(
+                    "UPDATE conversation SET allowlist_mode = NULL WHERE id = ?1",
+                    rusqlite::params![lid],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .unwrap();
+        assert_eq!(store.load(&lid).unwrap()["allowlistMode"], "allowlist");
+
+        // An explicit choice still wins over the default.
+        let strict = store
+            .create(NewSession {
+                allowlist_mode: Some("allowlist".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let sid = strict["id"].as_str().unwrap().to_string();
+        assert_eq!(store.load(&sid).unwrap()["allowlistMode"], "allowlist");
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub struct AgentDef {
     /// Empty means "let agl resolve `default_model` from its config", which
     /// is re-read per inference — so an empty model is a feature, not a gap.
     pub model: String,
+    pub reasoning_effort: String,
     pub models: Vec<String>,
     pub context_window: Option<u64>,
     pub cwd: Option<String>,
@@ -74,6 +75,22 @@ pub struct AgentDef {
     /// The colour this agent is drawn in — `#rrggbb`, or `None` for the
     /// app's default accent.
     pub accent_color: Option<String>,
+    /// The Phosphor icon it is drawn with — a bare name like `robot` or
+    /// `dog`, or `None` for the default.
+    ///
+    /// A name rather than a glyph or a URL: the UI already ships the
+    /// Phosphor set, so an agent picks one of those by name and gets the
+    /// same weight and alignment as every other icon on the page.
+    pub icon: Option<String>,
+    /// How many model round-trips one turn may take before the agent gives
+    /// up: `None` leaves agl's own default (5).
+    ///
+    /// Each tool call costs a turn, so an agent that reads three files and
+    /// then answers needs at least four. Too low and it dies mid-task with
+    /// "exceeded max_turns without a final answer"; too high and a model
+    /// stuck in a loop burns tokens until it is noticed. It is per-agent
+    /// because the right number is a property of the work, not of the app.
+    pub max_turns: Option<u32>,
     /// Where it was imported from, if it came from a file. Historical.
     pub file: Option<String>,
 }
@@ -118,6 +135,7 @@ impl Default for AgentDef {
             name: String::new(),
             description: String::new(),
             model: String::new(),
+            reasoning_effort: String::new(),
             models: Vec::new(),
             context_window: None,
             cwd: None,
@@ -140,6 +158,8 @@ impl Default for AgentDef {
             id: None,
             avatar: None,
             accent_color: None,
+            icon: None,
+            max_turns: None,
             file: None,
         }
     }
@@ -185,6 +205,7 @@ impl AgentDef {
             "name": self.name,
             "description": self.description,
             "model": self.model,
+            "reasoningEffort": self.reasoning_effort,
             "models": self.models,
             "contextWindow": self.context_window,
             "cwd": self.cwd,
@@ -201,6 +222,11 @@ impl AgentDef {
             "starters": self.starters,
             "avatar": self.avatar,
             "accentColor": self.accent_color,
+            // `null` when unset, which the UI draws as the default robot.
+            "icon": self.icon,
+            // `null` when unset, which is what the editor shows as a blank
+            // box and what the server reads back as "use agl's default".
+            "maxTurns": self.max_turns,
             // Only ever set on a definition that came in from a file.
             "agentFile": self.file,
         })
@@ -209,6 +235,65 @@ impl AgentDef {
 
 /// The app's accent when an agent has not chosen one.
 pub const DEFAULT_ACCENT: &str = "#a78bfa";
+
+/// The icon an agent is drawn with when it has not chosen one.
+pub const DEFAULT_ICON: &str = "robot";
+
+/// A Phosphor icon name, safe to interpolate into a `class` attribute.
+///
+/// The value ends up as `ph ph-<icon>`, so "whatever was typed" is not a
+/// thing to pass through — the same reasoning as [`normalize_hex`]. It is
+/// lowercased, a pasted `ph-` or `ph ph-` prefix is dropped so copying a
+/// class name off the Phosphor site works, and anything outside
+/// `[a-z0-9-]` is rejected back to `None` rather than kept as a value that
+/// would render as no icon at all.
+///
+/// The name is **not** checked against the icon set: the set ships from a
+/// CDN and grows, so a server that only accepted the names it knew would
+/// start rejecting new icons the page can already draw.
+pub fn normalize_icon(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let mut t = lower.trim();
+    t = t.strip_prefix("ph ").unwrap_or(t).trim();
+    t = t.strip_prefix("ph-").unwrap_or(t);
+    t = t.trim_matches('-');
+    if t.is_empty() || t.len() > 64 {
+        return None;
+    }
+    if !t
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// The ceiling on a per-agent turn budget.
+///
+/// Not a technical limit — a backstop. The failure this bounds is a model
+/// looping on a tool it cannot satisfy, where the cost is tokens and the
+/// symptom is a turn that never ends; 1000 is far past any real task and
+/// still terminates.
+pub const MAX_TURNS_CEILING: u32 = 1000;
+
+/// A turn budget from user input, or `None` to leave agl's default.
+///
+/// Accepts a number or a string, because the field arrives from a JSON body
+/// one way and an HTML number input the other. Zero, negative and junk all
+/// mean "unset" rather than "no turns at all": an agent that cannot take a
+/// single turn is never what someone meant to configure.
+pub fn normalize_max_turns(raw: Option<&Value>) -> Option<u32> {
+    let n = match raw? {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(t) => t.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !n.is_finite() || n < 1.0 {
+        return None;
+    }
+    Some((n as u32).min(MAX_TURNS_CEILING))
+}
 
 /// Accept `#rgb` / `#rrggbb` (with or without the `#`), reject anything else.
 ///
@@ -344,6 +429,7 @@ pub fn from_json(name_hint: &str, v: &Value, file: Option<String>) -> AgentDef {
         },
         description: s(get("description")),
         model: s(get("model")),
+        reasoning_effort: s(get("reasoningEffort").or_else(|| get("reasoning_effort"))),
         models: string_list(get("models")),
         context_window: get("contextWindow")
             .or_else(|| o.get("context_window"))
@@ -418,6 +504,8 @@ pub fn from_json(name_hint: &str, v: &Value, file: Option<String>) -> AgentDef {
             if a.is_empty() { None } else { Some(a) }
         },
         accent_color: normalize_hex(&s(get("accentColor").or_else(|| o.get("accent_color")))),
+        icon: normalize_icon(&s(get("icon"))),
+        max_turns: normalize_max_turns(get("maxTurns").or_else(|| o.get("max_turns"))),
         file,
     };
     // De-duplicate `models` while keeping order — the JS does this with
@@ -529,6 +617,89 @@ pub fn default_system_prompt() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_turn_budget_survives_the_json_round_trip() {
+        use super::{from_json, AgentDef};
+        let mut d = AgentDef::default();
+        d.name = "x".into();
+        d.max_turns = Some(25);
+        let j = d.to_json();
+        // The editor reads this key; without it the box renders empty
+        // however the agent was configured.
+        assert_eq!(j["maxTurns"], serde_json::json!(25));
+        assert_eq!(from_json("x", &j, None).max_turns, Some(25));
+        // Unset is null, not 0 — "use the default", not "no turns".
+        let j2 = AgentDef::default().to_json();
+        assert!(j2["maxTurns"].is_null(), "{}", j2["maxTurns"]);
+        assert_eq!(from_json("x", &j2, None).max_turns, None);
+    }
+
+    #[test]
+    fn an_icon_survives_the_json_round_trip() {
+        use super::{from_json, AgentDef};
+        let mut d = AgentDef::default();
+        d.name = "x".into();
+        d.icon = Some("dog".into());
+        let j = d.to_json();
+        // The editor and the rail both read this key; without it every
+        // agent draws as the default however it was configured.
+        assert_eq!(j["icon"], serde_json::json!("dog"));
+        assert_eq!(from_json("x", &j, None).icon.as_deref(), Some("dog"));
+        // Unset is null, which the UI draws as the default robot.
+        let j2 = AgentDef::default().to_json();
+        assert!(j2["icon"].is_null(), "{}", j2["icon"]);
+        assert_eq!(from_json("x", &j2, None).icon, None);
+    }
+
+    #[test]
+    fn an_icon_name_is_safe_to_put_in_a_class_attribute() {
+        use super::normalize_icon as n;
+        assert_eq!(n("dog").as_deref(), Some("dog"));
+        assert_eq!(n("  Chart-Line  ").as_deref(), Some("chart-line"));
+        // Pasted off the Phosphor site, in either of the two forms it is
+        // written there.
+        assert_eq!(n("ph-dog").as_deref(), Some("dog"));
+        assert_eq!(n("ph ph-dog").as_deref(), Some("dog"));
+        // Anything that would end the class name and start an attribute.
+        for bad in [
+            "",
+            "   ",
+            "-",
+            "dog\" onclick=\"x",
+            "dog bone",
+            "dog;",
+            "../x",
+            "d_g",
+        ] {
+            assert_eq!(n(bad), None, "{bad:?}");
+        }
+        // A name the icon set does not have is still accepted: the set
+        // ships from a CDN and grows, and the editor's preview is what
+        // shows a typo.
+        assert_eq!(n("not-an-icon-yet").as_deref(), Some("not-an-icon-yet"));
+    }
+
+    #[test]
+    fn a_turn_budget_is_read_from_a_number_or_a_string() {
+        use super::{normalize_max_turns as n, MAX_TURNS_CEILING};
+        use serde_json::json;
+        // A JSON body sends a number; an HTML number input sends a string.
+        assert_eq!(n(Some(&json!(12))), Some(12));
+        assert_eq!(n(Some(&json!("12"))), Some(12));
+        assert_eq!(n(Some(&json!(" 12 "))), Some(12));
+        assert_eq!(n(Some(&json!(1))), Some(1));
+        // Unset, in every form it arrives as. Zero and negative included:
+        // an agent that cannot take a single turn is never what someone
+        // meant to configure, so it means "default", not "mute".
+        for v in [json!(null), json!(""), json!("   "), json!(0), json!(-3), json!("abc"), json!(true)] {
+            assert_eq!(n(Some(&v)), None, "{v}");
+        }
+        assert_eq!(n(None), None);
+        // Capped, not rejected: a backstop against a model looping on a
+        // tool it cannot satisfy.
+        assert_eq!(n(Some(&json!(999_999))), Some(MAX_TURNS_CEILING));
+    }
+
     use super::*;
 
     #[test]

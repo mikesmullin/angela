@@ -128,6 +128,11 @@ pub fn project(
     roster: &[Participant],
     user_label: &str,
 ) -> (Vec<agl::provider::Message>, String) {
+    let me_handle = roster
+        .iter()
+        .find(|p| p.id == me_id)
+        .map(|p| p.handle.clone())
+        .unwrap_or_else(|| "assistant".into());
     // Build alternating blocks first; pairing into messages is then trivial
     // and the coalescing rule lives in one place.
     enum Block {
@@ -135,6 +140,12 @@ pub fn project(
         Mine(String),
     }
     let mut blocks: Vec<Block> = Vec::new();
+    // The day of the last header written, not of the last message seen: an
+    // agent's own turn can cross midnight, and it carries no timestamp (it
+    // is the model's own words — stamping them teaches it to emit stamps).
+    // Tracking headers instead means the next line that *does* carry a
+    // clock still announces the new day.
+    let mut headed: Option<(i32, i32)> = None;
     for n in path {
         if n.kind != "context_window" || !n.visible {
             continue;
@@ -144,7 +155,17 @@ pub fn project(
         }
         let Some(text) = n.content.clone() else { continue };
         if n.participant_id == Some(me_id) {
-            blocks.push(Block::Mine(text));
+            // Its own words carry the same clock and label as everyone
+            // else's. The alternative — leaving them bare — makes the
+            // agent's own lines the only ones in the transcript with no
+            // time on them, which is exactly the thing the clocks were
+            // added to show. `strip_echoed_prefix` below handles the cost:
+            // a model that mimics the form has it removed before publishing.
+            blocks.push(Block::Mine(crate::relevance::history_line(
+                &n.ts,
+                &me_handle,
+                &text,
+            )));
             continue;
         }
         let sender = match n.role.as_deref() {
@@ -155,10 +176,23 @@ pub fn project(
                 .map(|p| p.handle.clone())
                 .unwrap_or_else(|| "assistant".into()),
         };
-        let line = crate::relevance::history_line(&sender, &text);
+        let line = crate::relevance::history_line(&n.ts, &sender, &text);
+        // A header whenever the calendar day changes, so a run of messages
+        // reads as a day rather than as an undated list.
+        let mut pending: Vec<String> = Vec::new();
+        if let Some(e) = crate::environment::epoch_from_iso(&n.ts) {
+            let key = crate::environment::day_key(e);
+            if headed != Some(key) {
+                if let Some(h) = crate::relevance::day_header(&n.ts) {
+                    pending.push(h);
+                }
+                headed = Some(key);
+            }
+        }
+        pending.push(line);
         match blocks.last_mut() {
-            Some(Block::Said(lines)) => lines.push(line),
-            _ => blocks.push(Block::Said(vec![line])),
+            Some(Block::Said(lines)) => lines.extend(pending),
+            _ => blocks.push(Block::Said(pending)),
         }
     }
 
@@ -212,16 +246,12 @@ pub fn render_wire(msgs: &[agl::provider::Message], me: &str) -> String {
             .as_ref()
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        // One transcript, every line attributed. A user turn already
-        // carries `[sender]` prefixes; an assistant turn is this agent's
-        // own words, so it gets its own handle — rather than a `--- role ---`
-        // divider, which names the wire's shape instead of the speaker and
-        // leaves the agent's own lines as the only anonymous ones.
-        if m.role == "assistant" {
-            out.push_str(&format!("[{me}] {text}\n"));
-        } else {
-            out.push_str(&format!("{text}\n"));
-        }
+        // Verbatim, both roles. Every turn already carries its own clock
+        // and `[sender]` label, so the card is a literal rendering of what
+        // was sent rather than a prettier version of it — which is the only
+        // way it can answer "what did the model actually receive?".
+        let _ = me;
+        out.push_str(&format!("{text}\n"));
     }
     out
 }
@@ -467,6 +497,16 @@ pub fn plan(
         }
     }
     system.push_str(&rules_section(reply_required, how_you_got_here, title.as_str()));
+    // Last, because it is the one part that changes between turns: where
+    // the agent is and what time it is, neither of which a model can know
+    // and both of which it will otherwise guess at confidently.
+    system.push_str(&crate::environment::section(
+        crate::environment::now_epoch(),
+        &store.setting("location"),
+        // The raw setting, not `user_label()`: an unset name should leave
+        // the line out, not announce that the user is called "user".
+        &store.setting("user__full_name"),
+    ));
 
     let seen_through = path.last().map(|n| n.seq).unwrap_or(watermark);
     let task_id = task_id(conv, me.id, &cursor, watermark, round_index, &prompt);
@@ -512,8 +552,43 @@ fn rules_section(reply_required: bool, how_you_got_here: &str, title: &str) -> S
         ));
     }
     out.push_str("- Do not repeat points already made.\n");
-    out.push_str("- Reply as yourself, in your own voice, with no [sender] prefix.\n");
+    out.push_str(
+        "- Reply as yourself, in your own voice. Do not prefix your reply with a \
+         timestamp or a [sender] label — those are added for you.\n",
+    );
     out
+}
+
+/// Remove a `14:05 [handle] ` prefix a model copied from its own history.
+///
+/// The history shows an agent its own past turns in the same stamped,
+/// labelled form as everyone else's, which is what gives it a sense of time
+/// passing — and also an example to imitate. The system prompt says not to;
+/// this is the belt to that braces, applied before anything reads the reply
+/// (`(pass)` detection included, or a passed turn arrives as a message).
+pub fn strip_echoed_prefix(reply: &str, handle: &str) -> String {
+    let t = reply.trim_start();
+    // `HH:MM `
+    let after_clock = match t.as_bytes() {
+        [a, b, b':', c, d, b' ', ..]
+            if a.is_ascii_digit()
+                && b.is_ascii_digit()
+                && c.is_ascii_digit()
+                && d.is_ascii_digit() =>
+        {
+            &t[6..]
+        }
+        _ => t,
+    };
+    // `[handle] `, only this agent's own — another participant's label in a
+    // reply is the model quoting someone, which is its business.
+    let tag = format!("[{handle}] ");
+    let out = after_clock.strip_prefix(tag.as_str()).unwrap_or(after_clock);
+    if std::ptr::eq(out, reply) {
+        reply.to_string()
+    } else {
+        out.to_string()
+    }
 }
 
 /// Did the participant decline to speak?
@@ -536,6 +611,8 @@ pub enum Settled {
     MaxRounds,
     /// `MAX_MESSAGES` reached.
     MaxMessages,
+    /// The user pressed stop.
+    Stopped,
 }
 
 impl Settled {
@@ -544,11 +621,17 @@ impl Settled {
             Settled::SilentRound => "silent_round",
             Settled::MaxRounds => "max_rounds",
             Settled::MaxMessages => "max_messages",
+            Settled::Stopped => "stopped",
         }
     }
     pub fn status(&self) -> &'static str {
         match self {
             Settled::SilentRound => "settled",
+            // Its own status, not "bounded": the discussion did not run out
+            // of rope, somebody took it away. A restarted server reads this
+            // to decide whether a round is still in flight, and "stopped"
+            // answers that as clearly as the other two.
+            Settled::Stopped => "stopped",
             _ => "bounded",
         }
     }
@@ -835,6 +918,24 @@ mod tests {
             .collect()
     }
 
+    /// The transcript with its clocks and day headers removed, so an
+    /// assertion about *who said what* is not also an assertion about when
+    /// the test ran.
+    fn undated(text: &str) -> String {
+        text.lines()
+            .filter(|l| !l.starts_with("--- "))
+            .map(|l| {
+                // `14:05 [who] …` -> `[who] …`
+                match l.split_once(' ') {
+                    Some((head, rest))
+                        if head.len() == 5 && head.as_bytes()[2] == b':' => rest.to_string(),
+                    _ => l.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn say(store: &ConvStore, id: &str, role: &str, who: Option<i64>, text: &str) {
         store
             .append_event(
@@ -871,10 +972,10 @@ mod tests {
             w.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(),
             vec!["system", "user", "assistant", "user"]
         );
-        assert_eq!(w[1].1, "[user] what time is it");
-        assert_eq!(w[2].1, "about three");
+        assert_eq!(undated(&w[1].1), "[user] what time is it");
+        assert_eq!(undated(&w[2].1), "[alice] about three");
         assert_eq!(
-            w[3].1,
+            undated(&w[3].1),
             "[user] i might go to the market\n[bob] bring a bag\n[user] maybe some fish"
         );
         // The turn it is answering is the last user block, not only the
@@ -898,10 +999,84 @@ mod tests {
         // Every line attributed, and no `--- role ---` dividers: those name
         // the wire's shape rather than the speaker, and leave the agent's
         // own lines as the only anonymous ones.
-        assert_eq!(wire, "[user] q1\n[alice] mine\n[bob] bob's\n[user] q2\n");
-        assert!(!wire.contains("---"));
+        assert_eq!(undated(&wire), "[user] q1\n[alice] mine\n[bob] bob's\n[user] q2");
+        assert!(!wire.contains("--- user ---") && !wire.contains("--- assistant ---"));
         // The system prompt is not part of the transcript.
         assert!(!wire.contains("Your name is"));
+    }
+
+    #[test]
+    fn the_system_prompt_ends_with_the_environment() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        say(&store, &id, "user", None, "hi");
+        let sys = plan(&store, &id, &alice, 0, true, "x").unwrap().system_prompt;
+        assert!(sys.contains("## Environment"), "{sys}");
+        assert!(sys.contains("You are on "));
+        assert!(sys.contains("The current time is "));
+        // Last: it is the one part that changes between turns, so anything
+        // stable that followed it would be re-sent for no reason.
+        let env = sys.find("## Environment").unwrap();
+        let rules = sys.find("## How to reply").unwrap();
+        assert!(rules < env, "the environment is the suffix");
+    }
+
+    /// Append a message with an explicit timestamp.
+    fn say_at(store: &ConvStore, id: &str, iso: &str, role: &str, who: Option<i64>, text: &str) {
+        store
+            .append_event(
+                id,
+                NewEvent {
+                    event_type: "context_window".into(),
+                    payload: json!({ "role": role, "content": text }),
+                    speaker: who,
+                    ts: Some(iso.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_transcript_is_grouped_by_day_and_stamped_by_minute() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        let bob = roster.iter().find(|p| p.handle == "bob").unwrap().clone();
+        // Two local days, chosen well inside each so no zone shifts them.
+        say_at(&store, &id, "2026-11-13T19:00:00.000Z", "user", None, "hello everyone");
+        say_at(&store, &id, "2026-11-13T19:01:00.000Z", "assistant", Some(bob.id), "hi, Bob!");
+        say_at(&store, &id, "2026-11-14T19:02:00.000Z", "user", None, "morning");
+
+        let prompt = plan(&store, &id, &alice, 0, true, "x").unwrap().prompt;
+        let lines: Vec<&str> = prompt.lines().collect();
+
+        // A header opens each day; every message carries a 24-hour clock.
+        assert!(lines[0].starts_with("--- ") && lines[0].ends_with(" ---"), "{lines:?}");
+        assert!(lines[1].contains("[user] hello everyone"));
+        assert!(lines[2].contains("[bob] hi, Bob!"));
+        let headers: Vec<&&str> = lines.iter().filter(|l| l.starts_with("--- ")).collect();
+        assert_eq!(headers.len(), 2, "one per day: {lines:?}");
+        assert_ne!(headers[0], headers[1]);
+        // Same day, same header — not one per message.
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("[")).count(),
+            3,
+            "{lines:?}"
+        );
+        for l in lines.iter().filter(|l| !l.starts_with("--- ")) {
+            let clock = &l[..5];
+            assert_eq!(&clock[2..3], ":", "expected HH:MM, got {l:?}");
+            assert!(clock[..2].parse::<u32>().unwrap() < 24, "{l:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_timestamp_loses_its_clock_not_its_line() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        say_at(&store, &id, "whenever", "user", None, "still here");
+        let prompt = plan(&store, &id, &alice, 0, true, "x").unwrap().prompt;
+        assert_eq!(prompt, "[user] still here");
     }
 
     #[test]
@@ -912,18 +1087,18 @@ mod tests {
 
         // Unset: a bracketed empty label would read as a participant with
         // no name, so it falls back rather than going blank.
-        assert_eq!(plan(&store, &id, &alice, 0, true, "x").unwrap().prompt, "[user] hello");
+        assert_eq!(undated(&plan(&store, &id, &alice, 0, true, "x").unwrap().prompt), "[user] hello");
 
         let mut patch = serde_json::Map::new();
         patch.insert("user__full_name".into(), json!("Bob"));
         store.set_settings(&patch);
-        assert_eq!(plan(&store, &id, &alice, 0, true, "x").unwrap().prompt, "[Bob] hello");
+        assert_eq!(undated(&plan(&store, &id, &alice, 0, true, "x").unwrap().prompt), "[Bob] hello");
 
         // Only the human is renamed; an agent is still its handle.
         let bob = roster.iter().find(|p| p.handle == "bob").unwrap().clone();
         say(&store, &id, "assistant", Some(bob.id), "hi back");
         let p = plan(&store, &id, &alice, 0, true, "x").unwrap().prompt;
-        assert_eq!(p, "[Bob] hello\n[bob] hi back");
+        assert_eq!(undated(&p), "[Bob] hello\n[bob] hi back");
     }
 
     #[test]
@@ -957,10 +1132,39 @@ mod tests {
         say(&store, &id, "user", None, "q2");
 
         let w = wire(&plan(&store, &id, &alice, 0, true, "x").unwrap());
-        // Not a `[alice] …` line in somebody else's block: its own words are
-        // its own turns, which is the shape a chat model is trained on.
-        assert!(w.iter().any(|(r, t)| r == "assistant" && t == "ALICE SAID THIS"));
-        assert!(!w.iter().any(|(_, t)| t.contains("[alice]")));
+        // Its own words are its own `assistant` turns — the shape a chat
+        // model is trained on — rather than `[alice] …` lines inside
+        // somebody else's user block.
+        let own: Vec<&(String, String)> = w.iter().filter(|(r, _)| r == "assistant").collect();
+        assert_eq!(own.len(), 1, "{w:?}");
+        assert!(own[0].1.ends_with("ALICE SAID THIS"), "{:?}", own[0].1);
+        // Stamped and labelled like every other line, so its own turns are
+        // not the only ones in the transcript with no time on them.
+        assert_eq!(undated(&own[0].1), "[alice] ALICE SAID THIS");
+        assert!(own[0].1.contains("[alice] "));
+        // …and the user blocks still do not carry it.
+        assert!(!w.iter().any(|(r, t)| r == "user" && t.contains("[alice]")));
+    }
+
+    #[test]
+    fn a_copied_prefix_is_stripped_from_the_reply() {
+        // Showing an agent its own turns stamped and labelled also shows it
+        // a form to imitate. The system prompt says not to; this is the
+        // belt to that braces.
+        assert_eq!(strip_echoed_prefix("17:43 [fish] hello", "fish"), "hello");
+        assert_eq!(strip_echoed_prefix("17:43 hello", "fish"), "hello");
+        assert_eq!(strip_echoed_prefix("[fish] hello", "fish"), "hello");
+        assert_eq!(strip_echoed_prefix("  17:43 [fish] hello", "fish"), "hello");
+        // A pass has to survive the strip, or it is published as a message
+        // instead of being silence.
+        assert!(is_pass(&strip_echoed_prefix("17:43 [fish] (pass)", "fish")));
+        // Left alone: an ordinary reply, a time that is part of the
+        // sentence, and another participant's label (the model quoting
+        // someone, which is its business).
+        assert_eq!(strip_echoed_prefix("hello", "fish"), "hello");
+        assert_eq!(strip_echoed_prefix("17:43 is when we meet", "fish"), "is when we meet");
+        assert_eq!(strip_echoed_prefix("[joker] said that", "fish"), "[joker] said that");
+        assert_eq!(strip_echoed_prefix("1:4 [fish] x", "fish"), "1:4 [fish] x");
     }
 
     #[test]
@@ -995,7 +1199,7 @@ mod tests {
         let task = plan(&store, &id, &alice, 0, true, "x").unwrap();
         // An unbounded history is a prompt that grows without limit.
         assert_eq!(task.context.len(), MAX_CONTEXT_TURNS - 1);
-        assert_eq!(task.prompt, "[user] newest");
+        assert_eq!(undated(&task.prompt), "[user] newest");
         let w = wire(&task);
         assert!(!w.iter().any(|(_, t)| t.contains("u0")), "oldest dropped");
     }

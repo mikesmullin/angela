@@ -43,6 +43,7 @@ fn a_turn_streams_persists_and_is_remembered() {
         .unwrap();
     // No MCP presets: this test is about the turn loop, not tools.
     let pool = McpPool::default();
+    let cancels = angela::cancel::Cancels::default();
     let def = agent_loader::AgentDef::default();
 
     // ---- turn one --------------------------------------------------------
@@ -53,6 +54,7 @@ fn a_turn_streams_persists_and_is_remembered() {
         &rt,
         "/tmp",
         &pool,
+        &cancels,
         &def,
         TurnRequest {
             tab_id: "1".into(),
@@ -108,6 +110,7 @@ fn a_turn_streams_persists_and_is_remembered() {
         &rt,
         "/tmp",
         &pool,
+        &cancels,
         &def,
         TurnRequest {
             tab_id: "1".into(),
@@ -145,6 +148,7 @@ fn an_empty_prompt_is_refused_before_any_session_is_made() {
         .build()
         .unwrap();
     let pool = McpPool::default();
+    let cancels = angela::cancel::Cancels::default();
     let def = agent_loader::AgentDef::default();
     let err = run_turn(
         &store,
@@ -152,6 +156,7 @@ fn an_empty_prompt_is_refused_before_any_session_is_made() {
         &rt,
         "/tmp",
         &pool,
+        &cancels,
         &def,
         TurnRequest {
             tab_id: "1".into(),

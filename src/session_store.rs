@@ -248,6 +248,9 @@ pub struct NewSession {
     pub approve_mode: Option<Value>,
     pub allowlist_source: Option<String>,
     pub allowlist: Option<String>,
+    /// `allowlist` or `unrestricted`. `None` takes the default for a new
+    /// conversation, which is `unrestricted`.
+    pub allowlist_mode: Option<String>,
     pub context_window: Option<u64>,
     pub config: Option<Value>,
     pub overrides: Option<Value>,

@@ -148,9 +148,23 @@ pub fn build_state(name: &str, identity: &str, history: &[String]) -> String {
     out
 }
 
-/// One history line: `[sender] text`.
-pub fn history_line(sender: &str, text: &str) -> String {
-    format!("[{sender}] {text}")
+/// One history line: `14:00 [sender] text`.
+///
+/// The clock is how an agent gets a sense of time passing — whether the last
+/// message was a minute ago or yesterday afternoon changes what a reply
+/// should say, and nothing else in the prompt carries that.
+pub fn history_line(ts: &str, sender: &str, text: &str) -> String {
+    match crate::environment::epoch_from_iso(ts) {
+        Some(e) => format!("{} [{sender}] {text}", crate::environment::clock(e)),
+        // A timestamp we cannot read loses its clock, not its line.
+        None => format!("[{sender}] {text}"),
+    }
+}
+
+/// `--- Fri, Nov 13 ---`, the header that opens a day's run.
+pub fn day_header(ts: &str) -> Option<String> {
+    let e = crate::environment::epoch_from_iso(ts)?;
+    Some(format!("--- {} ---", crate::environment::day_label(e)))
 }
 
 /// Ask whether `me` should take a turn on `message`.
@@ -160,6 +174,7 @@ pub fn history_line(sender: &str, text: &str) -> String {
 /// that the newest message alone cannot.
 pub fn should_speak(
     rt: &tokio::runtime::Runtime,
+    stop: &crate::cancel::Cancel,
     me: &Participant,
     identity: &str,
     history: &[String],
@@ -182,14 +197,25 @@ pub fn should_speak(
     let state = json!(build_state(&name, identity, history));
 
     let question = question();
-    let got = rt.block_on(async {
+    // Stoppable like any other model call. It is a short one, but "stop"
+    // that waits for a decision before taking effect is still a wait the
+    // user did not ask for.
+    let got = crate::cancel::block_on(rt, stop, async {
         client
             .decisions(&decision_model(), &state, &question, None)
             .await
     });
     let answers = match got {
-        Ok(d) => d.answers,
-        Err(e) => {
+        // Silence is the right answer to a stopped decision: it means this
+        // agent does not take a turn, which is what stopping asked for.
+        crate::cancel::Ran::Stopped => {
+            let mut v = quiet("stopped".to_string());
+            v.state = state;
+            v.question = question;
+            return v;
+        }
+        crate::cancel::Ran::Done(Ok(d)) => d.answers,
+        crate::cancel::Ran::Done(Err(e)) => {
             let mut v = quiet(e.to_string());
             // Even a failed call is worth showing: it is the difference
             // between "the model said no" and "nobody was asked".
@@ -286,9 +312,9 @@ mod tests {
             "Fish",
             "Whenever someone mentions fish You like to talk about Cajun creole cuisine\n\n             ## Goals\n\nSpread the values of the Cajun creole people",
             &[
-                history_line("user", "hi"),
-                history_line("fish", "Hey there!"),
-                history_line("user", "i'm at the wet market"),
+                history_line("", "user", "hi"),
+                history_line("", "fish", "Hey there!"),
+                history_line("", "user", "i'm at the wet market"),
             ],
         );
         assert!(state.starts_with("Your name is Fish.\n"), "{state}");
@@ -308,7 +334,7 @@ mod tests {
 
     #[test]
     fn an_agent_with_no_identity_still_gets_a_usable_state() {
-        let state = build_state("scout", "", &[history_line("user", "hello")]);
+        let state = build_state("scout", "", &[history_line("", "user", "hello")]);
         assert!(state.starts_with("Your name is scout.\n"));
         // No stray blank section where the identity would have been.
         assert!(!state.contains("\n\n\n"), "{state:?}");
@@ -318,7 +344,7 @@ mod tests {
     #[test]
     fn a_long_persona_cannot_drown_out_the_conversation() {
         let huge = "word ".repeat(4000);
-        let state = build_state("x", &huge, &[history_line("user", "hi")]);
+        let state = build_state("x", &huge, &[history_line("", "user", "hi")]);
         assert!(state.chars().count() < MAX_IDENTITY_CHARS + 400, "{}", state.len());
         // …and the conversation still makes it in.
         assert!(state.contains("[user] hi"));
@@ -327,7 +353,7 @@ mod tests {
     #[test]
     fn only_the_recent_history_is_carried_and_each_line_is_bounded() {
         let many: Vec<String> = (0..40)
-            .map(|i| history_line("user", &format!("message {i}")))
+            .map(|i| history_line("", "user", &format!("message {i}")))
             .collect();
         let state = build_state("x", "", &many);
         let kept: Vec<&str> = state.lines().filter(|l| l.starts_with('[')).collect();
@@ -337,8 +363,8 @@ mod tests {
         assert!(!state.contains("message 0]"));
 
         // One pasted file cannot crowd out the rest.
-        let long = history_line("user", &"x".repeat(5000));
-        let state = build_state("x", "", &[long, history_line("user", "after")]);
+        let long = history_line("", "user", &"x".repeat(5000));
+        let state = build_state("x", "", &[long, history_line("", "user", "after")]);
         assert!(state.contains("[user] after"));
         assert!(state.lines().all(|l| l.chars().count() <= MAX_HISTORY_LINE_CHARS));
     }
@@ -399,7 +425,8 @@ mod tests {
             .build()
             .unwrap();
         std::env::set_var("ANGELA_DECISIONS_URL", "http://127.0.0.1:9/v1");
-        let v = should_speak(&rt, &seat("x", "x"), "", &[history_line("user", "hello")]);
+        let never = crate::cancel::Cancel::never();
+        let v = should_speak(&rt, &never, &seat("x", "x"), "", &[history_line("", "user", "hello")]);
         // Quiet, and the reason is reported rather than swallowed: an agent
         // that speaks when it should not is the more disruptive failure.
         assert!(!v.speak);

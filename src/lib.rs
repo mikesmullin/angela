@@ -36,8 +36,11 @@
 
 pub mod agent_loader;
 pub mod agent_store;
+pub mod approvals;
+pub mod cancel;
 pub mod conv_store;
 pub mod db;
+pub mod environment;
 pub mod allowlist;
 pub mod group;
 pub mod harness;

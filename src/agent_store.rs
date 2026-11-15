@@ -88,7 +88,7 @@ impl<'a> AgentStore<'a> {
 
     const COLS: &'static str = "id, name, description, model, models, context_window, cwd, env, \
          mcp, allowlist, tools_enabled, policy_mode, parallel_tools, soul, goals, memory, \
-         engagement, starters, avatar, accent_color";
+         engagement, starters, avatar, accent_color, reasoning_effort, max_turns, icon";
 
     fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentDef> {
         Ok(AgentDef {
@@ -126,6 +126,9 @@ impl<'a> AgentStore<'a> {
                 .unwrap_or_default(),
             avatar: r.get(18)?,
             accent_color: r.get(19)?,
+            reasoning_effort: r.get(20)?,
+            max_turns: r.get::<_, Option<i64>>(21)?.map(|v| v as u32),
+            icon: r.get(22)?,
             file: None,
         })
     }
@@ -192,6 +195,13 @@ impl<'a> AgentStore<'a> {
             .accent_color
             .as_deref()
             .and_then(crate::agent_loader::normalize_hex);
+        // Same reasoning as the accent: it is interpolated into a `class`
+        // attribute, so it is normalised on the way in rather than trusted
+        // on the way out.
+        let icon = def
+            .icon
+            .as_deref()
+            .and_then(crate::agent_loader::normalize_icon);
         let now = now_iso();
 
         self.store.with(|c| {
@@ -315,6 +325,20 @@ impl<'a> AgentStore<'a> {
                     c.last_insert_rowid()
                 }
             };
+            // These columns were all added after the original INSERT was
+            // written; setting them here beats renumbering twenty-one
+            // positional parameters for each one.
+            c.execute(
+                "UPDATE agents SET reasoning_effort = ?1, max_turns = ?2, icon = ?3
+                 WHERE id = ?4",
+                params![
+                    def.reasoning_effort,
+                    def.max_turns.map(|v| v as i64),
+                    icon,
+                    id
+                ],
+            )
+            .map_err(|e| AgentError::Db(e.to_string()))?;
             // Carry the roster and any session headers across a rename.
             if let Some(prev) = previous_name {
                 if prev != name {
@@ -460,6 +484,11 @@ mod tests {
         d.goals = "Find things.".into();
         d.memory = "The repo is Rust.".into();
         d.engagement = "relevant".into();
+        d.reasoning_effort = "xhigh".into();
+        d.max_turns = Some(12);
+        // Typed with a prefix, as it is written on the Phosphor site:
+        // stored normalised, so nothing downstream has to strip it.
+        d.icon = Some("ph-dog".into());
         d.models = vec!["m1".into(), "m2".into()];
         d.context_window = Some(8192);
         d.tools_enabled = Some(vec!["file_io__read_file".into()]);
@@ -471,6 +500,9 @@ mod tests {
         assert_eq!(got.goals, "Find things.");
         assert_eq!(got.memory, "The repo is Rust.");
         assert_eq!(got.engagement, "relevant");
+        assert_eq!(got.reasoning_effort, "xhigh");
+        assert_eq!(got.max_turns, Some(12));
+        assert_eq!(got.icon.as_deref(), Some("dog"));
         assert_eq!(got.models, vec!["m1", "m2"]);
         assert_eq!(got.context_window, Some(8192));
         assert_eq!(got.mcp, vec!["file-io"]);

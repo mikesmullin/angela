@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when the DDL below changes in a way an existing file must be
 /// brought forward to. Recorded in `schema_meta`.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -133,6 +133,12 @@ CREATE TABLE IF NOT EXISTS agents (
     -- NULL means the app's default accent, so an agent nobody has coloured
     -- still looks like the rest of the UI rather than like a missing value.
     accent_color   TEXT,
+    -- The Phosphor icon name it is drawn with. NULL means the default
+    -- robot, so an agent nobody has given an icon still looks like an
+    -- agent rather than like a missing glyph.
+    icon           TEXT,
+    reasoning_effort TEXT NOT NULL DEFAULT '',
+    max_turns      INTEGER,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
@@ -329,6 +335,9 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
     for stmt in [
         "ALTER TABLE participants ADD COLUMN engagement TEXT",
         "ALTER TABLE agents ADD COLUMN accent_color TEXT",
+        "ALTER TABLE agents ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE agents ADD COLUMN max_turns INTEGER",
+        "ALTER TABLE agents ADD COLUMN icon TEXT",
     ] {
         let _ = conn.execute(stmt, []);
     }

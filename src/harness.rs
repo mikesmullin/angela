@@ -30,6 +30,8 @@ use crate::agent_loader::AgentDef;
 use crate::allowlist;
 use crate::mcp::McpServer;
 use crate::mcp_presets;
+use crate::approvals::Approvals;
+use crate::cancel::{self, Cancel, Cancels, Ran};
 use crate::conv_store::ConvStore;
 use crate::session_store::{ContextItem, NewEvent, NewSession};
 
@@ -76,17 +78,57 @@ impl LiveTabs {
     }
 }
 
-/// Connected MCP servers, started on demand and reused across turns.
+/// What the transcript says where a turn was cut off.
 ///
-/// Spawning a server per turn would pay process startup on every prompt and
-/// throw away whatever state the server holds; the JS keeps them on the live
-/// tab for the same reason.
+/// Said rather than left blank: a reply that stops halfway and a reply that
+/// finished are the same shape on screen, and the difference is one the
+/// reader needs — especially on a reload, where there is no memory of having
+/// pressed the button.
+pub const STOPPED_NOTICE: &str = "Stopped.";
+
+/// A turn's registration in [`Cancels`], removed however the turn ends.
+///
+/// A guard rather than a call at the end: `run_turn` leaves through a dozen
+/// `?`s and early returns, and a session left in the map would make the
+/// *next* stop press look like it worked while hitting nothing.
+struct Armed<'a> {
+    cancels: &'a Cancels,
+    session: String,
+    switch: Arc<Cancel>,
+}
+
+impl<'a> Armed<'a> {
+    fn new(cancels: &'a Cancels, session: &str) -> Self {
+        Armed {
+            cancels,
+            session: session.to_string(),
+            switch: cancels.begin(session),
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.switch.stopped()
+    }
+}
+
+impl Drop for Armed<'_> {
+    fn drop(&mut self) {
+        self.cancels.finish(&self.session, &self.switch);
+    }
+}
+
+/// Process-wide MCP connections, started on demand and shared across turns.
 #[derive(Default)]
 pub struct McpPool {
-    servers: Mutex<HashMap<String, Arc<McpServer>>>,
+    servers: Mutex<HashMap<String, Result<Arc<McpServer>, String>>>,
 }
 
 impl McpPool {
+    fn get_or_connect<F>(&self, name: &str, connect: F) -> Result<Arc<McpServer>, String>
+    where F: FnOnce() -> Result<Arc<McpServer>, String> {
+        let mut servers = self.servers.lock().unwrap();
+        servers.entry(name.to_string()).or_insert_with(connect).clone()
+    }
     /// Connect (or reuse) the named presets, returning those that came up.
     ///
     /// A server that fails to start is reported and skipped rather than
@@ -99,23 +141,17 @@ impl McpPool {
         let mut out = Vec::new();
         let mut errors = Vec::new();
         for name in names {
-            if let Some(existing) = self.servers.lock().unwrap().get(name) {
-                out.push(Arc::clone(existing));
-                continue;
-            }
-            let Some(spec) = mcp_presets::preset(name, project_root) else {
-                errors.push(format!("unknown or uninstalled MCP preset `{name}`"));
-                continue;
-            };
-            match McpServer::connect(&spec, CONNECT_TIMEOUT) {
-                Ok(srv) => {
-                    self.servers
-                        .lock()
-                        .unwrap()
-                        .insert(name.clone(), Arc::clone(&srv));
-                    out.push(srv);
-                }
-                Err(e) => errors.push(format!("MCP `{name}`: {e}")),
+            // Keep lookup and initialization together: different sessions can
+            // request the same server concurrently on different HTTP threads.
+            let result = self.get_or_connect(name, || {
+                let spec = mcp_presets::preset(name, project_root)
+                    .ok_or_else(|| format!("unknown or uninstalled MCP preset `{name}`"))?;
+                McpServer::connect(&spec, CONNECT_TIMEOUT)
+                    .map_err(|e| format!("MCP `{name}`: {e}"))
+            });
+            match result {
+                Ok(srv) => out.push(srv),
+                Err(e) => errors.push(e),
             }
         }
         (out, errors)
@@ -123,7 +159,7 @@ impl McpPool {
 
     pub fn shutdown(&self) {
         for (_, s) in self.servers.lock().unwrap().drain() {
-            s.close();
+            if let Ok(s) = s { s.close(); }
         }
     }
 }
@@ -149,6 +185,8 @@ pub enum TurnError {
     EmptyContent,
     Store(String),
     Agent(String),
+    /// The user pressed stop. Not a failure: the turn did what it was told.
+    Stopped,
 }
 
 impl std::fmt::Display for TurnError {
@@ -157,6 +195,7 @@ impl std::fmt::Display for TurnError {
             TurnError::EmptyContent => write!(f, "empty content"),
             TurnError::Store(m) => write!(f, "session store: {m}"),
             TurnError::Agent(m) => write!(f, "{m}"),
+            TurnError::Stopped => write!(f, "stopped"),
         }
     }
 }
@@ -251,16 +290,25 @@ pub fn title_from_first_message(store: &ConvStore, session_id: &str, content: &s
 /// definition's `toolsEnabled` / `allowlist` entries carry over unchanged and
 /// two servers cannot collide on a common name like `read_file`.
 ///
-/// Every call is gated by the allowlist **before** it reaches the server. A
-/// denied call returns text the model can read, so it can choose a different
-/// approach rather than failing the turn — and, critically, deny is the
-/// default: an empty allowlist permits nothing.
+/// Every call is gated by the allowlist **before** it reaches the server,
+/// and deny is the default: an empty allowlist permits nothing.
+///
+/// A call the list does not cover is not simply refused — it is **asked
+/// about**. The handler blocks in [`approvals`](crate::approvals) while the
+/// person decides, and only a denial (or a timeout, or nobody there to ask)
+/// returns text the model can read, so it can choose another approach rather
+/// than failing the turn.
+///
+/// `session` is what an "always" is pinned to: approvals do not outlive the
+/// conversation they were given in.
 pub fn register_tools(
     agent: &mut Agent,
     servers: &[Arc<McpServer>],
     enabled: Option<&Vec<String>>,
     allow_text: &str,
     policy_mode: &str,
+    session: &str,
+    approvals: Arc<Approvals>,
 ) -> usize {
     // `auto` is the documented escape hatch for a trusted project; anything
     // else (including the default `ask`) enforces the list.
@@ -280,6 +328,8 @@ pub fn register_tools(
             let remote = tool.name.clone();
             let gate_name = name.clone();
             let allow_text = allow_text.clone();
+            let approvals = Arc::clone(&approvals);
+            let session = session.to_string();
             let ok = agent.tool(
                 &name,
                 &tool.description,
@@ -288,17 +338,27 @@ pub fn register_tools(
                 move |args: &Value| {
                     if enforce {
                         let cmd = allowlist::command_line(&gate_name, args);
-                        if !allowlist::is_allowed(&allow_text, &gate_name, &cmd) {
-                            // Denied calls never reach the server.
-                            return Ok(format!(
-                                "denied: `{gate_name}`{} is not on this session's allowlist. \
-                                 Ask the user to allow it, or use a permitted tool.",
-                                if cmd.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" with `{cmd}`")
-                                }
-                            ));
+                        if !allowlist::is_allowed(&allow_text, &gate_name, &cmd)
+                            && !approvals.pinned(&session, &gate_name, &cmd)
+                        {
+                            // The turn stops here until somebody answers.
+                            let decision = approvals.ask(&session, &gate_name, &cmd, args);
+                            if !decision.allowed() {
+                                // Denied calls never reach the server. The
+                                // model is told plainly, so it can say so or
+                                // try something permitted instead of
+                                // retrying the same call forever.
+                                return Ok(format!(
+                                    "denied: `{gate_name}`{} was not approved by the user. \
+                                     Do not try it again — use a permitted tool, or explain \
+                                     what you needed it for.",
+                                    if cmd.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" with `{cmd}`")
+                                    }
+                                ));
+                            }
                         }
                     }
                     match srv.call_tool(&remote, args, TOOL_TIMEOUT) {
@@ -313,6 +373,12 @@ pub fn register_tools(
         }
     }
     n
+}
+
+fn turn_reasoning(def: &AgentDef, session: Option<&Value>) -> Option<String> {
+    Some(def.reasoning_effort.clone()).filter(|s| !s.trim().is_empty())
+        .or_else(|| session.and_then(|s| s.get("config")).and_then(|c| c.get("reasoningEffort"))
+            .and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(String::from))
 }
 
 /// Session rules add to each agent's own rules, one rule per line.
@@ -370,6 +436,85 @@ pub struct TurnMark {
     pub handle: String,
     pub participant: Option<i64>,
     pub round: i64,
+}
+
+/// What the model has said since the last time anything was written down.
+///
+/// agl runs one turn as several rounds — think, call a tool, read the result,
+/// think again — and returns only the final round's answer. Buffering all of
+/// it and writing a single row when the turn settles put every thought
+/// *below* the tool calls it actually preceded, and fused separate thoughts
+/// into one card. Flushing at each tool-call boundary puts each one on the
+/// rail where it happened.
+///
+/// Content said during a tool round is dropped by agl (only the last round's
+/// answer comes back), so it is written here or nowhere.
+#[derive(Default)]
+struct Said {
+    reasoning: String,
+    content: String,
+    participant: Option<i64>,
+}
+
+impl Said {
+    fn new(participant: Option<i64>) -> Self {
+        Said { participant, ..Default::default() }
+    }
+
+    fn card(&self, kind: &str, text: &str, event_id: &str, mark: &TurnMark) -> Value {
+        let mut card = json!({
+            "kind": kind, "text": text, "eventId": event_id,
+            "turn": mark.id, "handle": mark.handle, "visible": true,
+        });
+        if let Some(pid) = self.participant {
+            card["participantId"] = json!(pid);
+        }
+        json!({ "type": "card", "card": card })
+    }
+
+    /// Seal the thinking so far, if there is any.
+    fn flush_reasoning(&mut self, store: &ConvStore, conv: &str, mark: &TurnMark, emit: &mut dyn FnMut(&Value) -> bool) {
+        let text = std::mem::take(&mut self.reasoning);
+        if text.trim().is_empty() {
+            return;
+        }
+        if let Ok(w) = store.append_event(conv, mark.ev("reasoning", json!({ "text": text }))) {
+            let card = self.card("reasoning", &text, &w.event_id, mark);
+            emit(&card);
+        }
+    }
+
+    /// Seal anything said aloud before a tool call — narration the model
+    /// offered on its way to using a tool. A real assistant row, because the
+    /// agent did say it, and the room's transcript should show it.
+    fn flush_content(&mut self, store: &ConvStore, conv: &str, mark: &TurnMark, emit: &mut dyn FnMut(&Value) -> bool) {
+        let text = std::mem::take(&mut self.content);
+        if text.trim().is_empty() {
+            return;
+        }
+        if let Ok(w) = store.append_event(
+            conv,
+            mark.ev("context_window", json!({ "role": "assistant", "content": text })),
+        ) {
+            let card = self.card("assistant", &text, &w.event_id, mark);
+            emit(&card);
+        }
+    }
+
+    /// Both, in the order they were produced: the model thinks, then speaks,
+    /// then reaches for the tool.
+    fn flush(&mut self, store: &ConvStore, conv: &str, mark: &TurnMark, emit: &mut dyn FnMut(&Value) -> bool) {
+        self.flush_reasoning(store, conv, mark, emit);
+        self.flush_content(store, conv, mark, emit);
+    }
+
+    /// At the end of a turn only the thinking is flushed: the final round's
+    /// content is what `run_events` returns, and the caller writes that as
+    /// the turn's answer. Flushing it here too would publish it twice.
+    fn finish(&mut self, store: &ConvStore, conv: &str, mark: &TurnMark, emit: &mut dyn FnMut(&Value) -> bool) {
+        self.flush_reasoning(store, conv, mark, emit);
+        self.content.clear();
+    }
 }
 
 impl TurnMark {
@@ -471,6 +616,30 @@ fn record_prompt(
     }));
 }
 
+/// Move any answered approvals into the transcript.
+///
+/// Called between a tool call and its result, which is exactly where the
+/// question was asked: the card then sits above the result it decided,
+/// rather than at the end of the turn where it would read as a footnote to
+/// something that already happened.
+fn flush_approvals(
+    store: &ConvStore,
+    conv: &str,
+    mark: &TurnMark,
+    approvals: &Approvals,
+    emit: &mut dyn FnMut(&Value) -> bool,
+) {
+    for row in approvals.take_answered(conv) {
+        let w = store.append_event(conv, mark.ev("approval", row.clone()));
+        let mut card = row;
+        card["eventId"] = json!(w.map(|x| x.event_id).unwrap_or_default());
+        card["turn"] = json!(mark.id);
+        card["handle"] = json!(mark.handle);
+        card["visible"] = json!(true);
+        let _ = emit(&json!({ "type": "card", "card": card }));
+    }
+}
+
 /// Run one turn, emitting protocol rows through `emit`.
 ///
 /// `emit` returns `false` when the client has gone away, which stops the
@@ -482,6 +651,8 @@ pub fn run_turn(
     rt: &tokio::runtime::Runtime,
     project_root: &str,
     pool: &McpPool,
+    cancels: &Cancels,
+    approvals: &Arc<Approvals>,
     def: &AgentDef,
     req: TurnRequest,
     emit: &mut dyn FnMut(&Value) -> bool,
@@ -490,16 +661,19 @@ pub fn run_turn(
     if content.is_empty() {
         return Err(TurnError::EmptyContent);
     }
-    // Precedence: the request, then the agent definition, then the default.
-    // An empty model is meaningful — it lets agl resolve `default_model`
-    // from its config on every inference.
-    let model = req
-        .model
-        .clone()
-        .filter(|m| !m.trim().is_empty())
-        .or_else(|| Some(def.model.clone()).filter(|m| !m.trim().is_empty()))
+    // The agent's setting overrides the session's selected model.
+    let model = Some(def.model.clone()).filter(|m| !m.trim().is_empty())
+        .or_else(|| req.model.clone().filter(|m| !m.trim().is_empty()))
+        .or_else(|| req.session_id.as_deref().and_then(|id| store.load(id))
+            .and_then(|v| v.get("model").and_then(Value::as_str).map(String::from))
+            .filter(|m| !m.trim().is_empty()))
         .unwrap_or_else(|| DEFAULT_MODEL.into());
     let session_id = resolve_session(store, tabs, &req)?;
+    // Stoppable from here on. The session id is the key the stop button
+    // uses, so this is the earliest point the turn *can* be registered —
+    // and `Cancels::begin` hands back an already-thrown switch if the user
+    // got there first, which is the race on a brand-new session.
+    let stop = Armed::new(cancels, &session_id);
 
     tabs.set(
         &req.tab_id,
@@ -552,8 +726,10 @@ pub fn run_turn(
                 return Ok(());
             }
             Some(crate::group::Invite::Ask) => {
-                if !decide_now(store, rt, &session_id, &roster, &roster[0], &content, &mark, emit)
-                {
+                if !decide_now(
+                    store, rt, &stop.switch, &session_id, &roster, &roster[0], &content,
+                    &mark, emit,
+                ) {
                     quiet(store, emit);
                     return Ok(());
                 }
@@ -568,8 +744,7 @@ pub fn run_turn(
 
     // Tools come up before the model is told they exist.
     let root = std::path::Path::new(project_root);
-    let configured = if def.mcp.is_empty() { mcp_presets::names() } else { def.mcp.clone() };
-    let (servers, mcp_errors) = pool.ensure(&configured, root);
+    let (servers, mcp_errors) = pool.ensure(&def.mcp, root);
     for e in &mcp_errors {
         let _ = store.append_event(&session_id, NewEvent::new("error", json!({ "message": e })));
         emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
@@ -596,9 +771,15 @@ pub fn run_turn(
         .unwrap_or_else(|| content.clone());
     let mut agent = Agent::factory(Factory {
         model: Some(model.clone()),
+        reasoning_effort: turn_reasoning(def, store.load(&session_id).as_ref()),
         system_prompt: Some(system.clone()).filter(|p| !p.trim().is_empty()),
         retain_history: Some(true),
         parallel_tools: Some(true),
+        // How many model round-trips this turn may take. `None` leaves
+        // agl's default of 5, which is three tool calls and an answer —
+        // enough for a chat reply, not enough for an agent that has to go
+        // and look something up first.
+        max_turns: def.max_turns.map(|v| v as usize),
         ..Default::default()
     })
     .map_err(|e| TurnError::Agent(e.to_string()))?;
@@ -651,6 +832,8 @@ pub fn run_turn(
         def.tools_enabled.as_ref(),
         &allow_text,
         &def.policy_mode,
+        &session_id,
+        Arc::clone(approvals),
     );
     let tool_names: Vec<String> = agent.tools.keys().cloned().collect();
 
@@ -699,7 +882,7 @@ pub fn run_turn(
     );
 
     // ---- the inference ----------------------------------------------------
-    let mut reasoning = String::new();
+    let mut said = Said::new(mark.participant);
     // Time to first token: the latency the user actually feels before
     // anything appears, which total duration hides entirely.
     let mut first_token_at: Option<std::time::Duration> = None;
@@ -717,11 +900,12 @@ pub fn run_turn(
                 }
                 match channel {
                 Channel::Reasoning => {
-                    reasoning.push_str(text);
+                    said.reasoning.push_str(text);
                     emit(&json!({ "type": "reasoning_delta", "text": text,
                                   "sessionId": sid, "handle": who }));
                 }
                 Channel::Content => {
+                    said.content.push_str(text);
                     emit(&json!({ "type": "assistant_delta", "text": text,
                                   "sessionId": sid, "handle": who }));
                 }
@@ -731,6 +915,9 @@ pub fn run_turn(
             // not after the turn settles — a long shell command would
             // otherwise look like a hang.
             TurnEvent::ToolCall { id, name, args } => {
+                // Before the call, so the thought that led to it sits above
+                // it on the rail instead of below every tool in the turn.
+                said.flush(store, &sid, &mark, emit);
                 let w = store.append_event(
                     &sid,
                     mark.ev("tool_call", json!({ "id": id, "name": name, "args": args })),
@@ -744,6 +931,9 @@ pub fn run_turn(
                 }));
             }
             TurnEvent::ToolResult { id, name, text } => {
+                // Whatever was asked while this call was gated belongs
+                // above its result, on the record.
+                flush_approvals(store, &sid, &mark, approvals, emit);
                 // A denial is a failure from the UI's point of view, even
                 // though it is a well-formed result the model can read.
                 let ok = !text.starts_with("error:") && !text.starts_with("denied:");
@@ -765,12 +955,40 @@ pub fn run_turn(
                 }));
             }
         };
-        rt.block_on(agent.run_events(&prompt, true, &mut on_event))
+        cancel::block_on(
+            rt,
+            &stop.switch,
+            agent.run_events(&prompt, true, &mut on_event),
+        )
     };
 
     let answer = match answer {
-        Ok(a) => a,
-        Err(e) => {
+        // Stopped mid-request. What it had already said stays: the user
+        // asked for the rest not to be generated, not for the half they
+        // had already read to be taken off the record.
+        Ran::Stopped => {
+            said.flush(store, &session_id, &mark, emit);
+            let _ = store.append_event(
+                &session_id,
+                mark.ev("stopped", json!({ "reason": "user" })),
+            );
+            // `record_turn_complete` sets the status ready itself, and it
+            // counts the turn — which this was: the user spent one, and the
+            // agent spent part of one answering it.
+            store.record_turn_complete(&session_id, None);
+            emit(&json!({
+                "type": "card",
+                "card": { "kind": "system", "text": STOPPED_NOTICE, "visible": true },
+            }));
+            // `ok` because nothing went wrong — the composer needs to come
+            // back out of `waiting` the same way it does on a good turn.
+            emit(&json!({
+                "type": "done", "ok": true, "stopped": true, "sessionId": session_id,
+            }));
+            return Ok(());
+        }
+        Ran::Done(Ok(a)) => a,
+        Ran::Done(Err(e)) => {
             store.set_status(&session_id, "error");
             let msg = e.to_string();
             let _ = store.append_event(
@@ -784,16 +1002,7 @@ pub fn run_turn(
     };
 
     // ---- persist + finalize ----------------------------------------------
-    if !reasoning.trim().is_empty() {
-        let w = store.append_event(&session_id, mark.ev("reasoning", json!({ "text": reasoning })));
-        if let Ok(w) = w {
-            emit(&json!({
-                "type": "card",
-                "card": { "kind": "reasoning", "text": reasoning, "eventId": w.event_id,
-                          "turn": mark.id, "handle": mark.handle, "visible": true },
-            }));
-        }
-    }
+    said.finish(store, &session_id, &mark, emit);
 
     let usage = agent.last_usage.lock().unwrap().clone();
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -886,6 +1095,43 @@ pub fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_turns_initialize_each_server_only_once() {
+        let pool = Arc::new(McpPool::default());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let pool = Arc::clone(&pool);
+            let attempts = Arc::clone(&attempts);
+            threads.push(std::thread::spawn(move || {
+                pool.get_or_connect("shared", || {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err("startup failed".into())
+                }).err().unwrap()
+            }));
+        }
+        for thread in threads { assert_eq!(thread.join().unwrap(), "startup failed"); }
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn empty_mcp_selection_connects_no_servers() {
+        let (servers, errors) = McpPool::default().ensure(&[], std::path::Path::new("/tmp"));
+        assert!(servers.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn agent_reasoning_overrides_session_reasoning() {
+        let mut def = AgentDef::default();
+        let session = json!({"config": {"reasoningEffort": "low"}});
+        assert_eq!(turn_reasoning(&def, Some(&session)).as_deref(), Some("low"));
+        def.reasoning_effort = "xhigh".into();
+        assert_eq!(turn_reasoning(&def, Some(&session)).as_deref(), Some("xhigh"));
+        def.reasoning_effort.clear();
+        assert_eq!(turn_reasoning(&def, None), None);
+    }
 
     #[test]
     fn session_rules_add_to_each_agents_own_rules() {
@@ -1106,6 +1352,8 @@ pub fn run_round(
     rt: &tokio::runtime::Runtime,
     project_root: &str,
     pool: &McpPool,
+    cancels: &Cancels,
+    approvals: &Arc<Approvals>,
     def: &AgentDef,
     req: TurnRequest,
     emit: &mut dyn FnMut(&Value) -> bool,
@@ -1115,6 +1363,9 @@ pub fn run_round(
         return Err(TurnError::EmptyContent);
     }
     let conv = resolve_session(store, tabs, &req)?;
+    // One switch for the whole round, not one per speaker: "stop" means stop
+    // the conversation, not hand the floor to the next agent.
+    let stop = Armed::new(cancels, &conv);
     tabs.set(
         &req.tab_id,
         TabEntry {
@@ -1184,7 +1435,7 @@ pub fn run_round(
     // the decision card lands next to the turn it decided — same turn id,
     // contiguous rows, one rail — instead of orphaned several turns above.
     let invites: Vec<(i64, crate::group::Invite)> = if routing == "lead" {
-        lead_assignment(store, rt, &conv, &roster, &content, emit)
+        lead_assignment(store, rt, &stop.switch, &conv, &roster, &content, emit)
             .into_iter()
             .map(|pid| (pid, crate::group::Invite::Mentioned))
             .collect()
@@ -1197,7 +1448,13 @@ pub fn run_round(
 
     // The loop yields *why* it stopped, so there is no window in which
     // "settled" holds a value nobody chose.
-    let settled = loop {
+    let settled = 'rounds: loop {
+        // Checked at the top of every round as well as inside each speaker's
+        // request: a stop that lands between two agents must not buy the
+        // room another round.
+        if stop.stopped() {
+            break crate::group::Settled::Stopped;
+        }
         if let Some(s) = crate::group::check_bounds(round_index, published, responders.len()) {
             break s;
         }
@@ -1205,6 +1462,9 @@ pub fn run_round(
         let mut replied: Vec<i64> = Vec::new();
 
         for pid in responders.clone() {
+            if stop.stopped() {
+                break 'rounds crate::group::Settled::Stopped;
+            }
             let Some(me) = roster.iter().find(|p| p.id == pid).cloned() else { continue };
             // Directly addressed in round 0 must answer; a later-round
             // mention is an invitation, and "(pass)" is a legitimate reply.
@@ -1232,12 +1492,11 @@ pub fn run_round(
                 "taskId": task.task_id,
             }));
 
-            let model = me
-                .model
-                .clone()
-                .filter(|m| !m.trim().is_empty())
-                .or_else(|| header.get("model").and_then(|v| v.as_str()).map(String::from))
-                .filter(|m| !m.trim().is_empty())
+            let participant_def = me.agent_name.as_deref()
+                .and_then(|name| store.agents().get(name))
+                .unwrap_or_else(|| def.clone());
+            let model = Some(participant_def.model.clone()).filter(|m| !m.trim().is_empty())
+                .or_else(|| header.get("model").and_then(|v| v.as_str()).map(String::from).filter(|m| !m.trim().is_empty()))
                 .unwrap_or_else(|| DEFAULT_MODEL.into());
             // One mark for the whole of this participant's turn, made here
             // so the reply it publishes lands on the same rail as the
@@ -1251,24 +1510,29 @@ pub fn run_round(
                 && invites
                     .iter()
                     .any(|(id, inv)| *id == pid && *inv == crate::group::Invite::Ask)
-                && !decide_now(store, rt, &conv, &roster, &me, &content, &mark, emit)
+                && !decide_now(
+                    store, rt, &stop.switch, &conv, &roster, &me, &content, &mark, emit,
+                )
             {
                 continue;
             }
-            let participant_def = me.agent_name.as_deref()
-                .and_then(|name| store.agents().get(name))
-                .unwrap_or_else(|| def.clone());
             let root = std::path::Path::new(project_root);
-            let configured = if participant_def.mcp.is_empty() { mcp_presets::names() } else { participant_def.mcp.clone() };
-            let (servers, mcp_errors) = pool.ensure(&configured, root);
+            let (servers, mcp_errors) = pool.ensure(&participant_def.mcp, root);
             for e in &mcp_errors {
                 let _ = store.append_event(&conv, mark.ev("error", json!({ "message": e })));
                 emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
             }
             let reply = match run_participant(
-                store, rt, &servers, &participant_def, &conv, &me, &task, &model, &mark, emit,
+                store, rt, &stop.switch, approvals, &servers, &participant_def, &conv, &me, &task,
+                &model, &mark, emit,
             ) {
                 Ok(r) => r,
+                // Not an error card: the user did this on purpose. Leaving
+                // by the label rather than by `break` keeps the recorded
+                // reason "stopped" — a plain break falls through to the
+                // next round's own bookkeeping, which would call a stopped
+                // discussion a silent one.
+                Err(TurnError::Stopped) => break 'rounds crate::group::Settled::Stopped,
                 Err(e) => {
                     let msg = e.to_string();
                     let _ = store.append_event(
@@ -1279,6 +1543,12 @@ pub fn run_round(
                     continue;
                 }
             };
+
+            // Its own history shows it stamped, labelled lines; a model that
+            // copies that form gets the copy removed here, before anything
+            // else reads the reply — `is_pass` included, or "17:43 [fish]
+            // (pass)" would be published as a message instead of silence.
+            let reply = crate::group::strip_echoed_prefix(&reply, &me.handle);
 
             // A pass is silence, not an empty message: publishing it would
             // clutter the room and show every other agent a blank turn.
@@ -1346,9 +1616,24 @@ pub fn run_round(
         store.set_participant_view(&conv, p.id, seq, round_index, false, None, Some(s.status()));
     }
     store.record_turn_complete(&conv, None);
+    // Said once for the whole discussion, not once per speaker: the user
+    // pressed one button, and a row per agent would read like several
+    // separate failures.
+    let was_stopped = s == crate::group::Settled::Stopped;
+    if was_stopped {
+        let _ = store.append_event(
+            &conv,
+            NewEvent::new("stopped", json!({ "reason": "user" })),
+        );
+        emit(&json!({
+            "type": "card",
+            "card": { "kind": "system", "text": STOPPED_NOTICE, "visible": true },
+        }));
+    }
     emit(&json!({
         "type": "done",
         "ok": true,
+        "stopped": was_stopped,
         "sessionId": conv,
         "rounds": round_index,
         "messages": published,
@@ -1374,6 +1659,8 @@ fn advance(store: &ConvStore, conv: &str, pid: &i64, seq: i64, round: i64, task_
 fn run_participant(
     store: &ConvStore,
     rt: &tokio::runtime::Runtime,
+    stop: &Cancel,
+    approvals: &Arc<Approvals>,
     servers: &[Arc<McpServer>],
     def: &AgentDef,
     conv: &str,
@@ -1400,11 +1687,17 @@ fn run_participant(
     };
     let mut agent = Agent::factory(Factory {
         model: Some(model.to_string()),
+        reasoning_effort: turn_reasoning(def, store.load(conv).as_ref()),
         system_prompt: Some(system.clone()),
         // The history is pushed explicitly below, and must not also
         // accumulate across participants.
         retain_history: Some(true),
         parallel_tools: Some(true),
+        // How many model round-trips this turn may take. `None` leaves
+        // agl's default of 5, which is three tool calls and an answer —
+        // enough for a chat reply, not enough for an agent that has to go
+        // and look something up first.
+        max_turns: def.max_turns.map(|v| v as usize),
         ..Default::default()
     })
     .map_err(|e| TurnError::Agent(e.to_string()))?;
@@ -1433,6 +1726,8 @@ fn run_participant(
         def.tools_enabled.as_ref(),
         &allow_text,
         &def.policy_mode,
+        conv,
+        Arc::clone(approvals),
     );
 
     // What this participant was actually given, on the record — the
@@ -1449,23 +1744,28 @@ fn run_participant(
         emit,
     );
 
-    let mut reasoning = String::new();
+    let mut said = Said::new(Some(me.id));
     let handle = me.handle.clone();
     let pid = me.id;
     let answer = {
         let mut on_event = |e: TurnEvent<'_>| match e {
             TurnEvent::Delta { text, channel } => match channel {
                 Channel::Reasoning => {
-                    reasoning.push_str(text);
+                    said.reasoning.push_str(text);
                     emit(&json!({ "type": "reasoning_delta", "text": text,
                                   "sessionId": conv, "handle": handle, "participantId": pid }));
                 }
                 Channel::Content => {
+                    said.content.push_str(text);
                     emit(&json!({ "type": "assistant_delta", "text": text,
                                   "sessionId": conv, "handle": handle, "participantId": pid }));
                 }
             },
             TurnEvent::ToolCall { id, name, args } => {
+                // Before the call, so the thought that led to it sits above
+                // it on the rail instead of below every tool in the turn.
+                // A second call in the same round finds the buffers empty.
+                said.flush(store, conv, mark, emit);
                 let w = store.append_event(
                     conv,
                     mark.ev("tool_call", json!({ "id": id, "name": name, "args": args })),
@@ -1479,6 +1779,9 @@ fn run_participant(
                 }));
             }
             TurnEvent::ToolResult { id, name, text } => {
+                // Same as the single-agent path: the question that gated
+                // this call goes above its result.
+                flush_approvals(store, conv, mark, approvals, emit);
                 let ok = !text.starts_with("error:") && !text.starts_with("denied:");
                 let w = store.append_event(
                     conv,
@@ -1498,21 +1801,24 @@ fn run_participant(
                 }));
             }
         };
-        rt.block_on(agent.run_events(&task.prompt, true, &mut on_event))
-            .map_err(|e| TurnError::Agent(e.to_string()))?
+        cancel::block_on(
+            rt,
+            stop,
+            agent.run_events(&task.prompt, true, &mut on_event),
+        )
     };
 
-    if !reasoning.trim().is_empty() {
-        let w = store.append_event(conv, mark.ev("reasoning", json!({ "text": reasoning })));
-        if let Ok(w) = w {
-            emit(&json!({
-                "type": "card",
-                "card": { "kind": "reasoning", "text": reasoning, "eventId": w.event_id,
-                          "participantId": pid, "turn": mark.id, "handle": me.handle,
-                          "visible": true },
-            }));
+    let answer = match answer {
+        // Whatever this participant had already said is kept, then the stop
+        // is handed up: the room must not move on to the next speaker.
+        Ran::Stopped => {
+            said.flush(store, conv, mark, emit);
+            return Err(TurnError::Stopped);
         }
-    }
+        Ran::Done(r) => r.map_err(|e| TurnError::Agent(e.to_string()))?,
+    };
+
+    said.finish(store, conv, mark, emit);
     Ok(answer)
 }
 
@@ -1523,6 +1829,7 @@ fn run_participant(
 fn lead_assignment(
     store: &ConvStore,
     rt: &tokio::runtime::Runtime,
+    stop: &Cancel,
     conv: &str,
     roster: &[crate::conv_store::Participant],
     content: &str,
@@ -1559,7 +1866,12 @@ fn lead_assignment(
         ..Default::default()
     })
     .ok()
-    .and_then(|a| rt.block_on(a.run(&prompt)).ok())
+    .and_then(|a| match cancel::block_on(rt, stop, a.run(&prompt)) {
+        Ran::Done(r) => r.ok(),
+        // A stopped routing call assigns nobody, and the round-level check
+        // ends the discussion before anyone is asked to speak.
+        Ran::Stopped => None,
+    })
     .and_then(|r| crate::group::parse_assignment(&r));
 
     match routed {
@@ -1641,6 +1953,7 @@ fn classify(
 fn decide_now(
     store: &ConvStore,
     rt: &tokio::runtime::Runtime,
+    stop: &Cancel,
     conv: &str,
     roster: &[crate::conv_store::Participant],
     me: &crate::conv_store::Participant,
@@ -1653,26 +1966,37 @@ fn decide_now(
     // — "has this already been said, and was it me who said it" is most of
     // what the decision turns on.
     let user_label = store.user_label();
-    let history: Vec<String> = store
-        .path(conv)
-        .iter()
-        .filter(|n| n.kind == "context_window" && n.visible)
-        .filter_map(|n| {
-            let text = n.content.clone()?;
-            let sender = match n.role.as_deref() {
-                // The same label the turn's own prompt uses: an agent told
-                // the speaker is "Bob" in one and "user" in the other is
-                // being asked about a different conversation.
-                Some("user") => user_label.clone(),
-                _ => n
-                    .participant_id
-                    .and_then(|id| roster.iter().find(|p| p.id == id))
-                    .map(|p| p.handle.clone())
-                    .unwrap_or_else(|| "assistant".into()),
-            };
-            Some(crate::relevance::history_line(&sender, &text))
-        })
-        .collect();
+    let mut history: Vec<String> = Vec::new();
+    let mut headed: Option<(i32, i32)> = None;
+    for n in store.path(conv).iter() {
+        if n.kind != "context_window" || !n.visible {
+            continue;
+        }
+        let Some(text) = n.content.clone() else { continue };
+        let sender = match n.role.as_deref() {
+            // The same label the turn's own prompt uses: an agent told the
+            // speaker is "Bob" in one and "user" in the other is being
+            // asked about a different conversation.
+            Some("user") => user_label.clone(),
+            _ => n
+                .participant_id
+                .and_then(|id| roster.iter().find(|p| p.id == id))
+                .map(|p| p.handle.clone())
+                .unwrap_or_else(|| "assistant".into()),
+        };
+        // Same day headers and clocks as the turn's own prompt: the two have
+        // to describe one conversation.
+        if let Some(e) = crate::environment::epoch_from_iso(&n.ts) {
+            let key = crate::environment::day_key(e);
+            if headed != Some(key) {
+                if let Some(h) = crate::relevance::day_header(&n.ts) {
+                    history.push(h);
+                }
+                headed = Some(key);
+            }
+        }
+        history.push(crate::relevance::history_line(&n.ts, &sender, &text));
+    }
 
     // The same identity the agent itself is given — soul, goals, memory —
     // so the decision is made on the same picture the reply would be.
@@ -1682,7 +2006,7 @@ fn decide_now(
         .and_then(|n| store.agents().get(n))
         .map(|d| d.system_prompt())
         .unwrap_or_else(|| me.system_prompt.clone());
-    let verdict = crate::relevance::should_speak(rt, me, &identity, &history);
+    let verdict = crate::relevance::should_speak(rt, stop, me, &identity, &history);
 
     let payload = verdict.to_json();
     let w = store.append_event(conv, mark.ev("decision", payload.clone()));
