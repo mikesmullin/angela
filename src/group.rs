@@ -126,6 +126,7 @@ pub fn project(
     path: &[TreeNode],
     me_id: i64,
     roster: &[Participant],
+    user_label: &str,
 ) -> (Vec<agl::provider::Message>, String) {
     // Build alternating blocks first; pairing into messages is then trivial
     // and the coalescing rule lives in one place.
@@ -147,7 +148,7 @@ pub fn project(
             continue;
         }
         let sender = match n.role.as_deref() {
-            Some("user") => "user".to_string(),
+            Some("user") => user_label.to_string(),
             _ => n
                 .participant_id
                 .and_then(|id| roster.iter().find(|p| p.id == id))
@@ -200,7 +201,7 @@ pub fn project(
 /// after the projection that is no longer one string — it is a list of
 /// turns. Showing only the last one would under-report by exactly the
 /// context the projection was added to supply.
-pub fn render_wire(msgs: &[agl::provider::Message]) -> String {
+pub fn render_wire(msgs: &[agl::provider::Message], me: &str) -> String {
     let mut out = String::new();
     for m in msgs {
         if m.role == "system" {
@@ -211,7 +212,16 @@ pub fn render_wire(msgs: &[agl::provider::Message]) -> String {
             .as_ref()
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        out.push_str(&format!("--- {} ---\n{}\n", m.role, text));
+        // One transcript, every line attributed. A user turn already
+        // carries `[sender]` prefixes; an assistant turn is this agent's
+        // own words, so it gets its own handle — rather than a `--- role ---`
+        // divider, which names the wire's shape instead of the speaker and
+        // leaves the agent's own lines as the only anonymous ones.
+        if m.role == "assistant" {
+            out.push_str(&format!("[{me}] {text}\n"));
+        } else {
+            out.push_str(&format!("{text}\n"));
+        }
     }
     out
 }
@@ -444,7 +454,7 @@ pub fn plan(
     // an agent given only what is new since it last looked has no sense of
     // how the conversation got here, which is most of what tells it whether
     // its answer still fits.
-    let (context, prompt) = project(&path, me.id, &roster);
+    let (context, prompt) = project(&path, me.id, &roster, &store.user_label());
 
     let mut system = preamble(&name, &identity);
     if let Some(p) = purpose.filter(|s| !s.trim().is_empty()) {
@@ -870,6 +880,50 @@ mod tests {
         // The turn it is answering is the last user block, not only the
         // final message — the context around it is the point.
         assert_eq!(task.prompt, w[3].1);
+    }
+
+    #[test]
+    fn the_wire_renders_as_one_attributed_transcript() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        let bob = roster.iter().find(|p| p.handle == "bob").unwrap().clone();
+        say(&store, &id, "user", None, "q1");
+        say(&store, &id, "assistant", Some(alice.id), "mine");
+        say(&store, &id, "assistant", Some(bob.id), "bob's");
+        say(&store, &id, "user", None, "q2");
+
+        let task = plan(&store, &id, &alice, 0, true, "x").unwrap();
+        let wire = render_wire(&task.messages(), &task.handle);
+
+        // Every line attributed, and no `--- role ---` dividers: those name
+        // the wire's shape rather than the speaker, and leave the agent's
+        // own lines as the only anonymous ones.
+        assert_eq!(wire, "[user] q1\n[alice] mine\n[bob] bob's\n[user] q2\n");
+        assert!(!wire.contains("---"));
+        // The system prompt is not part of the transcript.
+        assert!(!wire.contains("Your name is"));
+    }
+
+    #[test]
+    fn the_human_is_named_by_the_configured_setting() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        say(&store, &id, "user", None, "hello");
+
+        // Unset: a bracketed empty label would read as a participant with
+        // no name, so it falls back rather than going blank.
+        assert_eq!(plan(&store, &id, &alice, 0, true, "x").unwrap().prompt, "[user] hello");
+
+        let mut patch = serde_json::Map::new();
+        patch.insert("user__full_name".into(), json!("Bob"));
+        store.set_settings(&patch);
+        assert_eq!(plan(&store, &id, &alice, 0, true, "x").unwrap().prompt, "[Bob] hello");
+
+        // Only the human is renamed; an agent is still its handle.
+        let bob = roster.iter().find(|p| p.handle == "bob").unwrap().clone();
+        say(&store, &id, "assistant", Some(bob.id), "hi back");
+        let p = plan(&store, &id, &alice, 0, true, "x").unwrap().prompt;
+        assert_eq!(p, "[Bob] hello\n[bob] hi back");
     }
 
     #[test]

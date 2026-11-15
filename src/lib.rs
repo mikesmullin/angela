@@ -49,4 +49,5 @@ pub mod mcp_presets;
 pub mod project;
 pub mod relevance;
 pub mod serve;
+pub mod settings;
 pub mod session_store;

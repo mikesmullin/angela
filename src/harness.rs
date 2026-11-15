@@ -677,8 +677,8 @@ pub fn run_turn(
     // Everything the model gets, not just the final turn: the card is the
     // answer to "what did it actually receive?".
     let wire = match &task {
-        Some(t) => crate::group::render_wire(&t.messages()),
-        None => format!("--- user ---\n{prompt}\n"),
+        Some(t) => crate::group::render_wire(&t.messages(), &mark.handle),
+        None => format!("{prompt}\n"),
     };
     record_prompt(
         store,
@@ -1422,7 +1422,7 @@ fn run_participant(
         conv,
         mark,
         &system,
-        &crate::group::render_wire(&task.messages()),
+        &crate::group::render_wire(&task.messages(), &task.handle),
         model,
         task.context.len(),
         emit,
@@ -1631,6 +1631,7 @@ fn decide_now(
     // first, ending with the message being judged. Attribution is the point
     // — "has this already been said, and was it me who said it" is most of
     // what the decision turns on.
+    let user_label = store.user_label();
     let history: Vec<String> = store
         .path(conv)
         .iter()
@@ -1638,7 +1639,10 @@ fn decide_now(
         .filter_map(|n| {
             let text = n.content.clone()?;
             let sender = match n.role.as_deref() {
-                Some("user") => "user".to_string(),
+                // The same label the turn's own prompt uses: an agent told
+                // the speaker is "Bob" in one and "user" in the other is
+                // being asked about a different conversation.
+                Some("user") => user_label.clone(),
                 _ => n
                     .participant_id
                     .and_then(|id| roster.iter().find(|p| p.id == id))

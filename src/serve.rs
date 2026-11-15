@@ -638,6 +638,31 @@ impl Server {
                 )
             }
 
+            // ---- settings ---------------------------------------------------
+            ("GET", "/api/settings") => sink.json(
+                200,
+                &json!({
+                    "settings": st.store.settings(),
+                    // What the form can offer, named here rather than
+                    // hard-coded in the client, so one build cannot show a
+                    // field the other will drop.
+                    "keys": crate::settings::KEYS
+                        .iter()
+                        .map(|(k, about)| json!({ "key": k, "about": about }))
+                        .collect::<Vec<_>>(),
+                }),
+            ),
+
+            ("POST", "/api/settings") => {
+                let body = req.json();
+                let patch = body.as_object().cloned().unwrap_or_default();
+                let n = st.store.set_settings(&patch);
+                sink.json(
+                    200,
+                    &json!({ "ok": true, "saved": n, "settings": st.store.settings() }),
+                )
+            }
+
             // ---- agents ----------------------------------------------------
             //
             // Definitions live in the database, so these are the only way to

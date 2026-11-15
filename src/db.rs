@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when the DDL below changes in a way an existing file must be
 /// brought forward to. Recorded in `schema_meta`.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -81,6 +81,18 @@ CREATE TABLE IF NOT EXISTS conversation (
     legacy_format    TEXT,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
+);
+
+-- App settings: one row per key.
+--
+-- Key/value rather than a column per setting, so adding one is a write
+-- rather than a migration. The cost is that nothing is typed — which is why
+-- the writer keeps a list of the keys it knows and drops the rest, instead
+-- of letting any caller invent a setting.
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 -- Agent definitions. Formerly one `<name>.json` per agent under
