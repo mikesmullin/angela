@@ -912,9 +912,10 @@ mod tests {
         );
         // The merge is its two children joined.
         let merged = get(&store, &id, Coord::new(1, 0)).unwrap().0;
-        // Labelled by the speaker's handle, not the role: in a group chat the
-        // role `assistant` would name three different participants.
-        assert_eq!(merged, "user: hello default: hi there");
+        // Labelled by the speaker's handle where there is one. This chat has
+        // no agent seated (a new conversation is the user alone), so the
+        // generic role is the honest label.
+        assert_eq!(merged, "user: hello assistant: hi there");
     }
 
     #[test]
@@ -998,7 +999,7 @@ mod tests {
         assert!(built(&store, &id, Coord::new(2, 0)));
         assert_eq!(
             get(&store, &id, Coord::new(2, 0)).unwrap().0,
-            "user: a default: b user: c default: d"
+            "user: a assistant: b user: c assistant: d"
         );
     }
 
@@ -1264,7 +1265,7 @@ mod tests {
         // machinery around it.
         assert_eq!(count(&store, &id), 2);
         build_all(&store, &id, &Fake::new(5));
-        assert_eq!(get(&store, &id, Coord::new(1, 0)).unwrap().0, "user: a default: b");
+        assert_eq!(get(&store, &id, Coord::new(1, 0)).unwrap().0, "user: a assistant: b");
     }
 
     #[test]
@@ -1274,7 +1275,7 @@ mod tests {
         assert_eq!(count(&store, &id), 4);
         assert_eq!(
             get(&store, &id, Coord::new(2, 0)).unwrap().0,
-            "user: a default: b user: c default: d"
+            "user: a assistant: b user: c assistant: d"
         );
 
         // Fork at message 1 ("b") and say something else.
@@ -1306,7 +1307,7 @@ mod tests {
         assert_eq!(count(&store, &id), 4);
         assert_eq!(
             get(&store, &id, Coord::new(2, 0)).unwrap().0,
-            "user: a default: b user: c default: d"
+            "user: a assistant: b user: c assistant: d"
         );
     }
 

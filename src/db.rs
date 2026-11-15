@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when the DDL below changes in a way an existing file must be
 /// brought forward to. Recorded in `schema_meta`.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -83,6 +83,48 @@ CREATE TABLE IF NOT EXISTS conversation (
     updated_at       TEXT NOT NULL
 );
 
+-- Agent definitions. Formerly one `<name>.json` per agent under
+-- `.angela/agents/`; now rows, so the UI can create and edit them without a
+-- file-write round trip and without two readers disagreeing about what an
+-- agent is.
+--
+-- The three prompt fields are separate on purpose rather than one blob:
+-- `soul` is who the agent is (written once), `goals` is what it is working
+-- toward (the user's steering), and `memory` is what it has learned and may
+-- rewrite itself. They concatenate into the system prompt in that order, and
+-- keeping them apart is what lets an agent edit its own memory without
+-- being able to rewrite its own character.
+CREATE TABLE IF NOT EXISTS agents (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL UNIQUE,
+    description    TEXT NOT NULL DEFAULT '',
+    model          TEXT NOT NULL DEFAULT '',
+    models         TEXT NOT NULL DEFAULT '[]',
+    context_window INTEGER,
+    cwd            TEXT,
+    env            TEXT NOT NULL DEFAULT '{}',
+    mcp            TEXT NOT NULL DEFAULT '[]',
+    allowlist      TEXT NOT NULL DEFAULT '',
+    tools_enabled  TEXT,                              -- NULL = every tool
+    policy_mode    TEXT NOT NULL DEFAULT 'ask',
+    parallel_tools INTEGER NOT NULL DEFAULT 1,
+    soul           TEXT NOT NULL DEFAULT '',          -- was `system`
+    goals          TEXT NOT NULL DEFAULT '',
+    memory         TEXT NOT NULL DEFAULT '',
+    -- invoked  : speaks only when @mentioned
+    -- relevant : a System One call decides, per message
+    -- engaged  : speaks on every message
+    engagement     TEXT NOT NULL DEFAULT 'invoked',
+    starters       TEXT NOT NULL DEFAULT '[]',
+    avatar         TEXT,
+    -- The colour this agent is drawn in: its handle, its reasoning, its rail.
+    -- NULL means the app's default accent, so an agent nobody has coloured
+    -- still looks like the rest of the UI rather than like a missing value.
+    accent_color   TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+
 -- The roster. A 2-party chat is a roster of two: the human and one agent.
 CREATE TABLE IF NOT EXISTS participants (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,6 +139,10 @@ CREATE TABLE IF NOT EXISTS participants (
     seat            INTEGER NOT NULL DEFAULT 0,
     active          INTEGER NOT NULL DEFAULT 1,
     role            TEXT,                       -- 'lead' | 'member' | …
+    -- NULL means "whatever the agent definition currently says", so editing
+    -- an agent changes how it behaves in the conversations it is already in.
+    -- A value here is a per-conversation override.
+    engagement      TEXT,
     UNIQUE (conversation_id, handle)
 );
 
@@ -224,6 +270,7 @@ CREATE INDEX IF NOT EXISTS idx_psession_part        ON participant_session(parti
 CREATE INDEX IF NOT EXISTS idx_view_conv_part       ON participant_view(conversation_id, participant_id);
 CREATE INDEX IF NOT EXISTS idx_memory_slot          ON memory_nodes(conversation_id, slot);
 CREATE INDEX IF NOT EXISTS idx_participants_conv    ON participants(conversation_id, seat);
+CREATE INDEX IF NOT EXISTS idx_agents_name          ON agents(name);
 "#;
 
 /// `<root>/.angela/conversations.db`.
@@ -263,6 +310,16 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
     // immediately with SQLITE_BUSY.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(DDL)?;
+    // Columns added after a database may already exist. `ALTER TABLE ADD
+    // COLUMN` is a no-op-shaped error when the column is there, so the
+    // result is discarded rather than branched on — cheaper and less
+    // fragile than reading `pragma_table_info` for each one.
+    for stmt in [
+        "ALTER TABLE participants ADD COLUMN engagement TEXT",
+        "ALTER TABLE agents ADD COLUMN accent_color TEXT",
+    ] {
+        let _ = conn.execute(stmt, []);
+    }
     conn.execute(
         "INSERT INTO schema_meta (key, value) VALUES ('version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",

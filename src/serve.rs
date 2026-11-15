@@ -72,6 +72,13 @@ impl AppState {
         for f in &report.failed {
             eprintln!("angela: import failed — {f}");
         }
+        // Agents moved from `.angela/agents/*.json` into the database. The
+        // files are imported once and then neither read nor written — they
+        // stay on disk as the rollback, exactly like the session files.
+        let imported = store.agents().import_files(&root);
+        if imported > 0 {
+            eprintln!("angela: imported {imported} agent definition(s) into conversations.db");
+        }
         // Number any conversation that predates the `ordinal` field, so the
         // tab strip has a stable 1-based label for every one of them.
         let backfilled = store.backfill_ordinals();
@@ -166,6 +173,28 @@ pub fn reconstruct_messages(store: &ConvStore, id: &str) -> Vec<Value> {
 /// Shape a folded event list into the five card kinds the UI renders.
 pub fn reconstruct_from_events(events: Vec<EventWrapper>) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::new();
+    // Which turn each event belongs to, by event id.
+    //
+    // Collected up front and applied afterwards by `eventId` rather than
+    // tracked inside the loop: the loop `continue`s out of most branches, so
+    // anything bookkept at the bottom of it is reached by only some rows.
+    let marks: std::collections::HashMap<String, (String, Value)> = events
+        .iter()
+        .filter_map(|w| {
+            let t = w.meta.get("turn")?.as_str()?.to_string();
+            Some((
+                w.event_id.clone(),
+                (t, w.meta.get("round").cloned().unwrap_or(Value::Null)),
+            ))
+        })
+        .collect();
+    // When each row happened, by event id. Same reason as the turn marks:
+    // the loop `continue`s out of most branches, so anything set at the
+    // bottom of it reaches only some rows.
+    let times: std::collections::HashMap<String, String> = events
+        .iter()
+        .map(|w| (w.event_id.clone(), w.ts.clone()))
+        .collect();
     // Older logs lack `meta.telemetry`, so a trailing gen_info is the
     // fallback for the round it belongs to.
     let mut last_gen: Value = Value::Null;
@@ -236,6 +265,45 @@ pub fn reconstruct_from_events(events: Vec<EventWrapper>) -> Vec<Value> {
             }
         }
 
+        // --- what the model was given, and what decided it ran -----------
+        //
+        // These three carry no conversation: they are the turn's own
+        // paperwork, kept so an odd reply can be traced to the prompt that
+        // produced it. They are never fed back to a model.
+        if wrap.event_type == "system" {
+            if let Some(text) = po.get("content").and_then(|v| v.as_str()) {
+                messages.push(json!({
+                    "id": eid, "eventId": eid, "kind": "system_prompt",
+                    "text": text, "bytes": text.len(), "visible": visible, "goto": goto,
+                }));
+                continue;
+            }
+        }
+        if wrap.event_type == "agent_prompt" {
+            if let Some(text) = po.get("content").and_then(|v| v.as_str()) {
+                messages.push(json!({
+                    "id": eid, "eventId": eid, "kind": "agent_prompt",
+                    "text": text, "bytes": text.len(),
+                    "model": po.get("model").cloned().unwrap_or(Value::Null),
+                    "historyTurns": po.get("historyTurns").cloned().unwrap_or(Value::Null),
+                    "visible": visible, "goto": goto,
+                }));
+                continue;
+            }
+        }
+        if wrap.event_type == "decision" {
+            messages.push(json!({
+                "id": eid, "eventId": eid, "kind": "decision",
+                "verdict": p.clone(),
+                "speak": po.get("speak").cloned().unwrap_or(Value::Null),
+                "confidence": po.get("confidence").cloned().unwrap_or(Value::Null),
+                "reason": po.get("reason").cloned().unwrap_or(Value::Null),
+                "error": po.get("error").cloned().unwrap_or(Value::Null),
+                "visible": visible, "goto": goto,
+            }));
+            continue;
+        }
+
         let name = po.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let tel = match frozen {
             Some(f) => f.clone(),
@@ -273,7 +341,127 @@ pub fn reconstruct_from_events(events: Vec<EventWrapper>) -> Vec<Value> {
             }));
         }
     }
+    // A turn is one inference request. Marking the first and last row of each
+    // run is what lets the transcript draw them under a single rail rather
+    // than as unrelated rows.
+    let turn_at = |row: &Value| -> Option<String> {
+        let id = row.get("eventId")?.as_str()?;
+        marks.get(id).map(|(t, _)| t.clone())
+    };
+    let seq: Vec<Option<String>> = messages.iter().map(turn_at).collect();
+    for row in messages.iter_mut() {
+        let ts = row
+            .get("eventId")
+            .and_then(|v| v.as_str())
+            .and_then(|id| times.get(id))
+            .cloned();
+        if let (Some(ts), Some(o)) = (ts, row.as_object_mut()) {
+            o.insert("ts".into(), json!(ts));
+        }
+    }
+    for (i, row) in messages.iter_mut().enumerate() {
+        let Some(turn) = seq[i].clone() else { continue };
+        let round = row
+            .get("eventId")
+            .and_then(|v| v.as_str())
+            .and_then(|id| marks.get(id))
+            .map(|(_, r)| r.clone())
+            .unwrap_or(Value::Null);
+        let Some(o) = row.as_object_mut() else { continue };
+        let first = i == 0 || seq[i - 1].as_deref() != Some(turn.as_str());
+        let last = i + 1 >= seq.len() || seq[i + 1].as_deref() != Some(turn.as_str());
+        o.insert("turn".into(), json!(turn));
+        o.insert("round".into(), round);
+        o.insert("turnFirst".into(), json!(first));
+        o.insert("turnLast".into(), json!(last));
+    }
     messages
+}
+
+/// Build a definition from a request body, over an existing one.
+///
+/// Absent keys keep what the stored definition had, rather than resetting to
+/// the type default: the editor sends whole forms today, but a caller
+/// patching one field must not silently blank the other fifteen.
+fn agent_from_body(body: &Value, base: Option<crate::agent_loader::AgentDef>) -> crate::agent_loader::AgentDef {
+    let mut def = base.unwrap_or_default();
+    let Some(o) = body.as_object() else { return def };
+    let st = |k: &str| o.get(k).and_then(|v| v.as_str()).map(String::from);
+    let list = |k: &str| -> Option<Vec<String>> {
+        match o.get(k) {
+            Some(Value::Array(a)) => Some(
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect(),
+            ),
+            Some(Value::String(text)) => Some(
+                text.lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    };
+    if let Some(v) = st("name") { def.name = v.trim().to_string(); }
+    if let Some(v) = st("description") { def.description = v; }
+    if let Some(v) = st("model") { def.model = v; }
+    if let Some(v) = list("models") { def.models = v; }
+    if let Some(v) = list("mcp") { def.mcp = v; }
+    if let Some(v) = st("allowlist") { def.allowlist = v; }
+    if let Some(v) = st("soul").or_else(|| st("system")) { def.soul = v; }
+    if let Some(v) = st("goals") { def.goals = v; }
+    if let Some(v) = st("memory") { def.memory = v; }
+    if let Some(v) = st("engagement") { def.engagement = v; }
+    if let Some(v) = st("policyMode").or_else(|| st("policy_mode")) {
+        if !v.trim().is_empty() { def.policy_mode = v; }
+    }
+    if let Some(v) = st("avatar") { def.avatar = Some(v).filter(|a| !a.trim().is_empty()); }
+    if let Some(v) = st("accentColor").or_else(|| st("accent_color")) {
+        // Normalised, not stored verbatim: it ends up in a `style`
+        // attribute, so "whatever was typed" is not a thing to pass through.
+        // An unparseable colour clears it back to the app default rather
+        // than being kept as a value nothing can render.
+        def.accent_color = crate::agent_loader::normalize_hex(&v);
+    }
+    if let Some(v) = st("cwd") { def.cwd = Some(v).filter(|c| !c.trim().is_empty()); }
+    match o.get("contextWindow").or_else(|| o.get("context_window")) {
+        Some(Value::Null) => def.context_window = None,
+        Some(v) => {
+            if let Some(n) = v.as_u64() { def.context_window = Some(n); }
+            // A blank field in a form arrives as "", which means "unset".
+            if v.as_str().map(|t| t.trim().is_empty()).unwrap_or(false) {
+                def.context_window = None;
+            }
+        }
+        None => {}
+    }
+    if let Some(v) = o.get("parallelTools").or_else(|| o.get("parallel_tools")) {
+        def.parallel_tools = crate::session_store::js_truthy(v);
+    }
+    match o.get("toolsEnabled").or_else(|| o.get("tools_enabled")) {
+        // Explicit null, or an empty list, means every tool — which is NOT
+        // the same as "no tools".
+        Some(Value::Null) => def.tools_enabled = None,
+        Some(other) => {
+            let l = list("toolsEnabled").or_else(|| list("tools_enabled")).unwrap_or_default();
+            let _ = other;
+            def.tools_enabled = if l.is_empty() { None } else { Some(l) };
+        }
+        None => {}
+    }
+    if let Some(Value::Object(env)) = o.get("env") {
+        def.env = env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+            .collect();
+    }
+    if let Some(Value::Array(a)) = o.get("starters") {
+        def.starters = a.clone();
+    }
+    def
 }
 
 /// Split `/api/sessions/<id>/<rest>` into its id and sub-path.
@@ -287,6 +475,23 @@ fn session_route(path: &str) -> Option<(&str, &str)> {
         Some((id, tail)) => Some((id, tail)),
         None => Some((rest, "")),
     }
+}
+
+/// The roster, each seat carrying its agent's accent colour.
+pub fn roster_json(store: &ConvStore, conv: &str) -> Vec<Value> {
+    let agents = store.agents();
+    store
+        .participants(conv)
+        .iter()
+        .map(|p| {
+            let accent = p
+                .agent_name
+                .as_deref()
+                .and_then(|n| agents.get(n))
+                .and_then(|d| d.accent_color);
+            p.to_json_with(accent.as_deref())
+        })
+        .collect()
 }
 
 /// The transcript rows that are the memory tree's leaves, in leaf order.
@@ -411,7 +616,7 @@ impl Server {
                     "autoApprove": st.auto_approve,
                     // Agent loading is not ported yet; the JS also returns []
                     // when no agents are defined for the project.
-                    "agents": agent_loader::list(std::path::Path::new(&st.project_root))
+                    "agents": st.store.agents().list()
                         .iter()
                         .map(|a| json!(a.name))
                         .collect::<Vec<_>>(),
@@ -420,10 +625,65 @@ impl Server {
             ),
 
             ("GET", "/api/agents") => {
-                let root = std::path::Path::new(&st.project_root);
                 let agents: Vec<Value> =
-                    agent_loader::list(root).iter().map(|a| a.to_json()).collect();
-                sink.json(200, &json!({ "projectRoot": st.project_root, "agents": agents }))
+                    st.store.agents().list().iter().map(|a| a.to_json()).collect();
+                sink.json(
+                    200,
+                    &json!({
+                        "projectRoot": st.project_root,
+                        "agents": agents,
+                        "engagements": crate::agent_loader::ENGAGEMENTS,
+                        "mcpPresets": crate::mcp_presets::names(),
+                    }),
+                )
+            }
+
+            // ---- agents ----------------------------------------------------
+            //
+            // Definitions live in the database, so these are the only way to
+            // read or change one; there is no file to edit any more.
+            ("POST", "/api/agents") => {
+                let body = req.json();
+                let def = agent_from_body(&body, None);
+                match st.store.agents().save(&def, None) {
+                    Ok(a) => sink.json(200, &json!({ "ok": true, "agent": a.to_json() })),
+                    Err(e) => sink.json(400, &json!({ "error": e.to_string() })),
+                }
+            }
+
+            ("GET", path) if path.starts_with("/api/agents/") => {
+                let name = &path["/api/agents/".len()..];
+                match st.store.agents().get(name) {
+                    Some(a) => sink.json(200, &json!({ "agent": a.to_json() })),
+                    None => sink.json(404, &json!({ "error": format!("no agent named {name:?}") })),
+                }
+            }
+
+            ("POST", path) if path.starts_with("/api/agents/") => {
+                let name = &path["/api/agents/".len()..];
+                let agents = st.store.agents();
+                let Some(existing) = agents.get(name) else {
+                    sink.json(404, &json!({ "error": format!("no agent named {name:?}") }));
+                    return;
+                };
+                let body = req.json();
+                // Over the stored definition, so a partial body patches
+                // rather than blanks.
+                let def = agent_from_body(&body, Some(existing));
+                match agents.save(&def, Some(name)) {
+                    Ok(a) => sink.json(200, &json!({ "ok": true, "agent": a.to_json() })),
+                    Err(e) => sink.json(400, &json!({ "error": e.to_string() })),
+                }
+            }
+
+            ("DELETE", path) if path.starts_with("/api/agents/") => {
+                let name = &path["/api/agents/".len()..];
+                match st.store.agents().delete(name) {
+                    // `seated` is how many conversations had it: they keep
+                    // their transcripts, so the UI can say so plainly.
+                    Ok(seated) => sink.json(200, &json!({ "ok": true, "name": name, "seated": seated })),
+                    Err(e) => sink.json(404, &json!({ "error": e.to_string() })),
+                }
             }
 
             ("GET", "/api/sessions") => sink.json(200, &self.sessions_list()),
@@ -505,11 +765,7 @@ impl Server {
                 let (id, _) = session_route(path).unwrap();
                 sink.json(
                     200,
-                    &json!({
-                        "sessionId": id,
-                        "participants": st.store.participants(id)
-                            .iter().map(|p| p.to_json()).collect::<Vec<_>>(),
-                    }),
+                    &json!({ "sessionId": id, "participants": roster_json(&st.store, id) }),
                 )
             }
 
@@ -528,11 +784,12 @@ impl Server {
                 // An agent definition supplies the system prompt and model
                 // unless the request overrides them, so seating a configured
                 // agent takes one field.
-                let root = std::path::Path::new(&st.project_root);
-                let def = agent_name.and_then(|n| agent_loader::load(root, n));
+                let def = agent_name.and_then(|n| st.store.agents().get(n));
+                // Soul + goals + memory, composed once, so a seated agent
+                // carries the same prompt the editor shows.
                 let system = gs("systemPrompt")
                     .map(String::from)
-                    .or_else(|| def.as_ref().map(|d| d.system.clone()))
+                    .or_else(|| def.as_ref().map(|d| d.system_prompt()))
                     .unwrap_or_default();
                 let model = gs("model")
                     .map(String::from)
@@ -673,22 +930,16 @@ impl Server {
                     Some(meta) => {
                         // The UI seeds its textarea from here: the session's
                         // override when present, else the agent default.
-                        let root = std::path::Path::new(&st.project_root);
                         let agent_default = meta
                             .get("agent")
                             .and_then(|v| v.as_str())
-                            .and_then(|n| agent_loader::load(root, n))
-                            .or_else(|| agent_loader::list(root).into_iter().next())
+                            .and_then(|n| st.store.agents().get(n))
+                            .or_else(|| st.store.agents().list().into_iter().next())
                             .map(|d| d.allowlist)
                             .unwrap_or_default();
                         let override_text =
                             meta.get("allowlist").and_then(|v| v.as_str()).map(String::from);
-                        let roster: Vec<Value> = st
-                            .store
-                            .participants(id)
-                            .iter()
-                            .map(|p| p.to_json())
-                            .collect();
+                        let roster: Vec<Value> = roster_json(&st.store, id);
                         sink.json(
                             200,
                             &json!({
@@ -739,35 +990,54 @@ impl Server {
                 };
                 // Resolve the agent: the request's name, else the project's
                 // single agent, else the built-in default.
-                let root = std::path::Path::new(&st.project_root);
+                // Which definition runs the turn. The **seated** agent comes
+                // before the project's first-by-name one: since a
+                // conversation starts empty and agents join by invitation,
+                // the roster is the answer to "who is in this chat", and
+                // falling back to list order would run `@scout` with
+                // whichever definition happens to sort first.
+                let seated_def = turn
+                    .session_id
+                    .clone()
+                    .or_else(|| st.tabs.get(&turn.tab_id).map(|e| e.session_id))
+                    .filter(|_| !turn.new_session)
+                    .and_then(|sid| {
+                        let agents = st.store.agent_participants(&sid);
+                        agents
+                            .first()
+                            .filter(|_| agents.len() == 1)
+                            .and_then(|p| p.agent_name.clone())
+                    })
+                    .and_then(|n| st.store.agents().get(&n));
                 let def = turn
                     .agent
                     .as_deref()
-                    .and_then(|n| agent_loader::load(root, n))
-                    .or_else(|| {
-                        let all = agent_loader::list(root);
-                        all.into_iter().next()
-                    })
+                    .and_then(|n| st.store.agents().get(n))
+                    .or(seated_def)
+                    .or_else(|| st.store.agents().list().into_iter().next())
                     .unwrap_or_else(agent_loader::default_agent);
 
-                // One agent or several? With one, the provider-side history
-                // IS the transcript, which is cheaper and is what every
-                // existing session already holds. With two or more there can
-                // be no shared history (see `group.rs`), so each agent runs
-                // in its own context with the room flattened into text. The
-                // roster decides, so a two-seat chat is untouched.
+                // How many agents are seated decides the path. Exactly one:
+                // the provider-side history IS the transcript, which is
+                // cheaper and is what every existing session already holds.
+                // Two or more: no shared history can exist (see `group.rs`),
+                // so each runs in its own context with the room flattened
+                // into text. None: nothing answers, and `run_round` says so.
                 let seated = turn
                     .session_id
                     .clone()
                     .or_else(|| st.tabs.get(&turn.tab_id).map(|e| e.session_id))
                     .filter(|_| !turn.new_session)
                     .map(|sid| st.store.agent_participants(&sid).len())
-                    .unwrap_or(1);
+                    // A conversation that does not exist yet has nobody in
+                    // it. `run_round` is the path that handles an empty
+                    // roster: it stores the message and says so.
+                    .unwrap_or(0);
 
                 sink.begin_ndjson();
                 {
                     let mut emit = |v: &Value| sink.row(v);
-                    let _ = if seated > 1 {
+                    let _ = if seated != 1 {
                         harness::run_round(
                             &st.store, &st.tabs, &st.rt, &st.project_root,
                             &st.mcp, &def, turn, &mut emit,
@@ -944,5 +1214,146 @@ impl Server {
             _ => sink.json(404, &json!({ "error": "not found", "route": p })),
         }
         sink.end();
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+    use crate::conv_store::ConvStore;
+    use crate::harness::TurnMark;
+    use crate::session_store::{NewEvent, NewSession};
+
+    fn conv() -> (ConvStore, String) {
+        let s = ConvStore::memory("/tmp/p").unwrap();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (s, id)
+    }
+
+    #[test]
+    fn a_turn_is_marked_from_its_first_row_to_its_last() {
+        let (s, id) = conv();
+        s.append_event(
+            &id,
+            NewEvent::new("context_window", json!({"role":"user","content":"q"})),
+        )
+        .unwrap();
+
+        let a = TurnMark::new("alice", None, 0);
+        for ev in [
+            a.ev("system", json!({ "content": "You are Alice." })),
+            a.ev("agent_prompt", json!({ "content": "q, flattened" })),
+            a.ev("tool_call", json!({ "name": "read", "id": "c1" })),
+            a.ev("tool_result", json!({ "name": "read", "text": "ok", "ok": true })),
+            a.ev("context_window", json!({"role":"assistant","content":"A"})),
+        ] {
+            s.append_event(&id, ev).unwrap();
+        }
+        let b = TurnMark::new("bob", None, 0);
+        s.append_event(&id, b.ev("context_window", json!({"role":"assistant","content":"B"})))
+            .unwrap();
+
+        let rows = reconstruct_messages(&s, &id);
+        let kinds: Vec<&str> = rows.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "user",
+                "system_prompt",
+                "agent_prompt",
+                "tool_call",
+                "tool_result",
+                "assistant",
+                "assistant"
+            ]
+        );
+
+        // The user's own message belongs to no turn: it is what they typed,
+        // not part of anyone's inference request.
+        assert!(rows[0].get("turn").is_none());
+
+        // Alice's five rows are one run, marked at both ends.
+        let alice: Vec<&Value> = rows[1..6].iter().collect();
+        assert!(alice.iter().all(|r| r["turn"] == json!(a.id)));
+        assert_eq!(alice[0]["turnFirst"], json!(true));
+        assert_eq!(alice[0]["turnLast"], json!(false));
+        assert_eq!(alice[4]["turnFirst"], json!(false));
+        assert_eq!(alice[4]["turnLast"], json!(true));
+
+        // Bob's single row is its own run: first AND last.
+        assert_eq!(rows[6]["turn"], json!(b.id));
+        assert_eq!(rows[6]["turnFirst"], json!(true));
+        assert_eq!(rows[6]["turnLast"], json!(true));
+    }
+
+    #[test]
+    fn the_prompt_the_agent_got_is_kept_apart_from_what_the_user_typed() {
+        let (s, id) = conv();
+        s.append_event(
+            &id,
+            NewEvent::new("context_window", json!({"role":"user","content":"hi"})),
+        )
+        .unwrap();
+        let m = TurnMark::new("alice", None, 2);
+        s.append_event(
+            &id,
+            m.ev(
+                "agent_prompt",
+                json!({ "content": "[Conversation] …hi…", "model": "m", "historyTurns": 3 }),
+            ),
+        )
+        .unwrap();
+
+        let rows = reconstruct_messages(&s, &id);
+        assert_eq!(rows[0]["text"], "hi");
+        // Two different things. Conflating them is exactly what makes "why
+        // did it answer that?" unanswerable.
+        assert_eq!(rows[1]["kind"], "agent_prompt");
+        assert_eq!(rows[1]["text"], "[Conversation] …hi…");
+        assert_eq!(rows[1]["historyTurns"], 3);
+        assert_eq!(rows[1]["round"], 2);
+    }
+
+    #[test]
+    fn a_decision_survives_as_a_row_with_what_it_was_asked() {
+        let (s, id) = conv();
+        let m = TurnMark::new("fish", None, -1);
+        s.append_event(
+            &id,
+            m.ev(
+                "decision",
+                json!({
+                    "speak": false, "confidence": 0.8, "error": Value::Null,
+                    "state": { "you_are": "@fish — a cook" },
+                    "answers": { "should_reply": { "choice": "no" } },
+                }),
+            ),
+        )
+        .unwrap();
+        let rows = reconstruct_messages(&s, &id);
+        assert_eq!(rows[0]["kind"], "decision");
+        assert_eq!(rows[0]["speak"], false);
+        assert_eq!(rows[0]["confidence"], 0.8);
+        // The state is the only place the description it judged on appears.
+        assert_eq!(rows[0]["verdict"]["state"]["you_are"], "@fish — a cook");
+    }
+
+    #[test]
+    fn rows_from_before_turn_marking_simply_have_no_turn() {
+        let (s, id) = conv();
+        for ev in [
+            NewEvent::new("context_window", json!({"role":"user","content":"q"})),
+            NewEvent::new("reasoning", json!({"text":"hmm"})),
+            NewEvent::new("context_window", json!({"role":"assistant","content":"a"})),
+        ] {
+            s.append_event(&id, ev).unwrap();
+        }
+        let rows = reconstruct_messages(&s, &id);
+        assert_eq!(rows.len(), 3);
+        // An older transcript renders as it always did, with no rail.
+        assert!(rows.iter().all(|r| r.get("turn").is_none()));
     }
 }

@@ -60,6 +60,16 @@ fn bun() -> String {
     std::env::var("ANGELA_BUN").unwrap_or_else(|_| "bun".into())
 }
 
+/// The preset names the agent editor offers.
+///
+/// Hard-coded rather than discovered from `mcp_root_candidates()`: these are
+/// the two this build knows how to jail (`MCP_FILE_ROOT`, `MCP_TERM_JB_ROOT`),
+/// and offering a name whose sandbox is not configured would hand someone an
+/// unjailed server from a dropdown.
+pub fn names() -> Vec<&'static str> {
+    vec!["file-io", "term-local"]
+}
+
 /// Build the spec for a preset name, jailed to `project_root`.
 ///
 /// Both servers are sandboxed to the project: `MCP_FILE_ROOT` for file-io and

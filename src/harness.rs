@@ -344,6 +344,126 @@ pub fn build_agent(
     Ok(agent)
 }
 
+/// Everything one agent turn emits, stamped so the UI can draw it as a run.
+///
+/// A "turn" here is **one inference request** — from the moment the prompt is
+/// assembled to the moment the model stops. Every node it produces (the
+/// system prompt, the prompt as the agent actually received it, each tool
+/// call and result, the reasoning, the answer) carries the same `meta.turn`,
+/// which is what lets the transcript group them under one rail instead of
+/// showing a flat list where you cannot tell whose turn a tool call belonged
+/// to.
+///
+/// Stamping the handle too is redundant with `participant_id` and worth it:
+/// the reader is a template, and resolving a seat per row to draw a label is
+/// work the writer can do once.
+#[derive(Debug, Clone)]
+pub struct TurnMark {
+    pub id: String,
+    pub handle: String,
+    pub participant: Option<i64>,
+    pub round: i64,
+}
+
+impl TurnMark {
+    pub fn new(handle: &str, participant: Option<i64>, round: i64) -> Self {
+        TurnMark {
+            id: format!("t{}", &crate::session_store::new_event_id_pub()[1..]),
+            handle: handle.to_string(),
+            participant,
+            round,
+        }
+    }
+
+    fn meta(&self) -> serde_json::Map<String, Value> {
+        let mut m = serde_json::Map::new();
+        m.insert("turn".into(), json!(self.id));
+        if !self.handle.is_empty() {
+            m.insert("handle".into(), json!(self.handle));
+        }
+        m.insert("round".into(), json!(self.round));
+        m
+    }
+
+    /// An event belonging to this turn.
+    pub fn ev(&self, kind: &str, payload: Value) -> NewEvent {
+        NewEvent {
+            event_type: kind.into(),
+            payload,
+            meta: Some(self.meta()),
+            speaker: self.participant,
+            ..Default::default()
+        }
+    }
+
+    /// An event belonging to this turn, carrying extra meta.
+    pub fn ev_with(&self, kind: &str, payload: Value, extra: &[(&str, Value)]) -> NewEvent {
+        let mut ev = self.ev(kind, payload);
+        let mut meta = ev.meta.take().unwrap_or_default();
+        for (k, v) in extra {
+            meta.insert((*k).to_string(), v.clone());
+        }
+        ev.meta = Some(meta);
+        ev
+    }
+}
+
+/// Record what the model was actually given, as two cards.
+///
+/// This is the whole point of the feature: when an agent behaves oddly, the
+/// question is always "what did it actually receive?", and before this the
+/// answer was not in the transcript at all. The system prompt is stored per
+/// turn rather than once per conversation because it is *composed* — soul
+/// plus goals plus memory, any of which may have been edited since the last
+/// turn — so "the system prompt" is only meaningful as of a given turn.
+fn record_prompt(
+    store: &ConvStore,
+    conv: &str,
+    mark: &TurnMark,
+    system: &str,
+    wire: &str,
+    model: &str,
+    history_turns: usize,
+    emit: &mut dyn FnMut(&Value) -> bool,
+) {
+    if !system.trim().is_empty() {
+        let w = store.append_event(
+            conv,
+            mark.ev(
+                "system",
+                json!({ "content": system, "bytes": system.len(), "model": model }),
+            ),
+        );
+        emit(&json!({
+            "type": "card",
+            "card": { "kind": "system_prompt", "text": system, "bytes": system.len(),
+                      "handle": mark.handle, "turn": mark.id, "round": mark.round,
+                      "eventId": w.map(|x| x.event_id).unwrap_or_default(),
+                      "participantId": mark.participant, "visible": true },
+        }));
+    }
+    let w = store.append_event(
+        conv,
+        mark.ev(
+            "agent_prompt",
+            json!({
+                "content": wire,
+                "bytes": wire.len(),
+                "model": model,
+                "historyTurns": history_turns,
+            }),
+        ),
+    );
+    emit(&json!({
+        "type": "card",
+        "card": { "kind": "agent_prompt", "text": wire, "bytes": wire.len(),
+                  "model": model, "historyTurns": history_turns,
+                  "handle": mark.handle, "turn": mark.id, "round": mark.round,
+                  "eventId": w.map(|x| x.event_id).unwrap_or_default(),
+                  "participantId": mark.participant, "visible": true },
+    }));
+}
+
 /// Run one turn, emitting protocol rows through `emit`.
 ///
 /// `emit` returns `false` when the client has gone away, which stops the
@@ -396,6 +516,45 @@ pub fn run_turn(
         ),
     );
 
+    // One mark for this whole turn, made before anything it covers — the
+    // engagement decision included, so the decision card shares the turn's
+    // id and the rail runs through it rather than leaving it orphaned.
+    let me = store.agent_participants(&session_id).into_iter().next();
+    let mark = TurnMark::new(
+        me.as_ref().map(|p| p.handle.as_str()).unwrap_or(&def.name),
+        me.as_ref().map(|p| p.id),
+        0,
+    );
+
+    // Engagement applies here too, not only in a group. A lone agent set to
+    // `invoked` should wait to be named, and one set to `relevant` should be
+    // asked — otherwise the field would silently mean nothing until a second
+    // agent joined.
+    if let Some(p) = me.clone() {
+        let roster = vec![p];
+        let quiet = |store: &ConvStore, emit: &mut dyn FnMut(&Value) -> bool| {
+            store.set_status(&session_id, "ready");
+            emit(&json!({
+                "type": "done", "ok": true, "sessionId": session_id,
+                "roundStatus": "settled", "reason": "not_engaged",
+            }));
+        };
+        match classify(store, &roster, &content, emit).first().map(|(_, i)| i.clone()) {
+            None => {
+                quiet(store, emit);
+                return Ok(());
+            }
+            Some(crate::group::Invite::Ask) => {
+                if !decide_now(store, rt, &session_id, &roster, &roster[0], &content, &mark, emit)
+                {
+                    quiet(store, emit);
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
+
     let context_window = store
         .load(&session_id)
         .and_then(|s| s.get("contextWindow").and_then(|v| v.as_u64()));
@@ -411,12 +570,49 @@ pub fn run_turn(
     // Timed from before the agent is built so the number covers the whole
     // turn the user waited through, not just the final inference.
     let started = std::time::Instant::now();
-    let mut agent = build_agent(
-        store,
-        &session_id,
-        &model,
-        Some(def.system.clone()).filter(|p| !p.trim().is_empty()),
-    )?;
+    // One agent or several, the prompt is built the same way — by
+    // `group::plan`. Two separate builders is how the single-agent path came
+    // to be sending only the latest message while the group path sent the
+    // whole flow: the same bug cannot hide in one of two implementations if
+    // there is only one.
+    let task = me
+        .as_ref()
+        .and_then(|p| crate::group::plan(store, &session_id, p, 0, true, "The user addressed you."));
+    let system = task
+        .as_ref()
+        .map(|t| t.system_prompt.clone())
+        .unwrap_or_else(|| def.system_prompt());
+    let prompt = task
+        .as_ref()
+        .map(|t| t.prompt.clone())
+        .unwrap_or_else(|| content.clone());
+    let mut agent = Agent::factory(Factory {
+        model: Some(model.clone()),
+        system_prompt: Some(system.clone()).filter(|p| !p.trim().is_empty()),
+        retain_history: Some(true),
+        parallel_tools: Some(true),
+        ..Default::default()
+    })
+    .map_err(|e| TurnError::Agent(e.to_string()))?;
+    match &task {
+        Some(t) => {
+            for msg in &t.context {
+                agent.push_context(msg.clone());
+            }
+        }
+        // No agent seated — only reachable by calling this directly. Fall
+        // back to hydrating the raw transcript, as it always did.
+        None => {
+            for item in store.build_context_window_items(&session_id) {
+                if !item.visible {
+                    continue;
+                }
+                if let Some(msg) = item_to_message(&item) {
+                    agent.push_context(msg);
+                }
+            }
+        }
+    }
     // The session's own allowlist (set from the UI) overrides the agent
     // definition's; `allowlistSource` records which one is in force.
     let session_state = store.load(&session_id);
@@ -473,6 +669,28 @@ pub fn run_turn(
     }));
     let _ = tool_count;
 
+    // What the model is about to be given, on the record.
+    let history_turns = task
+        .as_ref()
+        .map(|t| t.context.len())
+        .unwrap_or_else(|| store.build_context_window_items(&session_id).len());
+    // Everything the model gets, not just the final turn: the card is the
+    // answer to "what did it actually receive?".
+    let wire = match &task {
+        Some(t) => crate::group::render_wire(&t.messages()),
+        None => format!("--- user ---\n{prompt}\n"),
+    };
+    record_prompt(
+        store,
+        &session_id,
+        &mark,
+        &system,
+        &wire,
+        &model,
+        history_turns,
+        emit,
+    );
+
     // ---- the inference ----------------------------------------------------
     let mut reasoning = String::new();
     // Time to first token: the latency the user actually feels before
@@ -480,6 +698,11 @@ pub fn run_turn(
     let mut first_token_at: Option<std::time::Duration> = None;
     let answer = {
         let sid = session_id.clone();
+        // Named on every delta, not only on the sealed card: the live
+        // reasoning card picks its colour from this, and without it the
+        // turn streams in the default accent and only snaps to the agent's
+        // once it finishes.
+        let who = mark.handle.clone();
         let mut on_event = |e: TurnEvent<'_>| match e {
             TurnEvent::Delta { text, channel } => {
                 if first_token_at.is_none() {
@@ -488,10 +711,12 @@ pub fn run_turn(
                 match channel {
                 Channel::Reasoning => {
                     reasoning.push_str(text);
-                    emit(&json!({ "type": "reasoning_delta", "text": text, "sessionId": sid }));
+                    emit(&json!({ "type": "reasoning_delta", "text": text,
+                                  "sessionId": sid, "handle": who }));
                 }
                 Channel::Content => {
-                    emit(&json!({ "type": "assistant_delta", "text": text, "sessionId": sid }));
+                    emit(&json!({ "type": "assistant_delta", "text": text,
+                                  "sessionId": sid, "handle": who }));
                 }
                 }
             }
@@ -501,16 +726,14 @@ pub fn run_turn(
             TurnEvent::ToolCall { id, name, args } => {
                 let w = store.append_event(
                     &sid,
-                    NewEvent::new(
-                        "tool_call",
-                        json!({ "id": id, "name": name, "args": args }),
-                    ),
+                    mark.ev("tool_call", json!({ "id": id, "name": name, "args": args })),
                 );
                 let event_id = w.map(|x| x.event_id).unwrap_or_default();
                 emit(&json!({
                     "type": "card",
                     "card": { "kind": "tool_call", "name": name, "args": args,
-                              "eventId": event_id, "visible": true },
+                              "eventId": event_id, "turn": mark.id, "handle": mark.handle,
+                              "visible": true },
                 }));
             }
             TurnEvent::ToolResult { id, name, text } => {
@@ -519,7 +742,7 @@ pub fn run_turn(
                 let ok = !text.starts_with("error:") && !text.starts_with("denied:");
                 let w = store.append_event(
                     &sid,
-                    NewEvent::new(
+                    mark.ev(
                         "tool_result",
                         json!({ "tool_call_id": id, "name": name, "text": text, "ok": ok,
                                 "denied": text.starts_with("denied:") }),
@@ -530,11 +753,12 @@ pub fn run_turn(
                     "type": "card",
                     "card": { "kind": "tool_result", "name": name, "text": text,
                               "ok": ok, "denied": text.starts_with("denied:"),
-                              "eventId": event_id, "visible": true },
+                              "eventId": event_id, "turn": mark.id, "handle": mark.handle,
+                              "visible": true },
                 }));
             }
         };
-        rt.block_on(agent.run_events(&content, true, &mut on_event))
+        rt.block_on(agent.run_events(&prompt, true, &mut on_event))
     };
 
     let answer = match answer {
@@ -554,14 +778,12 @@ pub fn run_turn(
 
     // ---- persist + finalize ----------------------------------------------
     if !reasoning.trim().is_empty() {
-        let w = store.append_event(
-            &session_id,
-            NewEvent::new("reasoning", json!({ "text": reasoning })),
-        );
+        let w = store.append_event(&session_id, mark.ev("reasoning", json!({ "text": reasoning })));
         if let Ok(w) = w {
             emit(&json!({
                 "type": "card",
-                "card": { "kind": "reasoning", "text": reasoning, "eventId": w.event_id, "visible": true },
+                "card": { "kind": "reasoning", "text": reasoning, "eventId": w.event_id,
+                          "turn": mark.id, "handle": mark.handle, "visible": true },
             }));
         }
     }
@@ -609,36 +831,44 @@ pub fn run_turn(
     // `reconstruct_messages_from_log` carries `lastGen` FORWARD onto later
     // rows, so a gen_info written afterwards would never reach the message
     // and a reloaded transcript would show no metrics.
-    let _ = store.append_event(
-        &session_id,
-        NewEvent {
-            event_type: "gen_info".into(),
-            payload: telemetry.clone(),
-            duration_ms: Some(elapsed_ms),
-            meta: Some({
-                let mut m = serde_json::Map::new();
-                m.insert("telemetry".into(), telemetry.clone());
-                m
-            }),
-            ..Default::default()
-        },
-    );
+    let _ = store.append_event(&session_id, {
+        let mut ev = mark.ev_with(
+            "gen_info",
+            telemetry.clone(),
+            &[("telemetry", telemetry.clone())],
+        );
+        // The wrapper's own duration, which the metrics row reads back.
+        ev.duration_ms = Some(elapsed_ms);
+        ev
+    });
 
     let text = answer.trim().to_string();
+    let mut sealed_at = String::new();
+    let mut sealed_id = String::new();
     if !text.is_empty() {
-        let _ = store.append_event(
+        if let Ok(w) = store.append_event(
             &session_id,
-            NewEvent::new(
-                "context_window",
-                json!({ "role": "assistant", "content": text }),
-            ),
-        );
+            mark.ev("context_window", json!({ "role": "assistant", "content": text })),
+        ) {
+            sealed_at = w.ts;
+            sealed_id = w.event_id;
+        }
     }
     // Always finalize the bubble, even when empty, so a client streaming into
     // a live bubble knows the turn is sealed.
+    //
+    // The handle rides along so the live card says the same thing the
+    // reloaded transcript will: `reconstruct_messages` reads it from the
+    // node's author, and a card without one would briefly be anonymous.
+    let handle = store
+        .agent_participants(&session_id)
+        .first()
+        .map(|p| p.handle.clone());
     emit(&json!({
         "type": "card",
-        "card": { "kind": "assistant", "text": text, "telemetry": telemetry, "streaming": false },
+        "card": { "kind": "assistant", "text": text, "telemetry": telemetry,
+                  "handle": handle, "turn": mark.id, "ts": sealed_at,
+                  "eventId": sealed_id, "streaming": false },
     }));
 
     store.record_turn_complete(&session_id, Some(elapsed_ms));
@@ -889,6 +1119,26 @@ pub fn run_round(
 
     let roster = store.participants(&conv);
     let header = store.load(&conv).unwrap_or(Value::Null);
+
+    // Nobody to answer. The message is already durable, so this is a state
+    // the user can fix and then re-send from — but silence with no
+    // explanation would read as a broken app, so it is stated plainly.
+    if !roster.iter().any(|p| p.is_agent() && p.active) {
+        let notice = "No agents in this conversation yet. \
+                      Invite one with /invite @name — see the Agents rail.";
+        emit(&json!({
+            "type": "card",
+            "card": { "kind": "system", "text": notice, "visible": true },
+        }));
+        store.set_status(&conv, "ready");
+        emit(&json!({
+            "type": "done", "ok": true, "sessionId": conv,
+            "rounds": 0, "messages": 0,
+            "roundStatus": "settled", "reason": "no_agents",
+            "userEventId": user_node.event_id,
+        }));
+        return Ok(());
+    }
     let routing = header
         .get("routing")
         .and_then(|v| v.as_str())
@@ -912,11 +1162,25 @@ pub fn run_round(
     }
 
     // --- round 0 responders -------------------------------------------------
-    let mut responders: Vec<i64> = if routing == "lead" {
+    //
+    // Who speaks is each agent's own `engagement`, not a property of the
+    // message: `engaged` always, `invoked` only when named, `relevant` when
+    // a System One call says this one is theirs. A mention beats all three.
+    //
+    // Classification only here; a `relevant` agent's System One call happens
+    // immediately before its own turn, further down. Two reasons: the
+    // decision then sees what the agents ahead of it have just said, and
+    // the decision card lands next to the turn it decided — same turn id,
+    // contiguous rows, one rail — instead of orphaned several turns above.
+    let invites: Vec<(i64, crate::group::Invite)> = if routing == "lead" {
         lead_assignment(store, rt, &conv, &roster, &content, emit)
+            .into_iter()
+            .map(|pid| (pid, crate::group::Invite::Mentioned))
+            .collect()
     } else {
-        crate::group::responders(&roster, &content, 0, &[], &[])
+        classify(store, &roster, &content, emit)
     };
+    let mut responders: Vec<i64> = invites.iter().map(|(pid, _)| *pid).collect();
     let mut round_index: i64 = 0;
     let mut published: usize = 0;
 
@@ -964,20 +1228,31 @@ pub fn run_round(
                 .or_else(|| header.get("model").and_then(|v| v.as_str()).map(String::from))
                 .filter(|m| !m.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_MODEL.into());
+            // One mark for the whole of this participant's turn, made here
+            // so the reply it publishes lands on the same rail as the
+            // decision, prompt, reasoning and tool calls around it.
+            let mark = TurnMark::new(&me.handle, Some(me.id), round_index);
+
+            // A `relevant` agent is asked now, not up front: it then sees
+            // what the agents ahead of it just said, and its decision card
+            // shares this turn's id so the rail runs through it.
+            if round_index == 0
+                && invites
+                    .iter()
+                    .any(|(id, inv)| *id == pid && *inv == crate::group::Invite::Ask)
+                && !decide_now(store, rt, &conv, &roster, &me, &content, &mark, emit)
+            {
+                continue;
+            }
             let reply = match run_participant(
-                store, rt, &servers, def, &conv, &me, &task, &model, emit,
+                store, rt, &servers, def, &conv, &me, &task, &model, &mark, emit,
             ) {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
                     let _ = store.append_event(
                         &conv,
-                        NewEvent {
-                            event_type: "error".into(),
-                            payload: json!({ "message": msg, "handle": me.handle }),
-                            speaker: Some(me.id),
-                            ..Default::default()
-                        },
+                        mark.ev("error", json!({ "message": msg, "handle": me.handle })),
                     );
                     emit(&json!({ "type": "card", "card": { "kind": "error", "text": msg } }));
                     continue;
@@ -1004,12 +1279,7 @@ pub fn run_round(
             let node = store
                 .append_event(
                     &conv,
-                    NewEvent {
-                        event_type: "context_window".into(),
-                        payload: json!({ "role": "assistant", "content": text }),
-                        speaker: Some(me.id),
-                        ..Default::default()
-                    },
+                    mark.ev("context_window", json!({ "role": "assistant", "content": text })),
                 )
                 .map_err(|e| TurnError::Store(e.to_string()))?;
             // The prompt is stored with the reply so this participant's own
@@ -1022,7 +1292,8 @@ pub fn run_round(
                 "type": "card",
                 "card": {
                     "kind": "assistant", "text": text, "eventId": node.event_id,
-                    "participantId": me.id, "handle": me.handle,
+                    "participantId": me.id, "handle": me.handle, "turn": mark.id,
+                    "ts": node.ts,
                     "round": round_index, "streaming": false, "visible": true,
                 },
             }));
@@ -1088,13 +1359,14 @@ fn run_participant(
     me: &crate::conv_store::Participant,
     task: &crate::group::Task,
     model: &str,
+    mark: &TurnMark,
     emit: &mut dyn FnMut(&Value) -> bool,
 ) -> Result<String, TurnError> {
     let system = if task.system_prompt.trim().is_empty() {
         // Fall back to the agent definition, with the participant's identity
         // appended: an agent that does not know its own handle cannot be
         // told apart from its peers in the flattened room.
-        let base = def.system.clone();
+        let base = def.system_prompt();
         format!(
             "{base}\n\nYou are @{} in a conversation with other participants. \
              Reply as yourself only.",
@@ -1107,7 +1379,7 @@ fn run_participant(
     };
     let mut agent = Agent::factory(Factory {
         model: Some(model.to_string()),
-        system_prompt: Some(system),
+        system_prompt: Some(system.clone()),
         // The history is pushed explicitly below, and must not also
         // accumulate across participants.
         retain_history: Some(true),
@@ -1115,9 +1387,10 @@ fn run_participant(
         ..Default::default()
     })
     .map_err(|e| TurnError::Agent(e.to_string()))?;
-    for (prompt, reply) in &task.history {
-        agent.push_context(Message::user(prompt.clone()));
-        agent.push_context(Message::assistant(reply.clone()));
+    // The conversation as this participant sees it: its own words as its
+    // own turns, everyone else's as `[sender]`-prefixed user turns.
+    for msg in &task.context {
+        agent.push_context(msg.clone());
     }
 
     let session_state = store.load(conv);
@@ -1141,6 +1414,20 @@ fn run_participant(
         &def.policy_mode,
     );
 
+    // What this participant was actually given, on the record — the
+    // flattened room prompt, not the user's typed message. They are
+    // different things, and only one of them explains the reply.
+    record_prompt(
+        store,
+        conv,
+        mark,
+        &system,
+        &crate::group::render_wire(&task.messages()),
+        model,
+        task.context.len(),
+        emit,
+    );
+
     let mut reasoning = String::new();
     let handle = me.handle.clone();
     let pid = me.id;
@@ -1160,39 +1447,33 @@ fn run_participant(
             TurnEvent::ToolCall { id, name, args } => {
                 let w = store.append_event(
                     conv,
-                    NewEvent {
-                        event_type: "tool_call".into(),
-                        payload: json!({ "id": id, "name": name, "args": args }),
-                        speaker: Some(pid),
-                        ..Default::default()
-                    },
+                    mark.ev("tool_call", json!({ "id": id, "name": name, "args": args })),
                 );
                 let event_id = w.map(|x| x.event_id).unwrap_or_default();
                 emit(&json!({
                     "type": "card",
                     "card": { "kind": "tool_call", "name": name, "args": args,
                               "eventId": event_id, "participantId": pid,
-                              "handle": handle, "visible": true },
+                              "turn": mark.id, "handle": handle, "visible": true },
                 }));
             }
             TurnEvent::ToolResult { id, name, text } => {
                 let ok = !text.starts_with("error:") && !text.starts_with("denied:");
                 let w = store.append_event(
                     conv,
-                    NewEvent {
-                        event_type: "tool_result".into(),
-                        payload: json!({ "tool_call_id": id, "name": name, "text": text,
-                                         "ok": ok, "denied": text.starts_with("denied:") }),
-                        speaker: Some(pid),
-                        ..Default::default()
-                    },
+                    mark.ev(
+                        "tool_result",
+                        json!({ "tool_call_id": id, "name": name, "text": text,
+                                "ok": ok, "denied": text.starts_with("denied:") }),
+                    ),
                 );
                 let event_id = w.map(|x| x.event_id).unwrap_or_default();
                 emit(&json!({
                     "type": "card",
                     "card": { "kind": "tool_result", "name": name, "text": text, "ok": ok,
                               "denied": text.starts_with("denied:"), "eventId": event_id,
-                              "participantId": pid, "handle": handle, "visible": true },
+                              "participantId": pid, "turn": mark.id, "handle": handle,
+                              "visible": true },
                 }));
             }
         };
@@ -1201,20 +1482,13 @@ fn run_participant(
     };
 
     if !reasoning.trim().is_empty() {
-        let w = store.append_event(
-            conv,
-            NewEvent {
-                event_type: "reasoning".into(),
-                payload: json!({ "text": reasoning }),
-                speaker: Some(pid),
-                ..Default::default()
-            },
-        );
+        let w = store.append_event(conv, mark.ev("reasoning", json!({ "text": reasoning })));
         if let Ok(w) = w {
             emit(&json!({
                 "type": "card",
                 "card": { "kind": "reasoning", "text": reasoning, "eventId": w.event_id,
-                          "participantId": pid, "handle": me.handle, "visible": true },
+                          "participantId": pid, "turn": mark.id, "handle": me.handle,
+                          "visible": true },
             }));
         }
     }
@@ -1288,4 +1562,119 @@ fn lead_assignment(
             vec![lead.id]
         }
     }
+}
+
+
+/// Round-0 invitations: who is a candidate, and on what grounds.
+///
+/// Pure classification — no model calls. The `relevant` agents' System One
+/// call happens later, immediately before each one's own turn, so that the
+/// decision sees what the agents ahead of it said and its card lands on the
+/// same rail as the turn it decided.
+fn classify(
+    store: &ConvStore,
+    roster: &[crate::conv_store::Participant],
+    content: &str,
+    emit: &mut dyn FnMut(&Value) -> bool,
+) -> Vec<(i64, crate::group::Invite)> {
+    let agents = store.agents();
+    // A participant's own `engagement` is a per-conversation override; with
+    // none, the agent definition's current value wins, so editing an agent
+    // changes how it behaves in conversations it is already in.
+    let engagement_of = |p: &crate::conv_store::Participant| {
+        if let Some(over) = p.engagement.as_deref().filter(|s| !s.trim().is_empty()) {
+            return crate::agent_loader::Engagement::parse(over);
+        }
+        p.agent_name
+            .as_deref()
+            .and_then(|n| agents.get(n))
+            .map(|d| d.engagement())
+            // No definition at all (a seat whose agent was deleted, or one
+            // added by hand): answer, rather than go mute for no stated
+            // reason.
+            .unwrap_or(crate::agent_loader::Engagement::Engaged)
+    };
+
+    let mut out = Vec::new();
+    for (pid, invite) in crate::group::invitations(roster, &engagement_of, content) {
+        let Some(me) = roster.iter().find(|p| p.id == pid) else { continue };
+        if invite == crate::group::Invite::Skip {
+            emit(&json!({
+                "type": "not_speaking", "participantId": pid, "handle": me.handle,
+                "reason": "invoked", "detail": "waiting to be @mentioned",
+            }));
+            continue;
+        }
+        out.push((pid, invite));
+    }
+    out
+}
+
+/// Ask System One whether this agent should take the turn it is about to
+/// take. `true` means go ahead.
+///
+/// The verdict gets a card on **this turn's** mark, so it reads as the first
+/// step of the turn rather than as an unrelated row — and when the answer is
+/// no, as a turn that stopped there.
+#[allow(clippy::too_many_arguments)]
+fn decide_now(
+    store: &ConvStore,
+    rt: &tokio::runtime::Runtime,
+    conv: &str,
+    roster: &[crate::conv_store::Participant],
+    me: &crate::conv_store::Participant,
+    content: &str,
+    mark: &TurnMark,
+    emit: &mut dyn FnMut(&Value) -> bool,
+) -> bool {
+    // The conversation as the decider reads it: `[sender] text`, oldest
+    // first, ending with the message being judged. Attribution is the point
+    // — "has this already been said, and was it me who said it" is most of
+    // what the decision turns on.
+    let history: Vec<String> = store
+        .path(conv)
+        .iter()
+        .filter(|n| n.kind == "context_window" && n.visible)
+        .filter_map(|n| {
+            let text = n.content.clone()?;
+            let sender = match n.role.as_deref() {
+                Some("user") => "user".to_string(),
+                _ => n
+                    .participant_id
+                    .and_then(|id| roster.iter().find(|p| p.id == id))
+                    .map(|p| p.handle.clone())
+                    .unwrap_or_else(|| "assistant".into()),
+            };
+            Some(crate::relevance::history_line(&sender, &text))
+        })
+        .collect();
+
+    // The same identity the agent itself is given — soul, goals, memory —
+    // so the decision is made on the same picture the reply would be.
+    let identity = me
+        .agent_name
+        .as_deref()
+        .and_then(|n| store.agents().get(n))
+        .map(|d| d.system_prompt())
+        .unwrap_or_else(|| me.system_prompt.clone());
+    let verdict = crate::relevance::should_speak(rt, me, &identity, &history);
+
+    let payload = verdict.to_json();
+    let w = store.append_event(conv, mark.ev("decision", payload.clone()));
+    emit(&json!({
+        "type": "card",
+        "card": { "kind": "decision", "handle": me.handle, "turn": mark.id,
+                  "participantId": me.id, "verdict": payload,
+                  "speak": verdict.speak, "confidence": verdict.confidence,
+                  "reason": verdict.reason, "error": verdict.error,
+                  "eventId": w.map(|x| x.event_id).unwrap_or_default(),
+                  "visible": true },
+    }));
+    emit(&json!({
+        "type": if verdict.speak { "speaking_because" } else { "not_speaking" },
+        "sessionId": conv, "participantId": me.id, "handle": me.handle,
+        "reason": "relevant", "verdict": verdict.to_json(),
+    }));
+    let _ = content;
+    verdict.speak
 }

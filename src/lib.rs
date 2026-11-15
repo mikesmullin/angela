@@ -15,7 +15,7 @@
 //! | `src/session-store.mjs` | [`session_store`] | ported — now the **legacy reader** only (see below) |
 //! | `src/serve.mjs` | [`serve`] | ported |
 //! | `src/index.mjs` | [`harness`] | ported |
-//! | `src/agent-loader.mjs` | [`agent_loader`] | ported (`.coffee` → declarative JSON) |
+//! | `src/agent-loader.mjs` | [`agent_loader`] | ported (`.coffee` → JSON), then superseded by [`agent_store`]: definitions are rows now, and the files are import-only |
 //! | `src/allowlist.mjs`, `policy.mjs` | [`allowlist`] | ported |
 //! | `src/mcp-*.mjs` | [`mcp`] | ported |
 //!
@@ -28,12 +28,14 @@
 //! | [`db`], [`conv_store`] | the conversation as a **tree**: nodes name a parent, a cursor names the active leaf, and forking is "move the cursor, then append" |
 //! | [`group`] | **N participants** — each agent in its own context, reading the room as flattened text (the hermes shape), with watermarks, rounds and `@mentions` |
 //! | [`memory`] | an **unbounded history in a bounded window**: a binary tree of summaries, coarse with age, where any line opens into the two it was merged from, down to the original message |
+//! | [`agent_store`], [`relevance`] | **agents are rows**, created and edited in the UI, each carrying a soul, goals, a memory it may rewrite, and an `engagement` that decides when it speaks |
 //! | [`migrate`] | the one-shot, idempotent, non-destructive import of the old files — which is also the rollback plan |
 //!
 //! [`session_store`] is deliberately kept: it is the importer's reader and
 //! the reference the differential tests measure the port against.
 
 pub mod agent_loader;
+pub mod agent_store;
 pub mod conv_store;
 pub mod db;
 pub mod allowlist;
@@ -45,5 +47,6 @@ pub mod memory;
 pub mod migrate;
 pub mod mcp_presets;
 pub mod project;
+pub mod relevance;
 pub mod serve;
 pub mod session_store;

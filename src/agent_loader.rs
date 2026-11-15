@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 
 
@@ -54,11 +54,63 @@ pub struct AgentDef {
     pub tools_enabled: Option<Vec<String>>,
     pub policy_mode: String,
     pub parallel_tools: bool,
-    pub system: String,
+    /// Who the agent **is**. Written once, by whoever defined it.
+    /// (Called `system` in the file format; the name changed because it is
+    /// now one of three things that make up the system prompt.)
+    pub soul: String,
+    /// What it is working **toward**. The user's steering, appended to the
+    /// system prompt.
+    pub goals: String,
+    /// What it has **learned**: a blackboard that survives between sessions,
+    /// which the agent may rewrite and the user can read and edit.
+    pub memory: String,
+    /// When it speaks: `invoked` (only when @mentioned), `relevant` (a
+    /// System One call decides per message), `engaged` (every message).
+    pub engagement: String,
     pub starters: Vec<Value>,
-    /// Where it was loaded from, for `/api/agents` and session metadata.
+    /// Row id once it lives in the database.
+    pub id: Option<i64>,
+    pub avatar: Option<String>,
+    /// The colour this agent is drawn in — `#rrggbb`, or `None` for the
+    /// app's default accent.
+    pub accent_color: Option<String>,
+    /// Where it was imported from, if it came from a file. Historical.
     pub file: Option<String>,
 }
+
+/// The three engagement modes, as a type rather than a loose string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engagement {
+    /// Speaks only when `@mentioned`.
+    Invoked,
+    /// A System One call decides, per message, whether this one has anything
+    /// to add.
+    Relevant,
+    /// Speaks on every message.
+    Engaged,
+}
+
+impl Engagement {
+    pub fn parse(s: &str) -> Engagement {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "relevant" => Engagement::Relevant,
+            "engaged" | "always" => Engagement::Engaged,
+            // Anything unrecognised is the quiet option. An agent that
+            // speaks when it should not is far more disruptive than one that
+            // waits to be asked.
+            _ => Engagement::Invoked,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Engagement::Invoked => "invoked",
+            Engagement::Relevant => "relevant",
+            Engagement::Engaged => "engaged",
+        }
+    }
+}
+
+pub const ENGAGEMENTS: &[&str] = &["invoked", "relevant", "engaged"];
 
 impl Default for AgentDef {
     fn default() -> Self {
@@ -76,27 +128,113 @@ impl Default for AgentDef {
             // The JS default: every tool call asks unless allow-listed.
             policy_mode: "ask".into(),
             parallel_tools: true,
-            system: String::new(),
+            soul: String::new(),
+            goals: String::new(),
+            memory: String::new(),
+            // Answers every message. This is what every agent did before
+            // engagement existed, so it is what an imported definition and a
+            // freshly created one both get; `invoked` and `relevant` are
+            // opt-ins.
+            engagement: "engaged".into(),
             starters: Vec::new(),
+            id: None,
+            avatar: None,
+            accent_color: None,
             file: None,
         }
     }
 }
 
 impl AgentDef {
-    /// The JSON `/api/agents` sends.
+    pub fn engagement(&self) -> Engagement {
+        Engagement::parse(&self.engagement)
+    }
+
+    /// The system prompt the model actually sees: soul, then goals, then
+    /// memory.
+    ///
+    /// Concatenated in that order and nowhere else, so every caller gets the
+    /// same prompt. The headings are there because without them an agent
+    /// cannot tell its own standing instructions from a note it left itself
+    /// last week — and it is allowed to rewrite only the latter.
+    pub fn system_prompt(&self) -> String {
+        let mut out = self.soul.trim().to_string();
+        let goals = self.goals.trim();
+        if !goals.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str("## Goals\n\n");
+            out.push_str(goals);
+        }
+        let memory = self.memory.trim();
+        if !memory.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str("## Memory\n\nWhat you have learned so far:\n\n");
+            out.push_str(memory);
+        }
+        out
+    }
+
+    /// The full definition, as the editor reads and writes it.
     pub fn to_json(&self) -> Value {
         json!({
+            "id": self.id,
             "name": self.name,
             "description": self.description,
             "model": self.model,
             "models": self.models,
             "contextWindow": self.context_window,
+            "cwd": self.cwd,
+            "env": self.env,
             "mcp": self.mcp,
+            "allowlist": self.allowlist,
+            "toolsEnabled": self.tools_enabled,
             "policyMode": self.policy_mode,
+            "parallelTools": self.parallel_tools,
+            "soul": self.soul,
+            "goals": self.goals,
+            "memory": self.memory,
+            "engagement": self.engagement,
             "starters": self.starters,
+            "avatar": self.avatar,
+            "accentColor": self.accent_color,
+            // Only ever set on a definition that came in from a file.
             "agentFile": self.file,
         })
+    }
+}
+
+/// The app's accent when an agent has not chosen one.
+pub const DEFAULT_ACCENT: &str = "#a78bfa";
+
+/// Accept `#rgb` / `#rrggbb` (with or without the `#`), reject anything else.
+///
+/// Rejected rather than coerced: this value is interpolated straight into a
+/// `style` attribute, so "whatever the user typed" is not a thing to pass
+/// through, and a silently-wrong colour is worse than the default.
+pub fn normalize_hex(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_start_matches('#');
+    if t.is_empty() {
+        return None;
+    }
+    if !t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    match t.len() {
+        3 => {
+            // #abc -> #aabbcc, so everything downstream sees one form.
+            let mut out = String::from("#");
+            for c in t.chars() {
+                out.push(c.to_ascii_lowercase());
+                out.push(c.to_ascii_lowercase());
+            }
+            Some(out)
+        }
+        6 => Some(format!("#{}", t.to_ascii_lowercase())),
+        _ => None,
     }
 }
 
@@ -252,11 +390,34 @@ pub fn from_json(name_hint: &str, v: &Value, file: Option<String>) -> AgentDef {
             .or_else(|| o.get("parallelTools"))
             .and_then(|x| x.as_bool())
             .unwrap_or(true),
-        system: s(get("system")),
+        // `system` is the old file-format name for the same field; both are
+        // accepted so an imported definition keeps its prompt.
+        soul: {
+            let v = s(get("soul"));
+            if v.is_empty() { s(get("system")) } else { v }
+        },
+        goals: s(get("goals")),
+        memory: s(get("memory")),
+        // Only an *explicit* value is parsed. A definition with no
+        // `engagement` key predates the field, and its behaviour was to
+        // answer everything — so it keeps the default rather than being
+        // silently muted by the import.
+        engagement: match get("engagement") {
+            Some(v) if !s(Some(v)).trim().is_empty() => {
+                Engagement::parse(&s(Some(v))).as_str().to_string()
+            }
+            _ => AgentDef::default().engagement,
+        },
         starters: get("starters")
             .and_then(|x| x.as_array())
             .cloned()
             .unwrap_or_default(),
+        id: get("id").and_then(|x| x.as_i64()),
+        avatar: {
+            let a = s(get("avatar"));
+            if a.is_empty() { None } else { Some(a) }
+        },
+        accent_color: normalize_hex(&s(get("accentColor").or_else(|| o.get("accent_color")))),
         file,
     };
     // De-duplicate `models` while keeping order — the JS does this with
@@ -287,8 +448,9 @@ fn agent_dirs(project_root: &Path) -> Vec<PathBuf> {
     ]
 }
 
-/// Load `<name>` from the first search directory that has it.
-pub fn load(project_root: &Path, name: &str) -> Option<AgentDef> {
+/// Load `<name>` from the first search directory that has it — **import
+/// only**; see [`list_files`].
+pub fn load_file(project_root: &Path, name: &str) -> Option<AgentDef> {
     if name.is_empty() || name.contains('/') || name.contains("..") {
         return None;
     }
@@ -303,8 +465,12 @@ pub fn load(project_root: &Path, name: &str) -> Option<AgentDef> {
     None
 }
 
-/// Every definition in `.angela/agents/`, sorted by name.
-pub fn list(project_root: &Path) -> Vec<AgentDef> {
+/// Every definition on disk, sorted by name — **import only**.
+///
+/// Agents live in the `agents` table now. This reads the pre-database files
+/// so [`crate::agent_store::AgentStore::import_files`] can bring them in
+/// once; nothing in the running server reads a definition from disk.
+pub fn list_files(project_root: &Path) -> Vec<AgentDef> {
     let mut out: Vec<AgentDef> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for dir in agent_dirs(project_root) {
@@ -345,7 +511,7 @@ pub fn default_agent() -> AgentDef {
         name: "default".into(),
         description: "Local coding assistant (file-io + term-local)".into(),
         mcp: vec!["file-io".into(), "term-local".into()],
-        system: "You are a coding assistant with access to the local project.\n\
+        soul: "You are a coding assistant with access to the local project.\n\
                  Use the tools to list, read, search and edit files, and to run \
                  shell commands, rather than guessing. Be concise and concrete, \
                  and use Markdown."
@@ -355,26 +521,10 @@ pub fn default_agent() -> AgentDef {
     }
 }
 
-/// Write the default definition into a project that has none.
-pub fn ensure_default_agent(project_root: &Path) -> std::io::Result<PathBuf> {
-    let dir = crate::project::agents_dir(project_root);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("default.json");
-    if path.exists() {
-        return Ok(path);
-    }
-    let d = default_agent();
-    let body = json!({
-        "name": d.name,
-        "description": d.description,
-        "mcp": d.mcp,
-        "system": d.system,
-        "policyMode": d.policy_mode,
-        "allowlist": "",
-        "_comment": "Agent definition. String values support ${VAR} and ${VAR:-fallback}.",
-    });
-    std::fs::write(&path, serde_json::to_string_pretty(&body)? + "\n")?;
-    Ok(path)
+/// The system prompt the built-in default produces, for callers that have
+/// no definition at all.
+pub fn default_system_prompt() -> String {
+    default_agent().system_prompt()
 }
 
 #[cfg(test)]
@@ -480,14 +630,14 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("notjson.txt"), "ignored").unwrap();
 
-        let d = load(tmp.path(), "coder").expect("loaded");
+        let d = load_file(tmp.path(), "coder").expect("loaded");
         assert_eq!(d.name, "coder");
         assert_eq!(d.mcp, vec!["file-io"]);
         assert!(d.file.unwrap().ends_with("coder.json"));
 
-        let all = list(tmp.path());
+        let all = list_files(tmp.path());
         assert_eq!(all.len(), 1, "only .json files are definitions");
-        assert!(load(tmp.path(), "missing").is_none());
+        assert!(load_file(tmp.path(), "missing").is_none());
     }
 
     #[test]
@@ -499,26 +649,16 @@ mod tests {
         crate::project::ensure_angela_layout(tmp.path()).unwrap();
         std::fs::write(tmp.path().join("rustex1.json"), r#"{"name":"chat"}"#).unwrap();
         std::fs::write(tmp.path().join("package.json"), r#"{"name":"pkg"}"#).unwrap();
-        assert!(list(tmp.path()).is_empty(), "project json is not an agent");
-        assert!(load(tmp.path(), "rustex1").is_none());
-        assert!(load(tmp.path(), "package").is_none());
+        assert!(list_files(tmp.path()).is_empty(), "project json is not an agent");
+        assert!(load_file(tmp.path(), "rustex1").is_none());
+        assert!(load_file(tmp.path(), "package").is_none());
     }
 
     #[test]
     fn load_refuses_traversal_names() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(load(tmp.path(), "../escape").is_none());
-        assert!(load(tmp.path(), "a/b").is_none());
+        assert!(load_file(tmp.path(), "../escape").is_none());
+        assert!(load_file(tmp.path(), "a/b").is_none());
     }
 
-    #[test]
-    fn the_default_agent_is_written_once_and_reused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = ensure_default_agent(tmp.path()).unwrap();
-        assert!(p.exists());
-        std::fs::write(&p, r#"{"description":"edited by hand"}"#).unwrap();
-        ensure_default_agent(tmp.path()).unwrap();
-        let after = load(tmp.path(), "default").unwrap();
-        assert_eq!(after.description, "edited by hand", "never overwritten");
-    }
 }

@@ -69,6 +69,10 @@ pub struct Participant {
     pub seat: i64,
     pub active: bool,
     pub role: Option<String>,
+    /// Per-conversation engagement override. `None` means "whatever the
+    /// agent definition currently says", so editing an agent changes how it
+    /// behaves in the conversations it is already seated in.
+    pub engagement: Option<String>,
 }
 
 impl Participant {
@@ -77,8 +81,18 @@ impl Participant {
     }
 
     pub fn to_json(&self) -> Value {
+        self.to_json_with(None)
+    }
+
+    /// The seat, with its agent's colour folded in.
+    ///
+    /// Resolved from the definition at read time rather than copied at seat
+    /// time, like the system prompt and `engagement`: recolouring an agent
+    /// has to recolour it in the conversations it is already in.
+    pub fn to_json_with(&self, accent: Option<&str>) -> Value {
         json!({
             "id": self.id,
+            "accentColor": accent,
             "kind": self.kind,
             "handle": self.handle,
             "displayName": self.display_name,
@@ -88,6 +102,7 @@ impl Participant {
             "seat": self.seat,
             "active": self.active,
             "role": self.role,
+            "engagement": self.engagement,
         })
     }
 }
@@ -270,10 +285,11 @@ impl ConvStore {
                  VALUES (?1, 0, NULL, ?2)",
                 params![id, now],
             )?;
-            // A conversation always has a roster, even a chat of two: the
-            // group-chat path and the 2-party path are then the same code
-            // with a different roster size, instead of two code paths.
-            Self::seed_roster(c, &id, meta.agent.as_deref(), meta.model.as_deref())?;
+            // A new conversation is **you, alone**. Agents join by invitation
+            // (`/invite @name`), so the roster starts out saying honestly
+            // that nobody is listening yet rather than quietly seating
+            // whichever agent happened to be the default.
+            Self::seed_roster(c, &id)?;
             Ok::<(), rusqlite::Error>(())
         })?;
         // The opening lifecycle beat, so the log reads the same as it did.
@@ -294,26 +310,13 @@ impl ConvStore {
         Ok(self.load(&id).unwrap_or(Value::Null))
     }
 
-    /// Seat the human and, when the conversation names one, the agent.
-    fn seed_roster(
-        c: &Connection,
-        conv: &str,
-        agent: Option<&str>,
-        model: Option<&str>,
-    ) -> rusqlite::Result<()> {
+    /// Seat the human. Agents are invited, never assumed.
+    fn seed_roster(c: &Connection, conv: &str) -> rusqlite::Result<()> {
         c.execute(
             "INSERT OR IGNORE INTO participants
                (conversation_id, kind, handle, display_name, seat, active)
              VALUES (?1, 'user', 'user', 'User', 0, 1)",
             params![conv],
-        )?;
-        let name = agent.unwrap_or("assistant");
-        c.execute(
-            "INSERT OR IGNORE INTO participants
-               (conversation_id, kind, handle, display_name, agent_name, model,
-                system_prompt, seat, active, role)
-             VALUES (?1, 'agent', ?2, ?3, ?4, ?5, '', 1, 1, 'member')",
-            params![conv, handle_from(name), name, agent, model],
         )?;
         Ok(())
     }
@@ -637,7 +640,7 @@ impl ConvStore {
     fn participants_in(c: &Connection, conv: &str) -> Vec<Participant> {
         let mut st = match c.prepare(
             "SELECT id, conversation_id, kind, handle, display_name, agent_name, model,
-                    system_prompt, avatar, seat, active, role
+                    system_prompt, avatar, seat, active, role, engagement
                FROM participants WHERE conversation_id = ?1 ORDER BY seat ASC, id ASC",
         ) {
             Ok(s) => s,
@@ -657,6 +660,7 @@ impl ConvStore {
                 seat: r.get(9)?,
                 active: r.get::<_, i64>(10)? != 0,
                 role: r.get(11)?,
+                engagement: r.get(12)?,
             })
         });
         match rows {
@@ -754,6 +758,7 @@ impl ConvStore {
                     "seat" => "seat",
                     "active" => "active",
                     "agentName" | "agent_name" => "agent_name",
+                    "engagement" => "engagement",
                     _ => continue,
                 };
                 let sql = format!("UPDATE participants SET {col} = ?1 WHERE id = ?2");
@@ -1529,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_conversation_has_a_header_a_roster_and_one_node() {
+    fn a_new_conversation_is_you_alone() {
         let s = store();
         let id = conv(&s);
         let meta = s.load(&id).unwrap();
@@ -1538,9 +1543,13 @@ mod tests {
         assert_eq!(meta["turns"], 0);
         assert_eq!(meta["eventCount"], 1);
         let roster = s.participants(&id);
-        assert_eq!(roster.len(), 2, "the human and the agent are both seated");
+        // Nobody is listening until you invite them. Seating the header's
+        // agent here would mean a conversation that silently has a
+        // participant the roster never showed you choosing.
+        assert_eq!(roster.len(), 1);
         assert_eq!(roster[0].kind, "user");
-        assert_eq!(roster[1].handle, "default");
+        assert_eq!(roster[0].handle, "user");
+        assert!(s.agent_participants(&id).is_empty());
     }
 
     #[test]

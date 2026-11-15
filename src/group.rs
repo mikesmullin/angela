@@ -38,22 +38,18 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::agent_loader::Engagement;
 use crate::conv_store::{ConvStore, Participant, TreeNode};
 
 /// Hard cap on the flattened prompt. Beyond this the prompt is a liability,
 /// not context.
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
-/// Lines of room history in one prompt, newest kept.
-pub const MAX_DELTA_LINES: usize = 24;
 /// Rounds before a discussion is declared bounded.
 pub const MAX_ROUNDS: i64 = 3;
 /// Messages in one discussion before it is declared bounded.
 pub const MAX_MESSAGES: usize = 10;
 /// A single participant's message, truncated at this size when published.
 pub const MAX_MEMBER_TEXT_BYTES: usize = 64 * 1024;
-/// How much of a tool result is worth showing a teammate.
-const TOOL_SUMMARY_CHARS: usize = 80;
-
 /// The marker a participant returns to stay silent.
 pub const PASS: &str = "(pass)";
 
@@ -64,9 +60,11 @@ pub struct Task {
     pub participant_id: i64,
     pub handle: String,
     pub system_prompt: String,
-    /// The participant's own `(prompt, reply)` history, oldest first.
-    pub history: Vec<(String, String)>,
-    /// The single current user message: the flattened room.
+    /// The conversation as this participant sees it, up to but excluding the
+    /// turn it is being asked to take: its own messages as `assistant`,
+    /// everyone else's coalesced into `user` turns of `[sender] text` lines.
+    pub context: Vec<agl::provider::Message>,
+    /// The final user turn — what it is replying to.
     pub prompt: String,
     pub round_index: i64,
     pub reply_required: bool,
@@ -80,13 +78,142 @@ impl Task {
     /// The exact message list to send the provider.
     pub fn messages(&self) -> Vec<agl::provider::Message> {
         let mut out = vec![agl::provider::Message::system(self.system_prompt.clone())];
-        for (prompt, reply) in &self.history {
-            out.push(agl::provider::Message::user(prompt.clone()));
-            out.push(agl::provider::Message::assistant(reply.clone()));
-        }
+        out.extend(self.context.iter().cloned());
         out.push(agl::provider::Message::user(self.prompt.clone()));
         out
     }
+}
+
+/// The standing part of a participant's system prompt.
+///
+/// Addressed to the agent, and ending with the line that explains the
+/// `[sender]` convention the conversation turns use — so the format is
+/// introduced once, where standing instructions belong, rather than
+/// re-explained in every message.
+///
+/// Shared with the engagement decider (`relevance`), deliberately: an agent
+/// should be deciding whether to speak from the same picture it would speak
+/// from.
+pub fn preamble(name: &str, identity: &str) -> String {
+    let mut out = format!("Your name is {name}.\n");
+    let identity = identity.trim();
+    if !identity.is_empty() {
+        out.push('\n');
+        out.push_str(identity);
+        out.push('\n');
+    }
+    out.push_str("\n## Conversation History\n\n");
+    out.push_str(
+        "**Session type:** Multi-user thread — messages are prefixed with \
+         [sender name]. Multiple users may participate.\n",
+    );
+    out
+}
+
+/// How many conversation turns one prompt carries, newest kept.
+pub const MAX_CONTEXT_TURNS: usize = 40;
+
+/// Project the room onto one participant's view of it.
+///
+/// Its own messages become `assistant` turns; everything else — the human
+/// and the other agents alike — is coalesced into `user` turns of
+/// `[sender] text` lines. That is what gives the agent the *flow* of the
+/// conversation rather than only the message that triggered it, and it is
+/// the shape a chat model is trained on: its own words as its own turns.
+///
+/// Returns the turns before the one being taken, and the final user turn.
+pub fn project(
+    path: &[TreeNode],
+    me_id: i64,
+    roster: &[Participant],
+) -> (Vec<agl::provider::Message>, String) {
+    // Build alternating blocks first; pairing into messages is then trivial
+    // and the coalescing rule lives in one place.
+    enum Block {
+        Said(Vec<String>),
+        Mine(String),
+    }
+    let mut blocks: Vec<Block> = Vec::new();
+    for n in path {
+        if n.kind != "context_window" || !n.visible {
+            continue;
+        }
+        if !matches!(n.role.as_deref(), Some("user") | Some("assistant")) {
+            continue;
+        }
+        let Some(text) = n.content.clone() else { continue };
+        if n.participant_id == Some(me_id) {
+            blocks.push(Block::Mine(text));
+            continue;
+        }
+        let sender = match n.role.as_deref() {
+            Some("user") => "user".to_string(),
+            _ => n
+                .participant_id
+                .and_then(|id| roster.iter().find(|p| p.id == id))
+                .map(|p| p.handle.clone())
+                .unwrap_or_else(|| "assistant".into()),
+        };
+        let line = crate::relevance::history_line(&sender, &text);
+        match blocks.last_mut() {
+            Some(Block::Said(lines)) => lines.push(line),
+            _ => blocks.push(Block::Said(vec![line])),
+        }
+    }
+
+    // Keep the newest turns. An unbounded history is a prompt that grows
+    // without limit, and the recent flow is what the agent is replying to.
+    let start = blocks.len().saturating_sub(MAX_CONTEXT_TURNS);
+    let blocks = &blocks[start..];
+
+    let mut out: Vec<agl::provider::Message> = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Said(lines) => out.push(agl::provider::Message::user(lines.join("\n"))),
+            Block::Mine(text) => out.push(agl::provider::Message::assistant(text.clone())),
+        }
+    }
+    // The last user turn is what this turn answers; anything after it would
+    // be this agent's own last word, which is not something to reply to.
+    let prompt = match out.last() {
+        Some(m) if m.role == "user" => {
+            let text = m
+                .content
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            out.pop();
+            text
+        }
+        // Nothing new since this agent last spoke. It should not have been
+        // asked, but a turn with no prompt is worse than a nudge.
+        _ => "(continue)".to_string(),
+    };
+    (out, prompt)
+}
+
+/// The conversation turns as one readable block, for the transcript's
+/// "Prompt sent" card.
+///
+/// The card exists to answer "what did the model actually receive?", and
+/// after the projection that is no longer one string — it is a list of
+/// turns. Showing only the last one would under-report by exactly the
+/// context the projection was added to supply.
+pub fn render_wire(msgs: &[agl::provider::Message]) -> String {
+    let mut out = String::new();
+    for m in msgs {
+        if m.role == "system" {
+            continue;
+        }
+        let text = m
+            .content
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        out.push_str(&format!("--- {} ---\n{}\n", m.role, text));
+    }
+    out
 }
 
 /// `@handle` mentions in a message, in order, de-duplicated.
@@ -130,6 +257,49 @@ pub fn mentions(text: &str) -> Vec<String> {
     out
 }
 
+/// What a seated agent's engagement decides, before anyone is asked.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Invite {
+    /// Named outright — it speaks whatever its engagement says.
+    Mentioned,
+    /// `engaged`: it speaks on every message.
+    Always,
+    /// `relevant`: a System One call decides. The caller makes it, because
+    /// this module stays free of I/O.
+    Ask,
+    /// `invoked` and not mentioned: it stays out.
+    Skip,
+}
+
+/// Round-0 invitations, one per active agent, from its engagement.
+///
+/// A mention always wins. Naming an agent is an unambiguous request for it,
+/// and making a `relevant` agent pass a relevance check before answering a
+/// direct question would be a bug the user cannot work around.
+pub fn invitations(
+    roster: &[Participant],
+    engagement_of: &dyn Fn(&Participant) -> Engagement,
+    trigger_text: &str,
+) -> Vec<(i64, Invite)> {
+    let named = mentions(trigger_text);
+    roster
+        .iter()
+        .filter(|p| p.is_agent() && p.active)
+        .map(|p| {
+            let invite = if named.contains(&p.handle) {
+                Invite::Mentioned
+            } else {
+                match engagement_of(p) {
+                    Engagement::Engaged => Invite::Always,
+                    Engagement::Relevant => Invite::Ask,
+                    Engagement::Invoked => Invite::Skip,
+                }
+            };
+            (p.id, invite)
+        })
+        .collect()
+}
+
 /// Who speaks in this round.
 ///
 /// Round 0: whoever the triggering message @-mentioned, or — when it
@@ -137,6 +307,10 @@ pub fn mentions(text: &str) -> Vec<String> {
 /// in this round* pulled in, and only if they have not spoken in it yet.
 /// That second rule is what makes a discussion terminate on its own: nobody
 /// new mentioned means nobody new speaks.
+///
+/// Round 0 here ignores engagement, and the caller uses [`invitations`]
+/// instead when the roster has definitions to consult. This remains the
+/// behaviour for a conversation whose agents have no definition at all.
 pub fn responders(
     roster: &[Participant],
     trigger_text: &str,
@@ -171,53 +345,6 @@ pub fn responders(
         .collect()
 }
 
-/// One room line, as a teammate reads it.
-///
-/// `tool_call`, `reasoning` and `gen_info` are deliberately absent: they are
-/// an agent's internal workings, and pasting them into a peer's prompt both
-/// wastes the budget and invites the peer to answer the tool instead of the
-/// person.
-fn format_line(node: &TreeNode, roster: &[Participant]) -> Option<String> {
-    let who = node
-        .participant_id
-        .and_then(|id| roster.iter().find(|p| p.id == id));
-    match node.kind.as_str() {
-        "context_window" => {
-            let text = node.content.as_deref()?;
-            match node.role.as_deref() {
-                Some("user") => Some(format!("User (user): {text}")),
-                Some("assistant") => {
-                    let h = who.map(|p| p.handle.as_str()).unwrap_or("assistant");
-                    Some(format!("@{h}: {text}"))
-                }
-                _ => None,
-            }
-        }
-        "tool_result" => {
-            let name = node
-                .payload
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("tool");
-            let raw = node.content.clone().unwrap_or_default();
-            let flat: String = raw.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
-            let short = truncate_chars(&flat, TOOL_SUMMARY_CHARS);
-            Some(format!("(tool: {name} → \"{short}\")"))
-        }
-        "error" => node.content.as_deref().map(|t| format!("(error: {t})")),
-        _ => None,
-    }
-}
-
-fn truncate_chars(s: &str, n: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", chars[..n].iter().collect::<String>())
-    }
-}
-
 /// Truncate to at most `max` **bytes**, on a character boundary.
 fn truncate_bytes(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -235,131 +362,6 @@ fn truncate_bytes(s: &str, max: usize) -> String {
         end = i;
     }
     format!("{}…", &s[..end])
-}
-
-/// Build the flattened group prompt for `me`.
-///
-/// Returns the prompt and the highest `seq` it covers. Packing is
-/// **newest-first** on purpose: when the budget runs out it is the oldest
-/// line that gets cut, because the newest line is the one being answered.
-/// The sentinel is not decoration — without it the model cannot tell a short
-/// history from a truncated one, and will happily refer to messages it never
-/// saw.
-pub fn flatten(
-    title: &str,
-    purpose: Option<&str>,
-    notes: Option<&str>,
-    me: &Participant,
-    roster: &[Participant],
-    delta: &[&TreeNode],
-    reply_required: bool,
-    how_you_got_here: &str,
-) -> (String, i64) {
-    let peers: Vec<String> = roster
-        .iter()
-        .filter(|p| p.id != me.id && p.active && p.is_agent())
-        .map(|p| format!("@{}", p.handle))
-        .collect();
-    let others = if peers.is_empty() {
-        "the user".to_string()
-    } else {
-        format!("{} and the user", peers.join(", "))
-    };
-
-    let mut opening = vec![
-        format!(
-            "[Conversation: \"{title}\"] You are @{}, one participant with {others}.",
-            me.handle
-        ),
-        String::new(),
-    ];
-    if let Some(p) = purpose.filter(|s| !s.trim().is_empty()) {
-        opening.push(format!("Conversation purpose (set by the user): {p}"));
-    }
-    if let Some(n) = notes.filter(|s| !s.trim().is_empty()) {
-        opening.push(
-            "Conversation notes (shared with every participant):".to_string(),
-        );
-        for line in n.lines() {
-            opening.push(format!("  {line}"));
-        }
-    }
-    if opening.len() > 2 {
-        opening.push(String::new());
-    }
-    opening.push("New messages on this branch since your last turn (oldest first):".to_string());
-
-    let mut rules = vec![String::new(), "Rules for this conversation:".to_string()];
-    if reply_required {
-        rules.push(format!(
-            "  - {how_you_got_here} Reply with your answer, result, or concrete blocker."
-        ));
-        rules.push(format!(
-            "  - Do not return \"{PASS}\". If you cannot proceed, explain why and what you need from the user."
-        ));
-    } else {
-        rules.push(
-            "  - Reply with one conversational message only when you have something new worth adding."
-                .to_string(),
-        );
-        rules.push(format!(
-            "  - If you have nothing new to add, reply with exactly \"{PASS}\"."
-        ));
-    }
-    rules.push(
-        "  - Mention a teammate by handle to pull them into the next round; do not repeat points already made."
-            .to_string(),
-    );
-    rules.push("  - Your reply is published to every participant verbatim.".to_string());
-
-    // The framing is counted once; whatever is left is the history budget.
-    let fixed = opening.join("\n").len() + rules.join("\n").len();
-    let mut available = MAX_PROMPT_BYTES.saturating_sub(fixed + 1);
-
-    // Only the newest `MAX_DELTA_LINES` are candidates at all.
-    let window: Vec<&&TreeNode> = delta.iter().rev().take(MAX_DELTA_LINES).collect();
-    let mut seen_through = 0i64;
-    for n in &window {
-        seen_through = seen_through.max(n.seq);
-    }
-
-    let mut selected: Vec<String> = Vec::new();
-    let mut truncated_any = false;
-    for node in &window {
-        let Some(body) = format_line(node, roster) else { continue };
-        let line = format!("  {body}");
-        if line.len() > available {
-            // The oldest line that would not fit: keep a truncated head of it
-            // when there is room worth keeping, then stop.
-            if selected.is_empty() && available > 32 {
-                selected.push(truncate_bytes(&line, available));
-            }
-            truncated_any = true;
-            break;
-        }
-        available -= line.len() + 1;
-        selected.push(line);
-    }
-    if truncated_any {
-        selected.push("  [Earlier messages on this branch were omitted to fit this turn.]".into());
-    }
-    selected.reverse();
-    if selected.is_empty() {
-        selected.push("  (nothing new)".to_string());
-    }
-
-    let mut parts = opening;
-    parts.extend(selected);
-    parts.extend(rules);
-    let prompt = parts.join("\n");
-    // The cap is a hard one; a prompt over it is a bug upstream, and sending
-    // it anyway would fail at the provider with a far less useful message.
-    let prompt = if prompt.len() > MAX_PROMPT_BYTES {
-        truncate_bytes(&prompt, MAX_PROMPT_BYTES)
-    } else {
-        prompt
-    };
-    (prompt, seen_through)
 }
 
 /// `sha256` of the coordinates a prompt is a pure function of.
@@ -419,37 +421,89 @@ pub fn plan(
     let cursor = store.cursor(conv).unwrap_or_default();
     let (watermark, _, _, _) = store.participant_view(conv, me.id);
 
-    // The delta: what is new on this branch, minus this participant's own
-    // nodes — those are in its private history already, and showing an agent
-    // its own words twice is how you teach it to repeat itself.
-    let delta: Vec<&TreeNode> = path
-        .iter()
-        .filter(|n| n.seq > watermark && n.visible && n.participant_id != Some(me.id))
-        .collect();
+    // The definition's current identity, not the copy taken when the agent
+    // was seated. Editing an agent has to change how it behaves in the
+    // conversations it is already in — the same rule `engagement` follows —
+    // and a stale snapshot would make the editor appear to do nothing. The
+    // stored prompt is the fallback for a seat with no definition behind it
+    // (one added by hand, or whose agent was deleted).
+    let identity = me
+        .agent_name
+        .as_deref()
+        .and_then(|n| store.agents().get(n))
+        .map(|d| d.system_prompt())
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| me.system_prompt.clone());
+    let name = if me.display_name.trim().is_empty() {
+        me.handle.clone()
+    } else {
+        me.display_name.clone()
+    };
 
-    let (prompt, seen_through) = flatten(
-        &title,
-        purpose.as_deref(),
-        notes.as_deref(),
-        me,
-        &roster,
-        &delta,
-        reply_required,
-        how_you_got_here,
-    );
-    let seen_through = if seen_through == 0 { watermark } else { seen_through };
+    // The conversation as this participant sees it. Not a watermark delta:
+    // an agent given only what is new since it last looked has no sense of
+    // how the conversation got here, which is most of what tells it whether
+    // its answer still fits.
+    let (context, prompt) = project(&path, me.id, &roster);
+
+    let mut system = preamble(&name, &identity);
+    if let Some(p) = purpose.filter(|s| !s.trim().is_empty()) {
+        system.push_str(&format!("\n**Purpose:** {p}\n"));
+    }
+    if let Some(n) = notes.filter(|s| !s.trim().is_empty()) {
+        system.push_str("\n**Notes:**\n");
+        for line in n.lines() {
+            system.push_str(&format!("{line}\n"));
+        }
+    }
+    system.push_str(&rules_section(reply_required, how_you_got_here, title.as_str()));
+
+    let seen_through = path.last().map(|n| n.seq).unwrap_or(watermark);
     let task_id = task_id(conv, me.id, &cursor, watermark, round_index, &prompt);
     Some(Task {
         participant_id: me.id,
         handle: me.handle.clone(),
-        system_prompt: me.system_prompt.clone(),
-        history: store.own_session(me.id),
+        system_prompt: system,
+        context,
         prompt,
         round_index,
         reply_required,
         seen_through_seq: seen_through,
         task_id,
     })
+}
+
+/// The standing instructions, as the tail of the system prompt.
+///
+/// In the system prompt rather than appended to the user turn, so the
+/// conversation turns stay pure conversation — which is the point of
+/// projecting them in the first place. They are kept, and not folded into
+/// the identity, because the `(pass)` protocol is a *protocol*: an agent
+/// never told it may pass will never pass, and the round machinery reads
+/// that reply.
+fn rules_section(reply_required: bool, how_you_got_here: &str, title: &str) -> String {
+    let mut out = String::from("\n## How to reply\n\n");
+    if !title.trim().is_empty() && title != "untitled" {
+        out.push_str(&format!("This conversation is called \"{title}\".\n\n"));
+    }
+    if reply_required {
+        let how = how_you_got_here.trim();
+        if !how.is_empty() {
+            out.push_str(&format!("- {how}\n"));
+        }
+        out.push_str("- Reply with your answer, result, or concrete blocker.\n");
+        out.push_str(&format!(
+            "- Do not return \"{PASS}\". If you cannot proceed, say why and what you need.\n"
+        ));
+    } else {
+        out.push_str("- Reply only when you have something new worth adding.\n");
+        out.push_str(&format!(
+            "- If you have nothing to add, reply with exactly \"{PASS}\".\n"
+        ));
+    }
+    out.push_str("- Do not repeat points already made.\n");
+    out.push_str("- Reply as yourself, in your own voice, with no [sender] prefix.\n");
+    out
 }
 
 /// Did the participant decline to speak?
@@ -616,6 +670,7 @@ mod tests {
             seat: id,
             active: true,
             role: Some("member".into()),
+            engagement: None,
         }
     }
 
@@ -634,6 +689,55 @@ mod tests {
         let roster = vec![seat("user", 1, "user"), seat("agent", 2, "alice"), seat("agent", 3, "bob")];
         assert_eq!(responders(&roster, "deploy is failing", 0, &[], &[]), vec![2, 3]);
         assert_eq!(responders(&roster, "@bob can you look?", 0, &[], &[]), vec![3]);
+    }
+
+    #[test]
+    fn engagement_decides_who_is_invited_in_round_zero() {
+        let roster = vec![
+            seat("user", 1, "user"),
+            seat("agent", 2, "quiet"),   // invoked
+            seat("agent", 3, "maybe"),   // relevant
+            seat("agent", 4, "eager"),   // engaged
+        ];
+        let eng = |p: &Participant| match p.handle.as_str() {
+            "maybe" => Engagement::Relevant,
+            "eager" => Engagement::Engaged,
+            _ => Engagement::Invoked,
+        };
+        let got = invitations(&roster, &eng, "anyone around?");
+        assert_eq!(
+            got,
+            vec![
+                (2, Invite::Skip),   // invoked, not named: stays out
+                (3, Invite::Ask),    // relevant: the decider is asked
+                (4, Invite::Always), // engaged: always speaks
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mention_overrides_every_engagement() {
+        let roster = vec![
+            seat("user", 1, "user"),
+            seat("agent", 2, "quiet"),
+            seat("agent", 3, "maybe"),
+        ];
+        let eng = |p: &Participant| match p.handle.as_str() {
+            "maybe" => Engagement::Relevant,
+            _ => Engagement::Invoked,
+        };
+        let got = invitations(&roster, &eng, "@quiet @maybe thoughts?");
+        // Naming an agent is an unambiguous request for it; making a
+        // `relevant` one pass a check first would be unfixable from the UI.
+        assert_eq!(got, vec![(2, Invite::Mentioned), (3, Invite::Mentioned)]);
+    }
+
+    #[test]
+    fn an_inactive_agent_is_never_invited() {
+        let mut roster = vec![seat("user", 1, "user"), seat("agent", 2, "gone")];
+        roster[1].active = false;
+        let eng = |_: &Participant| Engagement::Engaged;
+        assert!(invitations(&roster, &eng, "@gone hello").is_empty());
     }
 
     #[test]
@@ -696,229 +800,222 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        // Agents are invited, never assumed — a new conversation is the
+        // user alone, so the room's two agents are seated here.
+        store.add_participant(&id, "agent", "alice", Some("Alice"), Some("alice"), None, "You are Alice.", None, None);
         store.add_participant(&id, "agent", "bob", Some("Bob"), Some("bob"), None, "You are Bob.", None, None);
         let roster = store.participants(&id);
         (store, id, roster)
     }
 
-    #[test]
-    fn a_participant_sees_peers_as_text_lines_never_as_roles() {
-        let (store, id, roster) = room();
-        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
-        let bob = roster.iter().find(|p| p.handle == "bob").unwrap().clone();
-
-        store
-            .append_event(
-                &id,
-                NewEvent::new("context_window", json!({"role":"user","content":"deploy is failing"})),
-            )
-            .unwrap();
-        store
-            .append_event(
-                &id,
-                NewEvent {
-                    event_type: "context_window".into(),
-                    payload: json!({"role":"assistant","content":"rollback failed at 14:02"}),
-                    speaker: Some(bob.id),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-        let task = plan(&store, &id, &alice, 0, true, "The user directly addressed you.").unwrap();
-        assert!(task.prompt.contains("You are @alice, one participant with @bob and the user."));
-        assert!(task.prompt.contains("  User (user): deploy is failing"));
-        assert!(task.prompt.contains("  @bob: rollback failed at 14:02"));
-        assert!(task.prompt.contains("Do not return \"(pass)\""));
-
-        // The wire format: exactly one system message, then alice's own
-        // history (empty here), then ONE user message carrying the room.
-        let msgs = task.messages();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].role, "system");
-        assert_eq!(msgs[1].role, "user");
-        // Bob's line is inside that user message, not a role of its own.
-        assert!(msgs.iter().all(|m| m.role != "assistant"));
-    }
-
-    #[test]
-    fn a_participant_does_not_see_its_own_messages_in_the_group_delta() {
-        let (store, id, roster) = room();
-        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
-        store
-            .append_event(
-                &id,
-                NewEvent {
-                    event_type: "context_window".into(),
-                    payload: json!({"role":"assistant","content":"ALICE SAID THIS"}),
-                    speaker: Some(alice.id),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let task = plan(&store, &id, &alice, 1, false, "").unwrap();
-        // It belongs in her private history, not twice in the room summary.
-        assert!(!task.prompt.contains("ALICE SAID THIS"));
-    }
-
-    #[test]
-    fn the_watermark_is_what_stops_a_message_arriving_twice() {
-        let (store, id, roster) = room();
-        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
-        let first = store
-            .append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"one"})))
-            .unwrap();
-        let t1 = plan(&store, &id, &alice, 0, true, "x").unwrap();
-        assert!(t1.prompt.contains("one"));
-
-        // Alice has now seen up to that node.
-        let seq = store.node(&first.event_id).unwrap().seq;
-        store.set_participant_view(&id, alice.id, seq, 0, false, None, None);
-        store
-            .append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"two"})))
-            .unwrap();
-        let t2 = plan(&store, &id, &alice, 0, true, "x").unwrap();
-        assert!(t2.prompt.contains("two"));
-        assert!(!t2.prompt.contains("User (user): one"), "already seen");
-    }
-
-    #[test]
-    fn own_history_is_replayed_verbatim_so_the_prompt_cache_holds() {
-        let (store, id, roster) = room();
-        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
-        store.append_own_turn(&id, alice.id, "PROMPT 1", "REPLY 1", None);
-        store.append_own_turn(&id, alice.id, "PROMPT 2", "REPLY 2", None);
-        let task = plan(&store, &id, &alice, 1, false, "").unwrap();
-        let msgs = task.messages();
-        assert_eq!(msgs.len(), 6, "system + 2 pairs + the current prompt");
-        let txt = |m: &agl::provider::Message| {
-            m.content.as_ref().and_then(|v| v.as_str()).unwrap_or("").to_string()
-        };
-        assert_eq!(txt(&msgs[1]), "PROMPT 1");
-        assert_eq!(txt(&msgs[2]), "REPLY 1");
-        assert_eq!(txt(&msgs[3]), "PROMPT 2");
-        assert_eq!(txt(&msgs[4]), "REPLY 2");
-        // Stable prefix: only the last message differs between turns.
-        let again = plan(&store, &id, &alice, 1, false, "").unwrap().messages();
-        assert_eq!(
-            msgs[..5].iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
-            again[..5].iter().map(|m| m.content.clone()).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn a_tool_result_reaches_a_teammate_as_a_short_summary() {
-        let (store, id, roster) = room();
-        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
-        let bob = roster.iter().find(|p| p.handle == "bob").unwrap().clone();
-        store
-            .append_event(
-                &id,
-                NewEvent {
-                    event_type: "tool_result".into(),
-                    payload: json!({"name":"list_dir","text":"a\nb\nc","ok":true}),
-                    speaker: Some(bob.id),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        // A tool CALL is internal and must not leak into a peer's prompt.
-        store
-            .append_event(
-                &id,
-                NewEvent {
-                    event_type: "tool_call".into(),
-                    payload: json!({"name":"list_dir","args":{"path":"/secret"},"id":"call_1"}),
-                    speaker: Some(bob.id),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let task = plan(&store, &id, &alice, 0, true, "x").unwrap();
-        assert!(task.prompt.contains("(tool: list_dir → \"a b c\")"));
-        assert!(!task.prompt.contains("/secret"));
-    }
-
-    #[test]
-    fn the_delta_keeps_the_newest_lines_and_says_so_when_it_cuts() {
-        let roster = vec![seat("user", 1, "user"), seat("agent", 2, "alice")];
-        let me = roster[1].clone();
-        // More lines than the cap, numbered so we can see which survived.
-        let nodes: Vec<TreeNode> = (0..MAX_DELTA_LINES + 6)
-            .map(|i| TreeNode {
-                id: format!("n{i}"),
-                parent_id: None,
-                seq: i as i64 + 1,
-                depth: 1,
-                kind: "context_window".into(),
-                participant_id: Some(1),
-                content: Some(format!("line {i}")),
-                role: Some("user".into()),
-                payload: json!({"role":"user","content":format!("line {i}")}),
-                meta: Default::default(),
-                visible: true,
-                goto: None,
-                ts: "t".into(),
-                duration_ms: None,
+    /// Everything `plan` produced, as `(role, text)`.
+    fn wire(t: &Task) -> Vec<(String, String)> {
+        t.messages()
+            .iter()
+            .map(|m| {
+                (
+                    m.role.clone(),
+                    m.content
+                        .as_ref()
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                )
             })
-            .collect();
-        let refs: Vec<&TreeNode> = nodes.iter().collect();
-        let (prompt, seen) = flatten("T", None, None, &me, &roster, &refs, false, "");
-        assert_eq!(seen, nodes.last().unwrap().seq);
-        let kept = prompt.matches("line ").count();
-        assert_eq!(kept, MAX_DELTA_LINES, "capped at the newest 24");
-        assert!(prompt.contains(&format!("line {}", MAX_DELTA_LINES + 5)), "newest kept");
-        assert!(!prompt.contains("line 0"), "oldest dropped");
-        assert!(prompt.contains("If you have nothing new to add"), "pass-allowed variant");
+            .collect()
+    }
+
+    fn say(store: &ConvStore, id: &str, role: &str, who: Option<i64>, text: &str) {
+        store
+            .append_event(
+                id,
+                NewEvent {
+                    event_type: "context_window".into(),
+                    payload: json!({ "role": role, "content": text }),
+                    speaker: who,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
     }
 
     #[test]
-    fn an_oversized_line_is_truncated_with_the_omission_sentinel() {
-        let roster = vec![seat("user", 1, "user"), seat("agent", 2, "alice")];
-        let me = roster[1].clone();
-        let huge = "x".repeat(MAX_PROMPT_BYTES * 2);
-        let node = TreeNode {
-            id: "n".into(),
-            parent_id: None,
-            seq: 1,
-            depth: 1,
-            kind: "context_window".into(),
-            participant_id: Some(1),
-            content: Some(huge.clone()),
-            role: Some("user".into()),
-            payload: json!({"role":"user","content":huge}),
-            meta: Default::default(),
-            visible: true,
-            goto: None,
-            ts: "t".into(),
-            duration_ms: None,
-        };
-        let refs = vec![&node];
-        let (prompt, _) = flatten("T", None, None, &me, &roster, &refs, true, "x");
-        assert!(prompt.len() <= MAX_PROMPT_BYTES, "the hard cap holds");
-        // Without this the model would cite messages it never saw.
-        assert!(prompt.contains("omitted to fit this turn"));
-    }
+    fn the_agent_gets_the_flow_of_the_conversation_not_just_the_last_line() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        let bob = roster.iter().find(|p| p.handle == "bob").unwrap().clone();
 
-    #[test]
-    fn purpose_and_notes_appear_once_as_framing() {
-        let roster = vec![seat("user", 1, "user"), seat("agent", 2, "alice")];
-        let me = roster[1].clone();
-        let (prompt, _) = flatten(
-            "Room",
-            Some("Coordinate incident response."),
-            Some("Runbooks live in /ops.\nNever paste secrets."),
-            &me,
-            &roster,
-            &[],
-            true,
-            "The user directly addressed you.",
+        say(&store, &id, "user", None, "what time is it");
+        say(&store, &id, "assistant", Some(alice.id), "about three");
+        say(&store, &id, "user", None, "i might go to the market");
+        say(&store, &id, "assistant", Some(bob.id), "bring a bag");
+        say(&store, &id, "user", None, "maybe some fish");
+
+        let task = plan(&store, &id, &alice, 0, true, "x").unwrap();
+        let w = wire(&task);
+
+        // Its own words are its own turns; everyone else's — the human and
+        // the other agent alike — are `[sender]`-prefixed user turns,
+        // consecutive ones coalesced into one.
+        assert_eq!(
+            w.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(),
+            vec!["system", "user", "assistant", "user"]
         );
-        assert!(prompt.contains("Conversation purpose (set by the user): Coordinate incident response."));
-        assert!(prompt.contains("  Runbooks live in /ops."));
-        assert!(prompt.contains("  Never paste secrets."));
-        assert_eq!(prompt.matches("Coordinate incident response").count(), 1);
-        assert!(prompt.contains("(nothing new)"));
+        assert_eq!(w[1].1, "[user] what time is it");
+        assert_eq!(w[2].1, "about three");
+        assert_eq!(
+            w[3].1,
+            "[user] i might go to the market\n[bob] bring a bag\n[user] maybe some fish"
+        );
+        // The turn it is answering is the last user block, not only the
+        // final message — the context around it is the point.
+        assert_eq!(task.prompt, w[3].1);
+    }
+
+    #[test]
+    fn the_system_prompt_names_the_agent_and_introduces_the_format() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        say(&store, &id, "user", None, "hello");
+        let task = plan(&store, &id, &alice, 0, true, "The user addressed you.").unwrap();
+        let sys = &task.system_prompt;
+
+        assert!(sys.starts_with("Your name is Alice.\n"), "{sys}");
+        assert!(sys.contains("You are Alice."), "the identity: {sys}");
+        assert!(sys.contains("## Conversation History"));
+        assert!(sys.contains("**Session type:** Multi-user thread"));
+        // The `(pass)` protocol is a protocol: an agent never told it may
+        // pass will never pass, and the round machinery reads that reply.
+        assert!(sys.contains("Do not return \"(pass)\""), "{sys}");
+        assert!(sys.contains("The user addressed you."));
+        // …and the other way round in a later round.
+        let later = plan(&store, &id, &alice, 1, false, "").unwrap().system_prompt;
+        assert!(later.contains("reply with exactly \"(pass)\""), "{later}");
+        assert!(!later.contains("Do not return"));
+    }
+
+    #[test]
+    fn an_agents_own_messages_come_back_as_its_own_turns() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        say(&store, &id, "user", None, "q1");
+        say(&store, &id, "assistant", Some(alice.id), "ALICE SAID THIS");
+        say(&store, &id, "user", None, "q2");
+
+        let w = wire(&plan(&store, &id, &alice, 0, true, "x").unwrap());
+        // Not a `[alice] …` line in somebody else's block: its own words are
+        // its own turns, which is the shape a chat model is trained on.
+        assert!(w.iter().any(|(r, t)| r == "assistant" && t == "ALICE SAID THIS"));
+        assert!(!w.iter().any(|(_, t)| t.contains("[alice]")));
+    }
+
+    #[test]
+    fn purpose_and_notes_ride_in_the_system_prompt() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        let mut patch = serde_json::Map::new();
+        patch.insert("purpose".into(), json!("Coordinate incident response."));
+        patch.insert("notes".into(), json!("Runbooks live in /ops.\nNever paste secrets."));
+        store.update_meta(&id, patch);
+        say(&store, &id, "user", None, "hi");
+
+        let sys = plan(&store, &id, &alice, 0, true, "x").unwrap().system_prompt;
+        assert!(sys.contains("Coordinate incident response."));
+        assert!(sys.contains("Runbooks live in /ops."));
+        assert!(sys.contains("Never paste secrets."));
+        // Standing framing belongs in the system prompt, said once.
+        assert_eq!(sys.matches("Coordinate incident response").count(), 1);
+    }
+
+    #[test]
+    fn only_the_recent_turns_are_carried() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        // Alternating, so each message is its own block.
+        for i in 0..(MAX_CONTEXT_TURNS + 10) {
+            say(&store, &id, "user", None, &format!("u{i}"));
+            say(&store, &id, "assistant", Some(alice.id), &format!("a{i}"));
+        }
+        say(&store, &id, "user", None, "newest");
+
+        let task = plan(&store, &id, &alice, 0, true, "x").unwrap();
+        // An unbounded history is a prompt that grows without limit.
+        assert_eq!(task.context.len(), MAX_CONTEXT_TURNS - 1);
+        assert_eq!(task.prompt, "[user] newest");
+        let w = wire(&task);
+        assert!(!w.iter().any(|(_, t)| t.contains("u0")), "oldest dropped");
+    }
+
+    #[test]
+    fn a_seat_follows_its_agents_current_definition() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        say(&store, &id, "user", None, "hi");
+        assert!(plan(&store, &id, &alice, 0, true, "x")
+            .unwrap()
+            .system_prompt
+            .contains("You are Alice."));
+
+        // Editing an agent must change how it behaves in conversations it
+        // is already in.
+        let mut def = crate::agent_loader::AgentDef {
+            name: "alice".into(),
+            soul: "You are Alice, rewritten.".into(),
+            ..Default::default()
+        };
+        store.agents().save(&def, None).unwrap();
+        def.goals = "Ship it.".into();
+        store.agents().save(&def, Some("alice")).unwrap();
+
+        let sys = plan(&store, &id, &alice, 0, true, "x").unwrap().system_prompt;
+        assert!(sys.contains("You are Alice, rewritten."), "{sys}");
+        assert!(sys.contains("Ship it."), "goals reach the prompt: {sys}");
+    }
+
+    #[test]
+    fn a_seat_with_no_definition_keeps_the_prompt_it_was_given() {
+        let (store, id, _) = room();
+        let p = store
+            .add_participant(&id, "agent", "adhoc", Some("Adhoc"), None, None, "You are Adhoc.", None, None)
+            .unwrap();
+        say(&store, &id, "user", None, "hi");
+        let sys = plan(&store, &id, &p, 0, true, "x").unwrap().system_prompt;
+        assert!(sys.starts_with("Your name is Adhoc.\n"));
+        assert!(sys.contains("You are Adhoc."));
+    }
+
+    #[test]
+    fn a_hidden_node_is_not_in_anyone_s_prompt() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        let e = store
+            .append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"REDACTED"})))
+            .unwrap();
+        store.set_visibility(&e.event_id, false);
+        say(&store, &id, "user", None, "visible one");
+        let task = plan(&store, &id, &alice, 0, true, "x").unwrap();
+        let all = wire(&task)
+            .iter()
+            .map(|(_, t)| t.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains("REDACTED"));
+        assert!(all.contains("visible one"));
+    }
+
+    #[test]
+    fn the_decider_and_the_turn_share_one_preamble() {
+        let p = preamble("Fish", "You like Cajun food.");
+        assert!(p.starts_with("Your name is Fish.\n"));
+        assert!(p.contains("You like Cajun food."));
+        assert!(p.contains("## Conversation History"));
+        assert!(p.contains("**Session type:** Multi-user thread"));
+        // An agent should decide whether to speak from the picture it would
+        // speak from, so this is the one place the framing is written.
+        assert!(crate::relevance::build_state("Fish", "You like Cajun food.", &[])
+            .starts_with(&p));
+        // No stray blank section when there is no identity.
+        assert!(!preamble("x", "").contains("\n\n\n"));
     }
 
     #[test]
@@ -955,15 +1052,5 @@ mod tests {
         assert!(p.contains("\"assign\""));
     }
 
-    #[test]
-    fn a_hidden_node_is_not_in_anyone_s_prompt() {
-        let (store, id, roster) = room();
-        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
-        let e = store
-            .append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"REDACTED"})))
-            .unwrap();
-        store.set_visibility(&e.event_id, false);
-        let task = plan(&store, &id, &alice, 0, true, "x").unwrap();
-        assert!(!task.prompt.contains("REDACTED"));
-    }
+
 }
