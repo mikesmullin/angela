@@ -157,11 +157,117 @@ impl McpPool {
         (out, errors)
     }
 
+    /// [`ensure`](Self::ensure), as seen from inside the session's sandbox.
+    ///
+    /// A sandbox is a property of the **session**, not of an agent: an
+    /// isolation layer that constrains every participant in it. So this is
+    /// not a per-agent substitution of one server for another — it is the
+    /// session's filesystem and shell, and it applies the same way to
+    /// whoever is speaking.
+    ///
+    /// Two consequences, and they are separate:
+    ///
+    /// * The two servers whose whole meaning is "where the files and the
+    ///   shell are" are **removed** from every participant, whether or not
+    ///   this particular one was configured with them. A conversation
+    ///   working in a sandbox must not also be able to read and write this
+    ///   machine — through any of its participants.
+    /// * The sandbox's own `read` / `write` / `bash` are **present** for
+    ///   every participant, likewise whether or not this one had host file
+    ///   tools. Inside the boundary that is the point of the boundary: the
+    ///   capability is already constrained by the container, and an agent
+    ///   that cannot see the session's working tree cannot take part in
+    ///   work happening there.
+    ///
+    /// Every other server — the browser, the researcher, the camera — is
+    /// untouched, because none of them is about *this* host's filesystem.
+    ///
+    /// An unreachable sandbox is an **error, not a fallback**. Silently
+    /// leaving the host tools in place would mean a conversation the user
+    /// believes is sandboxed quietly writing to their machine, which is the
+    /// worst outcome available here.
+    pub fn ensure_in_sandbox(
+        &self,
+        names: &[String],
+        project_root: &std::path::Path,
+        sandbox: &str,
+    ) -> (Vec<Arc<McpServer>>, Vec<String>) {
+        if sandbox.trim().is_empty() {
+            return self.ensure(names, project_root);
+        }
+        let kept: Vec<String> = names
+            .iter()
+            .filter(|n| !DISPLACED_BY_SANDBOX.contains(&n.as_str()))
+            .cloned()
+            .collect();
+        let (mut out, mut errors) = self.ensure(&kept, project_root);
+
+        // Unconditional: the sandbox is the session's, so every participant
+        // addresses it, including one whose own `mcp` list named no file or
+        // shell server. The earlier version attached it only to agents that
+        // had host tools to displace, which made the isolation layer look
+        // per-agent and left the other participants unable to see the very
+        // tree the session is working in.
+        let url = sandbox_rpc_url(sandbox);
+        match self.get_or_connect(&format!("sandbox:{sandbox}"), || {
+            crate::mcp::connect_http(SANDBOX_SERVER, &url, CONNECT_TIMEOUT)
+                .map_err(|e| format!("sandbox `{sandbox}`: {e}"))
+        }) {
+            Ok(srv) => out.push(srv),
+            Err(e) => errors.push(format!(
+                "{e} — this conversation is assigned to that sandbox, so its file \
+                 and shell tools are unavailable. They have NOT fallen back to this \
+                 machine."
+            )),
+        }
+        (out, errors)
+    }
+
     pub fn shutdown(&self) {
         for (_, s) in self.servers.lock().unwrap().drain() {
             if let Ok(s) = s { s.close(); }
         }
     }
+}
+
+/// The servers a sandbox assignment takes over from.
+///
+/// Exactly the two that mean "the filesystem" and "the shell". Listed rather
+/// than inferred: a server is displaced because of what it *is*, and there
+/// is no property of an MCP server that says so.
+pub const DISPLACED_BY_SANDBOX: &[&str] = &["file-io", "term-local"];
+
+/// What the sandbox's server is called, and therefore the prefix its tools
+/// wear: `sandbox__bash`, `sandbox__read`, `sandbox__write`.
+///
+/// Deliberately **not** `file-io` / `term-local`. Borrowing those names
+/// would keep existing allowlists working, at the cost of a tool called
+/// `file_io__read_file` that reads a different machine's files — and a
+/// schema that is not quite the one that name has always had. A tool whose
+/// name lies is worse than one an allowlist has to learn.
+pub const SANDBOX_SERVER: &str = "sandbox";
+
+/// Where a sandbox has the session's checkout mounted.
+///
+/// One fixed guest path, so an agent's instructions never have to vary with
+/// which repo happens to be attached. It lives here, beside the server
+/// name, because both halves need it and they are in different crates: the
+/// chat server builds the bind mount from it, and
+/// [`environment::section`](crate::environment::section) tells the agent
+/// about it. Two spellings of this would be a sandbox whose files the agent
+/// cannot find.
+pub const SANDBOX_MOUNT: &str = "/work";
+
+/// Where sbox serves one sandbox's tools.
+///
+/// The `exec` facade, not `mcp`: `exec` is the guest's file-and-shell
+/// daemon, which is what is being substituted here. `mcp` is the desktop
+/// surface — screenshots and clicks — and is a different capability that a
+/// headless box does not even have.
+fn sandbox_rpc_url(sandbox: &str) -> String {
+    let host = std::env::var("SBOX_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port = std::env::var("SBOX_PORT").unwrap_or_else(|_| "3000".into());
+    format!("http://{host}:{port}/api/orchestration/sandboxes/{sandbox}/exec/rpc")
 }
 
 /// The default when the client names no model. Matches the JS fallback chain
@@ -744,7 +850,12 @@ pub fn run_turn(
 
     // Tools come up before the model is told they exist.
     let root = std::path::Path::new(project_root);
-    let (servers, mcp_errors) = pool.ensure(&def.mcp, root);
+    // Which machine "the filesystem" means for this conversation.
+    let sandbox = store
+        .load(&session_id)
+        .and_then(|s| s.get("sandboxId").and_then(|v| v.as_str().map(str::to_string)))
+        .unwrap_or_default();
+    let (servers, mcp_errors) = pool.ensure_in_sandbox(&def.mcp, root, &sandbox);
     for e in &mcp_errors {
         let _ = store.append_event(&session_id, NewEvent::new("error", json!({ "message": e })));
         emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
@@ -1094,6 +1205,93 @@ pub fn run_turn(
 
 #[cfg(test)]
 mod tests {
+    /// End to end against a **live** sandbox:
+    /// `SBOX_TEST_ID=<ready id> cargo test -- --ignored swapped_for_sandbox`
+    ///
+    /// The thing worth proving is not that a list was filtered — it is that
+    /// what the model ends up holding are the *guest's* tools, under names
+    /// that say so, with the host's file and shell tools gone.
+    #[test]
+    #[ignore]
+    fn a_sandbox_is_the_whole_session_s_files_and_shell() {
+        let Ok(id) = std::env::var("SBOX_TEST_ID") else {
+            panic!("set SBOX_TEST_ID to a ready sandbox");
+        };
+        let names: Vec<String> = ["file-io", "term-local"].iter().map(|s| s.to_string()).collect();
+        let root = std::env::var("ANGELA_ROOT").unwrap_or_else(|_| "/workspace/psicom/chat".into());
+        let pool = McpPool::default();
+
+        let (plain, _) = pool.ensure(&names, std::path::Path::new(&root));
+        let host: Vec<String> = plain.iter().map(|s| s.name.clone()).collect();
+        assert!(host.contains(&"file-io".to_string()), "host servers were {host:?}");
+
+        let (swapped, errors) =
+            pool.ensure_in_sandbox(&names, std::path::Path::new(&root), &id);
+        assert!(errors.is_empty(), "{errors:?}");
+        let got: Vec<String> = swapped.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(got, vec!["sandbox".to_string()], "servers were {got:?}");
+
+        let tools: Vec<String> = swapped[0]
+            .tools
+            .iter()
+            .map(|t| crate::mcp_presets::prefixed_tool_name("sandbox", &t.name))
+            .collect();
+        assert!(tools.contains(&"sandbox__bash".to_string()), "{tools:?}");
+        assert!(tools.contains(&"sandbox__read".to_string()), "{tools:?}");
+        // The host's are gone, not merely shadowed.
+        assert!(!tools.iter().any(|t| t.starts_with("file_io__")), "{tools:?}");
+        assert!(!tools.iter().any(|t| t.starts_with("term_local__")), "{tools:?}");
+
+        // Session-wide, not per-agent: a participant whose own `mcp` list
+        // named no file or shell server still works in the session's
+        // sandbox, because the sandbox is the session's filesystem and the
+        // participant is in the session.
+        let others: Vec<String> = ["web-researcher"].iter().map(|s| s.to_string()).collect();
+        let (also, errors) =
+            pool.ensure_in_sandbox(&others, std::path::Path::new(&root), &id);
+        assert!(errors.is_empty(), "{errors:?}");
+        let got: Vec<String> = also.iter().map(|s| s.name.clone()).collect();
+        assert!(got.contains(&"sandbox".to_string()), "servers were {got:?}");
+        assert!(got.contains(&"web-researcher".to_string()), "servers were {got:?}");
+    }
+
+    /// The swap is about *which machine*, so it must take exactly the two
+    /// servers that mean "this machine's files and shell" and leave
+    /// everything else alone. A browser or a researcher is not a filesystem.
+    #[test]
+    fn a_sandbox_displaces_the_host_file_and_shell_servers_and_nothing_else() {
+        let names: Vec<String> = ["file-io", "term-local", "web-researcher", "camera"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let kept: Vec<&String> = names
+            .iter()
+            .filter(|n| !super::DISPLACED_BY_SANDBOX.contains(&n.as_str()))
+            .collect();
+        assert_eq!(kept, vec!["web-researcher", "camera"]);
+    }
+
+    /// The guest's file-and-shell daemon, not the desktop surface: a
+    /// headless sandbox has no desktop, and `read`/`write`/`bash` are what
+    /// is being substituted.
+    #[test]
+    fn the_sandbox_url_points_at_the_exec_facade() {
+        let u = super::sandbox_rpc_url("sandbox2-abc");
+        assert!(u.ends_with("/api/orchestration/sandboxes/sandbox2-abc/exec/rpc"), "{u}");
+        assert!(!u.contains("/mcp/"), "{u}");
+    }
+
+    /// With no sandbox assigned nothing is displaced — the overwhelming
+    /// majority of conversations, and the path that must not change.
+    #[test]
+    fn no_sandbox_means_the_ordinary_server_list() {
+        let pool = McpPool::default();
+        let (servers, errors) =
+            pool.ensure_in_sandbox(&[], std::path::Path::new("/tmp"), "   ");
+        assert!(servers.is_empty());
+        assert!(errors.is_empty());
+    }
+
     use super::*;
 
     #[test]
@@ -1517,7 +1715,14 @@ pub fn run_round(
                 continue;
             }
             let root = std::path::Path::new(project_root);
-            let (servers, mcp_errors) = pool.ensure(&participant_def.mcp, root);
+            // The sandbox belongs to the conversation, not to the agent, so
+            // every participant in a group works in the same box.
+            let sandbox = store
+                .load(&conv)
+                .and_then(|s| s.get("sandboxId").and_then(|v| v.as_str().map(str::to_string)))
+                .unwrap_or_default();
+            let (servers, mcp_errors) =
+                pool.ensure_in_sandbox(&participant_def.mcp, root, &sandbox);
             for e in &mcp_errors {
                 let _ = store.append_event(&conv, mark.ev("error", json!({ "message": e })));
                 emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));

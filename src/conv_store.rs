@@ -346,7 +346,8 @@ impl ConvStore {
             .query_row(
                 "SELECT id, ordinal, api_version, kind, title, agent, agent_file, model, status,
                         policy_mode, approve_mode, allowlist_mode, allowlist, allowlist_source,
-                        context_window, mcp, project_root, config, overrides, turns,
+                        context_window, mcp, project_root, project, sandbox, worktree,
+                        branch_ref, config, overrides, turns,
                         round_index, round_status, routing, purpose, notes, memory_high,
                         legacy_format, created_at, updated_at
                    FROM conversation WHERE id = ?1",
@@ -371,18 +372,26 @@ impl ConvStore {
                         "contextWindow": r.get::<_, Option<i64>>(14)?,
                         "mcp": from_json_text(r.get::<_, Option<String>>(15)?),
                         "projectRoot": r.get::<_, String>(16)?,
-                        "config": from_json_text(r.get::<_, Option<String>>(17)?),
-                        "overrides": from_json_text(r.get::<_, Option<String>>(18)?),
-                        "turns": r.get::<_, i64>(19)?,
-                        "roundIndex": r.get::<_, i64>(20)?,
-                        "roundStatus": r.get::<_, Option<String>>(21)?,
-                        "routing": r.get::<_, String>(22)?,
-                        "purpose": r.get::<_, Option<String>>(23)?,
-                        "notes": r.get::<_, Option<String>>(24)?,
-                        "memoryHigh": r.get::<_, Option<i64>>(25)?,
-                        "legacyFormat": r.get::<_, Option<String>>(26)?,
-                        "createdAt": r.get::<_, String>(27)?,
-                        "updatedAt": r.get::<_, String>(28)?,
+                        // Empty rather than null: the UI binds it straight
+                        // into a picker, and "" is the no-folder answer.
+                        "project": r.get::<_, Option<String>>(17)?.unwrap_or_default(),
+                        // Empty rather than null, like `project`: these bind
+                        // straight into pickers whose no-selection answer is "".
+                        "sandboxId": r.get::<_, Option<String>>(18)?.unwrap_or_default(),
+                        "worktreeId": r.get::<_, Option<String>>(19)?.unwrap_or_default(),
+                        "branchId": r.get::<_, Option<String>>(20)?.unwrap_or_default(),
+                        "config": from_json_text(r.get::<_, Option<String>>(21)?),
+                        "overrides": from_json_text(r.get::<_, Option<String>>(22)?),
+                        "turns": r.get::<_, i64>(23)?,
+                        "roundIndex": r.get::<_, i64>(24)?,
+                        "roundStatus": r.get::<_, Option<String>>(25)?,
+                        "routing": r.get::<_, String>(26)?,
+                        "purpose": r.get::<_, Option<String>>(27)?,
+                        "notes": r.get::<_, Option<String>>(28)?,
+                        "memoryHigh": r.get::<_, Option<i64>>(29)?,
+                        "legacyFormat": r.get::<_, Option<String>>(30)?,
+                        "createdAt": r.get::<_, String>(31)?,
+                        "updatedAt": r.get::<_, String>(32)?,
                     }))
                 },
             )
@@ -446,6 +455,17 @@ impl ConvStore {
             "allowlistSource" | "allowlist_source" => "allowlist_source",
             "contextWindow" | "context_window" => "context_window",
             "projectRoot" | "project_root" => "project_root",
+            // The folder it is filed under — distinct from `project_root`,
+            // which is where its files are. Two sessions on one checkout may
+            // sit in different folders, and often do.
+            "project" => "project",
+            // Where its work happens. `branchRef`, not `branch`: a
+            // conversation already has *branches* in the memory tree, and
+            // one word for two unrelated things is how a patch lands on the
+            // wrong column.
+            "sandbox" | "sandboxId" => "sandbox",
+            "worktree" | "worktreeId" => "worktree",
+            "branchRef" | "branch_ref" | "branchId" => "branch_ref",
             "turns" => "turns",
             "roundIndex" | "round_index" => "round_index",
             "roundStatus" | "round_status" => "round_status",

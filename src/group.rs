@@ -506,6 +506,10 @@ pub fn plan(
         // The raw setting, not `user_label()`: an unset name should leave
         // the line out, not announce that the user is called "user".
         &store.setting("user__full_name"),
+        // A sandbox is the session's, so it is part of "where the agent
+        // is" for every participant — and `header` is already loaded, so
+        // this costs nothing.
+        header.get("sandboxId").and_then(|v| v.as_str()).unwrap_or_default(),
     ));
 
     let seen_through = path.last().map(|n| n.seq).unwrap_or(watermark);

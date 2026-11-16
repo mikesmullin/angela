@@ -44,6 +44,9 @@ fn a_turn_streams_persists_and_is_remembered() {
     // No MCP presets: this test is about the turn loop, not tools.
     let pool = McpPool::default();
     let cancels = angela::cancel::Cancels::default();
+    // Nothing here is gated, so nothing ever asks — but the turn loop
+    // takes the registry either way.
+    let approvals = std::sync::Arc::new(angela::approvals::Approvals::new());
     let def = agent_loader::AgentDef::default();
 
     // ---- turn one --------------------------------------------------------
@@ -55,6 +58,7 @@ fn a_turn_streams_persists_and_is_remembered() {
         "/tmp",
         &pool,
         &cancels,
+        &approvals,
         &def,
         TurnRequest {
             tab_id: "1".into(),
@@ -111,6 +115,7 @@ fn a_turn_streams_persists_and_is_remembered() {
         "/tmp",
         &pool,
         &cancels,
+        &approvals,
         &def,
         TurnRequest {
             tab_id: "1".into(),
@@ -149,6 +154,7 @@ fn an_empty_prompt_is_refused_before_any_session_is_made() {
         .unwrap();
     let pool = McpPool::default();
     let cancels = angela::cancel::Cancels::default();
+    let approvals = std::sync::Arc::new(angela::approvals::Approvals::new());
     let def = agent_loader::AgentDef::default();
     let err = run_turn(
         &store,
@@ -157,6 +163,7 @@ fn an_empty_prompt_is_refused_before_any_session_is_made() {
         "/tmp",
         &pool,
         &cancels,
+        &approvals,
         &def,
         TurnRequest {
             tab_id: "1".into(),

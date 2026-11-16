@@ -53,15 +53,34 @@ pub struct ServerSpec {
 
 type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, String>>>>>;
 
+/// How a connected server is reached.
+///
+/// Stdio is the original and still the normal case: a child process, framed
+/// JSON-RPC over its pipes. `Http` exists because a **sandbox's** tools are
+/// not a process on this machine — they run in a container, and the only way
+/// in is sbox's HTTP facade. Teaching the existing client a second transport
+/// keeps one MCP client, one tool-registration path and one allowlist gate;
+/// the alternative was a second client, or a local process whose whole job
+/// was to relay to that URL.
+enum Transport {
+    Stdio {
+        stdin: Mutex<ChildStdin>,
+        child: Mutex<Child>,
+        pending: Pending,
+        next_id: AtomicU64,
+        framing: Framing,
+    },
+    /// One POST per request. sbox's facade is request/response and
+    /// stateless per call — there is no stream to hold open, so there is no
+    /// pending map and no reader thread.
+    Http { url: String },
+}
+
 /// One connected MCP server.
 pub struct McpServer {
     pub name: String,
     pub tools: Vec<ToolDef>,
-    stdin: Mutex<ChildStdin>,
-    child: Mutex<Child>,
-    pending: Pending,
-    next_id: AtomicU64,
-    framing: Framing,
+    transport: Transport,
 }
 
 impl McpServer {
@@ -117,11 +136,13 @@ impl McpServer {
         let server = Arc::new(McpServer {
             name: spec.name.clone(),
             tools: Vec::new(),
-            stdin: Mutex::new(stdin),
-            child: Mutex::new(child),
-            pending,
-            next_id: AtomicU64::new(1),
-            framing: spec.framing,
+            transport: Transport::Stdio {
+                stdin: Mutex::new(stdin),
+                child: Mutex::new(child),
+                pending,
+                next_id: AtomicU64::new(1),
+                framing: spec.framing,
+            },
         });
 
         server.request(
@@ -145,8 +166,11 @@ impl McpServer {
     }
 
     fn write_frame(&self, text: &str) -> Result<(), String> {
-        let mut out = self.stdin.lock().unwrap();
-        match self.framing {
+        let Transport::Stdio { stdin, framing, .. } = &self.transport else {
+            return Err("not a stdio server".into());
+        };
+        let mut out = stdin.lock().unwrap();
+        match framing {
             Framing::Newline => {
                 writeln!(out, "{text}").map_err(|e| e.to_string())?;
             }
@@ -160,26 +184,39 @@ impl McpServer {
 
     /// A request that expects a reply.
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx): (Sender<_>, Receiver<_>) = channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        match &self.transport {
+            Transport::Http { url } => http_rpc(url, method, params, timeout),
+            Transport::Stdio {
+                pending, next_id, ..
+            } => {
+                let id = next_id.fetch_add(1, Ordering::Relaxed);
+                let (tx, rx): (Sender<_>, Receiver<_>) = channel();
+                pending.lock().unwrap().insert(id, tx);
 
-        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if let Err(e) = self.write_frame(&body.to_string()) {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(e);
-        }
-        match rx.recv_timeout(timeout) {
-            Ok(r) => r,
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(format!("MCP {} {method} timed out", self.name))
+                let body =
+                    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+                if let Err(e) = self.write_frame(&body.to_string()) {
+                    pending.lock().unwrap().remove(&id);
+                    return Err(e);
+                }
+                match rx.recv_timeout(timeout) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        pending.lock().unwrap().remove(&id);
+                        Err(format!("MCP {} {method} timed out", self.name))
+                    }
+                }
             }
         }
     }
 
     /// A notification, which has no reply.
     pub fn notify(&self, method: &str, params: Value) {
+        // Nothing to tell an HTTP facade: it holds no session between calls,
+        // so there is no "initialized" state for a notification to advance.
+        if matches!(self.transport, Transport::Http { .. }) {
+            return;
+        }
         let body = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         let _ = self.write_frame(&body.to_string());
     }
@@ -195,21 +232,108 @@ impl McpServer {
     }
 
     pub fn close(&self) {
-        // Closing stdin is the polite stop; the kill is the backstop.
-        if let Ok(mut c) = self.child.lock() {
-            let _ = c.kill();
-            let _ = c.wait();
+        // Closing stdin is the polite stop; the kill is the backstop. An
+        // HTTP server is someone else's process and is not ours to stop.
+        if let Transport::Stdio { child, .. } = &self.transport {
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
         }
     }
 }
 
 impl Drop for McpServer {
     fn drop(&mut self) {
-        if let Ok(mut c) = self.child.lock() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        self.close();
     }
+}
+
+/// Connect to an MCP server reached over HTTP, and read its tool list.
+///
+/// Used for a sandbox: the tools run in a container, and sbox's facade is
+/// the door. There is no handshake to perform — the facade does its own
+/// against the guest daemon — so this goes straight to `tools/list`.
+pub fn connect_http(name: &str, url: &str, timeout: Duration) -> Result<Arc<McpServer>, String> {
+    let listed = http_rpc(url, "tools/list", json!({}), timeout)?;
+    Ok(Arc::new(McpServer {
+        name: name.to_string(),
+        tools: parse_tools(&listed),
+        transport: Transport::Http {
+            url: url.to_string(),
+        },
+    }))
+}
+
+/// One JSON-RPC call over HTTP.
+///
+/// Hand-rolled for the same reason the rest of this file is: one loopback
+/// JSON POST, no TLS and no redirects, against a service on this machine.
+///
+/// sbox's facade takes `{id, method, params}` and **adds** the `jsonrpc`
+/// field itself — sending it is an `unknown_field` error — and answers
+/// `{ok, result}` rather than a bare JSON-RPC envelope. Both quirks are
+/// absorbed here so everything above this line sees ordinary MCP.
+fn http_rpc(url: &str, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("only http:// MCP urls are supported: {url}"))?;
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let host = hostport.split(':').next().unwrap_or(hostport).to_string();
+    let addr: std::net::SocketAddr = hostport
+        .parse()
+        .map_err(|_| format!("bad MCP address: {hostport}"))?;
+
+    let body = json!({ "id": 1, "method": method, "params": params }).to_string();
+    let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("MCP over HTTP: cannot reach {hostport}: {e}"))?;
+    sock.set_read_timeout(Some(timeout)).ok();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    sock.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    sock.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+    sock.flush().ok();
+
+    let mut raw = Vec::new();
+    sock.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let split = text
+        .find("\r\n\r\n")
+        .ok_or_else(|| "MCP over HTTP: malformed response".to_string())?;
+    let (headers, rest) = text.split_at(split);
+    let status: u16 = headers
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let payload: Value = serde_json::from_str(rest.trim_start_matches("\r\n\r\n").trim())
+        .unwrap_or(Value::Null);
+
+    if !(200..300).contains(&status) {
+        let msg = payload
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        return Err(msg);
+    }
+    // `{ok, result}` is the facade's envelope; a bare `result` is accepted
+    // too so this is not tied to one server's shape.
+    Ok(payload
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| payload.clone()))
 }
 
 fn read_loop(stdout: std::process::ChildStdout, framing: Framing, pending: &Pending) {
@@ -425,5 +549,39 @@ mod tests {
         let tools = parse_tools(&listed);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "read_file");
+    }
+}
+
+#[cfg(test)]
+mod http_transport_tests {
+    use super::*;
+
+    /// Against a **live** sandbox, so it is not part of the normal run:
+    /// `cargo test -- --ignored sandbox_tools` with sbox-b up and a ready
+    /// box named in `SBOX_TEST_ID`.
+    ///
+    /// It exists because the two things most likely to be wrong here cannot
+    /// be unit-tested — sbox's facade rejects a `jsonrpc` field and wraps
+    /// its reply in `{ok, result}` — and both are quirks of a real server.
+    #[test]
+    #[ignore]
+    fn sandbox_tools_list_over_http() {
+        let Ok(id) = std::env::var("SBOX_TEST_ID") else {
+            panic!("set SBOX_TEST_ID to a ready sandbox");
+        };
+        let url = format!("http://127.0.0.1:3000/api/orchestration/sandboxes/{id}/exec/rpc");
+        let srv = connect_http("sandbox", &url, Duration::from_secs(30)).expect("connect");
+        let names: Vec<&str> = srv.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"bash"), "tools were {names:?}");
+        assert!(names.contains(&"read"), "tools were {names:?}");
+
+        let out = srv
+            .call_tool(
+                "bash",
+                &json!({ "command": "echo angela-http-transport-ok" }),
+                Duration::from_secs(30),
+            )
+            .expect("bash");
+        assert!(out.contains("angela-http-transport-ok"), "got {out:?}");
     }
 }

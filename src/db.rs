@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when the DDL below changes in a way an existing file must be
 /// brought forward to. Recorded in `schema_meta`.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -66,6 +66,19 @@ CREATE TABLE IF NOT EXISTS conversation (
     context_window   INTEGER,
     mcp              TEXT,
     project_root     TEXT NOT NULL,
+    -- Which folder this conversation is filed under, as a path-ish label
+    -- ("psicom/chat"). A plain string, not a foreign key: the hierarchy is
+    -- derived from the '/' in the name, so moving a folder is one UPDATE
+    -- and there is no tree to keep consistent with the labels.
+    project          TEXT,
+    -- Where this conversation's work happens. `sandbox` names a box in the
+    -- sbox service; `worktree` and `branch` name the checkout bound into
+    -- it. They are opaque ids owned by other services, so they are plain
+    -- text with no constraint — a sandbox destroyed elsewhere leaves a
+    -- dangling id here, and the UI falls back rather than failing.
+    sandbox          TEXT,
+    worktree         TEXT,
+    branch_ref       TEXT,
     config           TEXT,
     overrides        TEXT,
     turns            INTEGER NOT NULL DEFAULT 0,
@@ -81,6 +94,18 @@ CREATE TABLE IF NOT EXISTS conversation (
     legacy_format    TEXT,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
+);
+
+-- The folders that exist, independent of whether anything is in them.
+--
+-- The assignment itself lives on `conversation.project`; this table only
+-- remembers NAMES. Without it a folder would exist exactly as long as a
+-- conversation pointed at it, so creating one before filing anything into
+-- it, or dragging the last session out of one, would make it vanish — both
+-- of which the UI offers as ordinary gestures.
+CREATE TABLE IF NOT EXISTS projects (
+    name       TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
 );
 
 -- App settings: one row per key.
@@ -338,6 +363,10 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE agents ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE agents ADD COLUMN max_turns INTEGER",
         "ALTER TABLE agents ADD COLUMN icon TEXT",
+        "ALTER TABLE conversation ADD COLUMN project TEXT",
+        "ALTER TABLE conversation ADD COLUMN sandbox TEXT",
+        "ALTER TABLE conversation ADD COLUMN worktree TEXT",
+        "ALTER TABLE conversation ADD COLUMN branch_ref TEXT",
     ] {
         let _ = conn.execute(stmt, []);
     }

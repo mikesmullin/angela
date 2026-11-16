@@ -336,6 +336,23 @@ term_local__exec:echo.*
 term_local__exec:pwd
 term_local__exec:true
 term_local__exec:ls.*
+
+# sandbox (read-only exploration)
+#
+# These replace the two above when a conversation is assigned a sandbox:
+# the same shapes, pointed at a container instead of this machine. Reading
+# is permitted outright and writing is not, exactly as on the host — a
+# sandbox bounds the blast radius, it does not make an unreviewed write
+# into something the user asked for.
+sandbox__read
+sandbox__read:.*
+sandbox__bash:pwd
+sandbox__bash:ls.*
+sandbox__bash:echo.*
+sandbox__bash:cat .+
+sandbox__bash:head .+
+sandbox__bash:uname.*
+sandbox__bash:true
 "#;
 
 #[cfg(test)]

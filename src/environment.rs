@@ -193,14 +193,36 @@ fn article(word: &str) -> &'static str {
 /// **omitted when unset** rather than written empty: "Your current
 /// geographic location: ." is a worse answer than no answer, and a model
 /// will try to make sense of it.
-pub fn section(epoch: i64, location: &str, user_name: &str) -> String {
-    let os = os_name();
-    let mut out = format!(
-        "\n## Environment\n\nYou are on {} {os} system.\nThe current time is {} ({}).\n",
-        article(os),
+pub fn section(epoch: i64, location: &str, user_name: &str, sandbox: &str) -> String {
+    let mut out = String::from("\n## Environment\n\n");
+    let sandbox = sandbox.trim();
+    if sandbox.is_empty() {
+        let os = os_name();
+        out.push_str(&format!("You are on {} {os} system.\n", article(os)));
+    } else {
+        // The host's distribution is the wrong answer in a sandboxed
+        // session, and wrong in the exact way this module exists to
+        // prevent: an agent told it is on Arch runs `pacman` inside a
+        // container that has `apk`. Saying which box, and where the
+        // session's checkout is mounted, is also the difference between a
+        // working `bash` call and one that starts by hunting for the files.
+        out.push_str(&format!(
+            "You are working inside the sandbox `{sandbox}` — an isolated \
+             container, not this user's machine. Your file and shell tools \
+             act in there and nowhere else; the host is not reachable from \
+             this conversation. The session's git checkout is mounted \
+             read-write at `{}`, which is where the work is. The image is a \
+             minimal Linux (Alpine, so `apk` and BusyBox, not `apt` or \
+             `pacman`); don't assume a tool is installed because it is \
+             common.\n",
+            crate::harness::SANDBOX_MOUNT,
+        ));
+    }
+    out.push_str(&format!(
+        "The current time is {} ({}).\n",
         long_time(epoch),
         epoch,
-    );
+    ));
     let location = location.trim();
     if !location.is_empty() {
         out.push_str(&format!("Your current geographic location: {location}.\n"));
@@ -270,7 +292,7 @@ mod tests {
 
     #[test]
     fn the_section_says_where_and_when() {
-        let s = section(epoch_for(2026, 11, 14, 17, 37), "Boise, Idaho", "Bob");
+        let s = section(epoch_for(2026, 11, 14, 17, 37), "Boise, Idaho", "Bob", "");
         assert!(s.contains("## Environment"));
         assert!(s.contains(" system."));
         // "a Arch Linux system" is wrong in a way a reader trips over.
@@ -294,15 +316,34 @@ mod tests {
     fn an_unset_location_or_name_is_left_out_entirely() {
         // "Your current geographic location: ." is a worse answer than no
         // answer, and a model will try to make sense of it.
-        let s = section(epoch_for(2026, 11, 14, 17, 37), "", "   ");
+        let s = section(epoch_for(2026, 11, 14, 17, 37), "", "   ", "");
         assert!(!s.contains("geographic location"), "{s}");
         assert!(!s.contains("human operator"), "{s}");
         // What is known is still said.
         assert!(s.contains("The current time is "));
 
-        let only_where = section(epoch_for(2026, 11, 14, 17, 37), "Boise, Idaho", "");
+        let only_where = section(epoch_for(2026, 11, 14, 17, 37), "Boise, Idaho", "", "");
         assert!(only_where.contains("geographic location: Boise, Idaho."));
         assert!(!only_where.contains("human operator"));
+    }
+
+
+    /// In a sandboxed session the host's distribution is the wrong answer,
+    /// and wrong in the way this module exists to prevent: an agent told it
+    /// is on Arch runs `pacman` in a container that has `apk`. It must also
+    /// learn where the checkout is, or a correct `bash` tool spends its
+    /// first calls hunting for the files.
+    #[test]
+    fn a_sandboxed_session_describes_the_box_not_the_host() {
+        let s = section(epoch_for(2026, 11, 14, 17, 37), "Boise, Idaho", "Bob", "sandbox2-abc");
+        assert!(s.contains("sandbox2-abc"), "{s}");
+        assert!(s.contains(crate::harness::SANDBOX_MOUNT), "{s}");
+        assert!(!s.contains("You are on a "), "{s}");
+        assert!(!s.contains(os_name()), "{s}");
+        // Everything else about "where and when" still holds.
+        assert!(s.contains("The current time is Sat, Nov 14th, 2026 @ 5:37PM"), "{s}");
+        assert!(s.contains("Your current geographic location: Boise, Idaho."), "{s}");
+        assert!(s.contains("The user (human operator)'s name is Bob."), "{s}");
     }
 
     #[test]
