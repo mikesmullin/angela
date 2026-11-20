@@ -652,6 +652,17 @@ impl Server {
                     "status": s.get("status").cloned().unwrap_or(Value::Null),
                     "turns": s.get("turns").cloned().unwrap_or(json!(0)),
                     "contextWindow": s.get("contextWindow").cloned().unwrap_or(Value::Null),
+                    // Ours, not the JS's: the chat app's project tree groups
+                    // conversations by this field, so a listing without it
+                    // cannot say where a conversation lives. Without this the
+                    // sidebar's drag-and-drop writes the column correctly and
+                    // then the 4s session poll redraws every row as Unfiled.
+                    // Empty rather than null, like `load`: "" is the no-folder
+                    // answer the tree tests for.
+                    "project": s
+                        .get("project")
+                        .cloned()
+                        .unwrap_or_else(|| json!("")),
                 })
             })
             .collect();

@@ -218,7 +218,9 @@ fn the_serve_layer_reconstructs_js_written_sessions() {
     );
 }
 
-/// The sessions list is newest-first and carries the nine fields the JS sends.
+/// The sessions list is newest-first and carries the ten fields the JS sends,
+/// plus the two the chat app needs and the JS never had: `ordinal` for the tab
+/// strip, and `project` for the sidebar's project tree.
 #[test]
 fn the_sessions_list_shape_matches_the_js() {
     use std::sync::Arc;
@@ -272,9 +274,31 @@ fn the_sessions_list_shape_matches_the_js() {
             // `ordinal` is ours, not the JS's: the tab strip needs a stable
             // 1-based label, and deriving one at read time would reshuffle
             // it as sessions come and go.
+            // `project` is ours too: the sidebar files conversations by it,
+            // and a listing that omits it redraws every refiled row as
+            // Unfiled on the next poll.
             "id", "ordinal", "title", "agent", "model", "createdAt", "updatedAt", "status",
-            "turns", "contextWindow"
+            "turns", "contextWindow", "project"
         ]
+    );
+
+    // And what the tree compares against. "" for an unfiled conversation —
+    // never null, because the sidebar tests `project == folder` and `project
+    // == ""` directly — and the full nested name once it has been filed.
+    assert_eq!(by_agent("lucy")["project"], "");
+    state
+        .store
+        .assign_project(a["id"].as_str().unwrap(), "psicom/chat")
+        .unwrap();
+    let filed = angela::serve::Server::new(Arc::clone(&state)).sessions_list_for_test();
+    let filed_rows = filed["sessions"].as_array().unwrap();
+    assert_eq!(
+        filed_rows
+            .iter()
+            .find(|r| r["id"] == a["id"])
+            .unwrap()["project"],
+        "psicom/chat",
+        "a refiled conversation must still name its folder in the listing"
     );
 }
 
