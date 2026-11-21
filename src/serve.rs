@@ -127,6 +127,18 @@ fn goto_from_meta(meta: &Map<String, Value>) -> Value {
     }
 }
 
+/// Seat known agents mentioned by the user before selecting the turn path.
+fn invite_mentions(store: &ConvStore, session: &str, text: &str) {
+    let names = crate::group::mentions(text);
+    if names.is_empty() { return; }
+    let definitions = store.agents().list();
+    for name in names {
+        if let Some(def) = definitions.iter().find(|d| d.name.eq_ignore_ascii_case(&name)) {
+            store.invite_mentioned_agent(session, def);
+        }
+    }
+}
+
 /// Rebuild the UI transcript from the log. Port of
 /// `reconstructMessagesFromLog`.
 ///
@@ -1094,7 +1106,7 @@ impl Server {
                     sink.json(400, &json!({ "error": "empty content" }));
                     return;
                 }
-                let turn = TurnRequest {
+                let mut turn = TurnRequest {
                     tab_id: sv("tabId").unwrap_or_else(|| "1".into()),
                     content,
                     agent: sv("agent"),
@@ -1105,6 +1117,21 @@ impl Server {
                         .unwrap_or(false),
                     session_id: sv("sessionId"),
                 };
+                if !crate::group::mentions(&turn.content).is_empty() {
+                    // Resolve first so an invitation affects this very turn,
+                    // including the first message of a new session.
+                    match harness::resolve_session(&st.store, &st.tabs, &turn) {
+                        Ok(id) => {
+                            invite_mentions(&st.store, &id, &turn.content);
+                            turn.session_id = Some(id);
+                            turn.new_session = false;
+                        }
+                        Err(e) => {
+                            sink.json(500, &json!({ "error": e.to_string() }));
+                            return;
+                        }
+                    }
+                }
                 // Resolve the agent: the request's name, else the project's
                 // single agent, else the built-in default.
                 // Which definition runs the turn. The **seated** agent comes
@@ -1409,6 +1436,56 @@ mod transcript_tests {
             .unwrap()
             .to_string();
         (s, id)
+    }
+
+    #[test]
+    fn mentions_invite_known_agents_once_and_route_the_same_message() {
+        let (s, id) = conv();
+        let mut def = crate::agent_loader::AgentDef::default();
+        def.name = "video_guy".into();
+        def.soul = "You are a video expert.".into();
+        s.agents().save(&def, None).unwrap();
+        invite_mentions(&s, &id, "@VIDEO_GUY hello @video_guy, and unknown @nobody; email x@video_guy.com");
+        let agents = s.agent_participants(&id);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].handle, "video_guy");
+        assert!(agents[0].system_prompt.contains("video expert"));
+        let invitations = crate::group::invitations(&agents, &|_| crate::agent_loader::Engagement::Invoked, "@VIDEO_GUY hello");
+        assert_eq!(invitations[0].1, crate::group::Invite::Mentioned);
+        invite_mentions(&s, &id, "@video_guy again");
+        assert_eq!(s.agent_participants(&id).len(), 1);
+    }
+
+    #[test]
+    fn mentioning_a_second_agent_adds_them_before_group_routing() {
+        let (s, id) = conv();
+        for name in ["first", "second"] {
+            let mut def = crate::agent_loader::AgentDef::default();
+            def.name = name.into();
+            s.agents().save(&def, None).unwrap();
+        }
+        invite_mentions(&s, &id, "@first hello");
+        invite_mentions(&s, &id, "@second hello");
+        let agents = s.agent_participants(&id);
+        assert_eq!(agents.len(), 2);
+        let invitations = crate::group::invitations(&agents, &|_| crate::agent_loader::Engagement::Invoked, "@second hello");
+        assert_eq!(invitations[0].1, crate::group::Invite::Skip);
+        assert_eq!(invitations[1].1, crate::group::Invite::Mentioned);
+    }
+
+    #[test]
+    fn mention_reactivates_the_same_former_participant() {
+        let (s, id) = conv();
+        let mut def = crate::agent_loader::AgentDef::default();
+        def.name = "videoguy".into();
+        s.agents().save(&def, None).unwrap();
+        invite_mentions(&s, &id, "@videoguy hi");
+        let participant = s.agent_participants(&id)[0].clone();
+        let mut patch = serde_json::Map::new();
+        patch.insert("active".into(), json!(false));
+        s.update_participant(participant.id, &patch).unwrap();
+        invite_mentions(&s, &id, "@videoguy hi again");
+        assert_eq!(s.agent_participants(&id)[0].id, participant.id);
     }
 
     #[test]

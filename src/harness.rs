@@ -134,7 +134,12 @@ impl McpPool {
                 Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
             }
         };
-        if let Some(result) = servers.get(name) { return result.clone(); }
+        if let Some(result) = servers.get(name) {
+            if result.as_ref().map(|server| server.is_running()).unwrap_or(true) {
+                return result.clone();
+            }
+            servers.remove(name);
+        }
         let result = connect();
         if !stop.stopped() { servers.insert(name.to_string(), result.clone()); }
         result
@@ -1378,6 +1383,25 @@ mod tests {
         assert!(result.is_err());
         let retry = pool.get_or_connect("slow", &Cancel::never(), || Err("retried".into()));
         assert_eq!(retry.err().unwrap(), "retried");
+    }
+
+    #[test]
+    fn a_closed_stdio_server_is_reconnected_on_next_use() {
+        let pool = McpPool::default();
+        let spec = crate::mcp::ServerSpec {
+            name: "reconnect-test".into(), command: "python3".into(),
+            args: vec!["-u".into(), "-c".into(), r#"import sys,json
+for line in sys.stdin:
+ m=json.loads(line)
+ if 'id' in m: print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'tools':[]}}), flush=True)
+"#.into()], cwd: None, env: vec![], framing: crate::mcp::Framing::Newline,
+        };
+        let connect = || McpServer::connect(&spec, Duration::from_secs(2));
+        let first = pool.get_or_connect("server", &Cancel::never(), connect).unwrap();
+        first.close();
+        let second = pool.get_or_connect("server", &Cancel::never(), connect).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(second.is_running());
     }
 
     #[test]

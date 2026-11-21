@@ -780,6 +780,36 @@ impl ConvStore {
         })
     }
 
+    /// Invite a named agent once. The roster check and insert share the store
+    /// lock so concurrent messages cannot create duplicate seats.
+    pub fn invite_mentioned_agent(&self, conv: &str, def: &crate::agent_loader::AgentDef) -> Option<Participant> {
+        let handle = def.name.to_ascii_lowercase();
+        self.with(|c| {
+            let roster = Self::participants_in(c, conv);
+            if let Some(existing) = roster.iter().find(|p| p.handle == handle) {
+                // A mention addresses an existing seat, including a human.
+                if existing.kind != "agent" || existing.agent_name.as_deref() != Some(def.name.as_str()) || existing.active {
+                    return None;
+                }
+                c.execute("UPDATE participants SET active = 1 WHERE id = ?1", params![existing.id]).ok()?;
+                return Self::participants_in(c, conv).into_iter().find(|p| p.id == existing.id);
+            }
+            if roster.iter().any(|p| p.kind == "agent" && p.agent_name.as_deref() == Some(def.name.as_str())) {
+                return None;
+            }
+            let seat: i64 = c.query_row(
+                "SELECT COALESCE(MAX(seat), -1) + 1 FROM participants WHERE conversation_id = ?1",
+                params![conv], |r| r.get(0),
+            ).ok()?;
+            c.execute(
+                "INSERT INTO participants (conversation_id, kind, handle, display_name, agent_name, model, system_prompt, seat, active, role) VALUES (?1, 'agent', ?2, ?2, ?3, ?4, ?5, ?6, 1, 'member')",
+                params![conv, handle, def.name, if def.model.is_empty() { None } else { Some(def.model.as_str()) }, def.system_prompt(), seat],
+            ).ok()?;
+            let id = c.last_insert_rowid();
+            Self::participants_in(c, conv).into_iter().find(|p| p.id == id)
+        })
+    }
+
     pub fn update_participant(&self, id: i64, patch: &Map<String, Value>) -> Option<Participant> {
         self.with(|c| {
             for (k, v) in patch {

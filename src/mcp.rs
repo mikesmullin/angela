@@ -15,13 +15,14 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use crate::cancel::Cancel;
 
 const POLL: Duration = Duration::from_millis(50);
+const CANCEL_GRACE: Duration = Duration::from_millis(500);
 
 use serde_json::{json, Map, Value};
 
@@ -84,6 +85,7 @@ pub struct McpServer {
     pub name: String,
     pub tools: Vec<ToolDef>,
     transport: Transport,
+    forced_closed: AtomicBool,
 }
 
 impl McpServer {
@@ -99,6 +101,13 @@ impl McpServer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Each owned stdio server gets its own group, so escalation reaches
+        // subprocesses without signalling the chat server or other MCPs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         if let Some(d) = &spec.cwd {
             cmd.current_dir(d);
         }
@@ -144,6 +153,7 @@ impl McpServer {
         let server = Arc::new(McpServer {
             name: spec.name.clone(),
             tools: Vec::new(),
+            forced_closed: AtomicBool::new(false),
             transport: Transport::Stdio {
                 stdin: Mutex::new(stdin),
                 child: Mutex::new(child),
@@ -215,8 +225,13 @@ impl McpServer {
                 let deadline = Instant::now() + timeout;
                 loop {
                     if stop.stopped() {
-                        pending.lock().unwrap().remove(&id);
+                        // Keep the waiter registered during the grace period:
+                        // a reply means this request has actually finished.
                         self.notify("notifications/cancelled", json!({ "requestId": id, "reason": "Stopped" }));
+                        if matches!(rx.recv_timeout(CANCEL_GRACE), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                            self.force_close();
+                        }
+                        pending.lock().unwrap().remove(&id);
                         return Err("stopped".into());
                     }
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -259,16 +274,36 @@ impl McpServer {
         Ok(flatten_content(&result))
     }
 
-    pub fn close(&self) {
-        // Closing stdin is the polite stop; the kill is the backstop. An
-        // HTTP server is someone else's process and is not ours to stop.
+    /// Whether a cached server can still accept requests.
+    pub fn is_running(&self) -> bool {
+        if self.forced_closed.load(Ordering::SeqCst) { return false; }
+        match &self.transport {
+            Transport::Http { .. } => true,
+            Transport::Stdio { child, .. } => child.lock().map(|mut c| matches!(c.try_wait(), Ok(None))).unwrap_or(false),
+        }
+    }
+
+    /// The server is shared, so force-closing it also interrupts any other
+    /// calls using it. The pool discards it and starts a fresh one next time.
+    fn force_close(&self) {
+        if self.forced_closed.swap(true, Ordering::SeqCst) { return; }
         if let Transport::Stdio { child, .. } = &self.transport {
             if let Ok(mut c) = child.lock() {
-                let _ = c.kill();
-                let _ = c.wait();
+                // A leader already reaped by try_wait could have its PID
+                // reused; never send a group signal to that old number.
+                if matches!(c.try_wait(), Ok(None)) {
+                    #[cfg(unix)]
+                    // The live, unreaped leader reserves this process group.
+                    unsafe { libc::kill(-(c.id() as i32), libc::SIGKILL); }
+                    #[cfg(not(unix))]
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
             }
         }
     }
+
+    pub fn close(&self) { self.force_close(); }
 }
 
 impl Drop for McpServer {
@@ -291,6 +326,7 @@ pub fn connect_http_cancellable(name: &str, url: &str, timeout: Duration, stop: 
     Ok(Arc::new(McpServer {
         name: name.to_string(),
         tools: parse_tools(&listed),
+        forced_closed: AtomicBool::new(false),
         transport: Transport::Http {
             url: url.to_string(),
         },
@@ -601,6 +637,57 @@ for line in sys.stdin:
         let notification = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
         assert_eq!(notification["requestId"], 3);
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncooperative_tool_and_its_child_are_killed_after_grace() {
+        let script = r#"import sys,json,subprocess
+child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+for line in sys.stdin:
+ m=json.loads(line)
+ if m.get('method') == 'initialize': print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{}}), flush=True)
+ elif m.get('method') == 'tools/list': print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'tools':[{'name':str(child.pid)}]}}), flush=True)
+"#;
+        let srv = McpServer::connect(&fake_server(script), Duration::from_secs(2)).unwrap();
+        let child_pid: i32 = srv.tools[0].name.parse().unwrap();
+        let stop = Cancel::never();
+        let worker_stop = stop.clone();
+        let worker_srv = srv.clone();
+        let worker = std::thread::spawn(move || worker_srv.call_tool_cancellable("slow", &json!({}), Duration::from_secs(20), &worker_stop));
+        std::thread::sleep(Duration::from_millis(100));
+        stop.stop();
+        assert_eq!(worker.join().unwrap().unwrap_err(), "stopped");
+        assert!(!srv.is_running());
+        // An adopted zombie has terminated even if its new parent has not
+        // reaped it yet; it cannot continue doing work.
+        let ended = (0..100).any(|_| {
+            let state = std::fs::read_to_string(format!("/proc/{child_pid}/stat"));
+            if state.as_deref().map(|s| s.split_whitespace().nth(2) == Some("Z")).unwrap_or(true) { true }
+            else { std::thread::sleep(Duration::from_millis(10)); false }
+        });
+        assert!(ended, "tool subprocess is still running");
+    }
+
+    #[test]
+    fn cooperative_tool_finishes_without_killing_the_server() {
+        let script = r#"import sys,json
+for line in sys.stdin:
+ m=json.loads(line)
+ method=m.get('method')
+ if method == 'initialize': print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{}}), flush=True)
+ elif method == 'tools/list': print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'tools':[]}}), flush=True)
+ elif method == 'notifications/cancelled': print(json.dumps({'jsonrpc':'2.0','id':m['params']['requestId'],'error':{'code':-32800,'message':'cancelled'}}), flush=True)
+"#;
+        let srv = McpServer::connect(&fake_server(script), Duration::from_secs(2)).unwrap();
+        let stop = Cancel::never();
+        let worker_stop = stop.clone();
+        let worker_srv = srv.clone();
+        let worker = std::thread::spawn(move || worker_srv.call_tool_cancellable("slow", &json!({}), Duration::from_secs(20), &worker_stop));
+        std::thread::sleep(Duration::from_millis(100));
+        stop.stop();
+        assert_eq!(worker.join().unwrap().unwrap_err(), "stopped");
+        assert!(srv.is_running());
     }
 
     #[test]
