@@ -37,7 +37,7 @@ use crate::session_store::{ContextItem, NewEvent, NewSession};
 
 /// How long one tool call may take before the turn gives up on it.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
-/// Audio8 may transcribe an hour-long recording locally; the MCP tool has its
+/// Whisper may transcribe an hour-long recording locally; the MCP tool has its
 /// own two-hour deadline, and Stop remains available throughout.
 const VIDEO_TRANSCRIPT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60 + 60);
 /// Starting a server should be fast; a hang here would stall the first turn.
