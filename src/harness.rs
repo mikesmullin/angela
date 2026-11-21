@@ -124,31 +124,55 @@ pub struct McpPool {
 }
 
 impl McpPool {
-    fn get_or_connect<F>(&self, name: &str, connect: F) -> Result<Arc<McpServer>, String>
+    fn get_or_connect<F>(&self, name: &str, stop: &Cancel, connect: F) -> Result<Arc<McpServer>, String>
     where F: FnOnce() -> Result<Arc<McpServer>, String> {
-        let mut servers = self.servers.lock().unwrap();
-        servers.entry(name.to_string()).or_insert_with(connect).clone()
+        let mut servers = loop {
+            if stop.stopped() { return Err("stopped".into()); }
+            match self.servers.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(50)),
+                Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+            }
+        };
+        if let Some(result) = servers.get(name) { return result.clone(); }
+        let result = connect();
+        if !stop.stopped() { servers.insert(name.to_string(), result.clone()); }
+        result
     }
     /// Connect (or reuse) the named presets, returning those that came up.
     ///
     /// A server that fails to start is reported and skipped rather than
     /// failing the turn: losing shell access should not cost you the chat.
+    ///
+    /// `file_root` is what each server's `${projectRoot}` expands to — the
+    /// agent's workspace root, passed by the caller. The cache key includes
+    /// it because two agents with different roots need different `file-io`
+    /// processes: the first root would be a lie for the second. One `file-io`,
+    /// same root, one process, no matter how many turns or sessions reuse it.
     pub fn ensure(
         &self,
         names: &[String],
-        project_root: &std::path::Path,
+        file_root: &std::path::Path,
     ) -> (Vec<Arc<McpServer>>, Vec<String>) {
+        self.ensure_cancellable(names, file_root, &Cancel::never())
+    }
+
+    fn ensure_cancellable(&self, names: &[String], file_root: &std::path::Path, stop: &Cancel) -> (Vec<Arc<McpServer>>, Vec<String>) {
         let mut out = Vec::new();
         let mut errors = Vec::new();
         for name in names {
+            if stop.stopped() { break; }
             // Keep lookup and initialization together: different sessions can
             // request the same server concurrently on different HTTP threads.
-            let result = self.get_or_connect(name, || {
-                let spec = mcp_presets::preset(name, project_root)
-                    .ok_or_else(|| format!("unknown or uninstalled MCP preset `{name}`"))?;
-                McpServer::connect(&spec, CONNECT_TIMEOUT)
-                    .map_err(|e| format!("MCP `{name}`: {e}"))
-            });
+            let result = self.get_or_connect(
+                &format!("{name}::{}", file_root.display()),
+                stop, || {
+                    let spec = mcp_presets::preset(name, file_root)
+                        .ok_or_else(|| format!("unknown or uninstalled MCP preset `{name}`"))?;
+                    McpServer::connect_cancellable(&spec, CONNECT_TIMEOUT, stop)
+                        .map_err(|e| format!("MCP `{name}`: {e}"))
+                },
+            );
             match result {
                 Ok(srv) => out.push(srv),
                 Err(e) => errors.push(e),
@@ -186,21 +210,31 @@ impl McpPool {
     /// leaving the host tools in place would mean a conversation the user
     /// believes is sandboxed quietly writing to their machine, which is the
     /// worst outcome available here.
+    ///
+    /// `file_root` is the agent's own workspace root: this is what `ensure`
+    /// uses to expand `${projectRoot}` for this agent's servers. The file and
+    /// shell servers get the sandbox's, instead — that discards `file_root`
+    /// for them, which is exactly the isolation a sandbox is for.
     pub fn ensure_in_sandbox(
         &self,
         names: &[String],
-        project_root: &std::path::Path,
+        file_root: &std::path::Path,
         sandbox: &str,
     ) -> (Vec<Arc<McpServer>>, Vec<String>) {
+        self.ensure_in_sandbox_cancellable(names, file_root, sandbox, &Cancel::never())
+    }
+
+    fn ensure_in_sandbox_cancellable(&self, names: &[String], file_root: &std::path::Path, sandbox: &str, stop: &Cancel) -> (Vec<Arc<McpServer>>, Vec<String>) {
         if sandbox.trim().is_empty() {
-            return self.ensure(names, project_root);
+            return self.ensure_cancellable(names, file_root, stop);
         }
         let kept: Vec<String> = names
             .iter()
             .filter(|n| !DISPLACED_BY_SANDBOX.contains(&n.as_str()))
             .cloned()
             .collect();
-        let (mut out, mut errors) = self.ensure(&kept, project_root);
+        let (mut out, mut errors) = self.ensure_cancellable(&kept, file_root, stop);
+        if stop.stopped() { return (out, errors); }
 
         // Unconditional: the sandbox is the session's, so every participant
         // addresses it, including one whose own `mcp` list named no file or
@@ -209,8 +243,8 @@ impl McpPool {
         // per-agent and left the other participants unable to see the very
         // tree the session is working in.
         let url = sandbox_rpc_url(sandbox);
-        match self.get_or_connect(&format!("sandbox:{sandbox}"), || {
-            crate::mcp::connect_http(SANDBOX_SERVER, &url, CONNECT_TIMEOUT)
+        match self.get_or_connect(&format!("sandbox:{sandbox}"), stop, || {
+            crate::mcp::connect_http_cancellable(SANDBOX_SERVER, &url, CONNECT_TIMEOUT, stop)
                 .map_err(|e| format!("sandbox `{sandbox}`: {e}"))
         }) {
             Ok(srv) => out.push(srv),
@@ -227,6 +261,27 @@ impl McpPool {
         for (_, s) in self.servers.lock().unwrap().drain() {
             if let Ok(s) = s { s.close(); }
         }
+    }
+}
+
+/// The file-system root an agent's MCP servers should believe the disk begins
+/// at: the agent's own workspace root (relative values resolving under the
+/// project root), or the project root when it named none.
+///
+/// This is what `${projectRoot}` in the MCP config expands to *for this
+/// agent* — before the per-agent field it was always the project root.
+fn file_root_for(def: &AgentDef, project_root: &std::path::Path) -> std::path::PathBuf {
+    let cwd = def.cwd.as_deref().map(|c| c.trim());
+    match cwd {
+        Some(c) if !c.is_empty() => {
+            let cwd_root: std::path::PathBuf = c.into();
+            if cwd_root.is_absolute() {
+                cwd_root
+            } else {
+                project_root.join(c)
+            }
+        }
+        _ => project_root.to_path_buf(),
     }
 }
 
@@ -415,6 +470,7 @@ pub fn register_tools(
     policy_mode: &str,
     session: &str,
     approvals: Arc<Approvals>,
+    stop: Arc<Cancel>,
 ) -> usize {
     // `auto` is the documented escape hatch for a trusted project; anything
     // else (including the default `ask`) enforces the list.
@@ -435,6 +491,7 @@ pub fn register_tools(
             let gate_name = name.clone();
             let allow_text = allow_text.clone();
             let approvals = Arc::clone(&approvals);
+            let stop = Arc::clone(&stop);
             let session = session.to_string();
             let ok = agent.tool(
                 &name,
@@ -442,13 +499,14 @@ pub fn register_tools(
                 props,
                 required,
                 move |args: &Value| {
+                    if stop.stopped() { return Ok("stopped".into()); }
                     if enforce {
                         let cmd = allowlist::command_line(&gate_name, args);
                         if !allowlist::is_allowed(&allow_text, &gate_name, &cmd)
                             && !approvals.pinned(&session, &gate_name, &cmd)
                         {
                             // The turn stops here until somebody answers.
-                            let decision = approvals.ask(&session, &gate_name, &cmd, args);
+                            let decision = approvals.ask_cancellable(&session, &gate_name, &cmd, args, &stop);
                             if !decision.allowed() {
                                 // Denied calls never reach the server. The
                                 // model is told plainly, so it can say so or
@@ -467,7 +525,8 @@ pub fn register_tools(
                             }
                         }
                     }
-                    match srv.call_tool(&remote, args, TOOL_TIMEOUT) {
+                    if stop.stopped() { return Ok("stopped".into()); }
+                    match srv.call_tool_cancellable(&remote, args, TOOL_TIMEOUT, &stop) {
                         Ok(text) => Ok(text),
                         Err(e) => Ok(format!("error: {e}")),
                     }
@@ -780,6 +839,8 @@ pub fn run_turn(
     // and `Cancels::begin` hands back an already-thrown switch if the user
     // got there first, which is the race on a brand-new session.
     let stop = Armed::new(cancels, &session_id);
+    // Name the turn before setup so Stop can address even a stalled connection.
+    emit(&json!({ "type": "session", "tabId": req.tab_id, "sessionId": session_id }));
 
     tabs.set(
         &req.tab_id,
@@ -850,13 +911,17 @@ pub fn run_turn(
 
     // Tools come up before the model is told they exist.
     let root = std::path::Path::new(project_root);
+    // Where this agent's files and shell begin: its own workspace root if it
+    // named one, else the project root.
+    let file_root = file_root_for(def, root);
     // Which machine "the filesystem" means for this conversation.
     let sandbox = store
         .load(&session_id)
         .and_then(|s| s.get("sandboxId").and_then(|v| v.as_str().map(str::to_string)))
         .unwrap_or_default();
-    let (servers, mcp_errors) = pool.ensure_in_sandbox(&def.mcp, root, &sandbox);
+    let (servers, mcp_errors) = pool.ensure_in_sandbox_cancellable(&def.mcp, &file_root, &sandbox, &stop.switch);
     for e in &mcp_errors {
+        if stop.stopped() { break; }
         let _ = store.append_event(&session_id, NewEvent::new("error", json!({ "message": e })));
         emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
     }
@@ -945,6 +1010,7 @@ pub fn run_turn(
         &def.policy_mode,
         &session_id,
         Arc::clone(approvals),
+        Arc::clone(&stop.switch),
     );
     let tool_names: Vec<String> = agent.tools.keys().cloned().collect();
 
@@ -1295,6 +1361,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stop_interrupts_wait_for_pool_and_cancelled_setup_is_not_cached() {
+        let pool = Arc::new(McpPool::default());
+        let held = pool.servers.lock().unwrap();
+        let stop = Cancel::never();
+        let worker_stop = stop.clone();
+        let worker_pool = pool.clone();
+        let worker = std::thread::spawn(move || worker_pool.get_or_connect("slow", &worker_stop, || Err("should not connect".into())).err().unwrap());
+        std::thread::sleep(Duration::from_millis(75));
+        stop.stop();
+        assert_eq!(worker.join().unwrap(), "stopped");
+        drop(held);
+
+        let stop = Cancel::never();
+        let result = pool.get_or_connect("slow", &stop, || { stop.stop(); Err("stopped".into()) });
+        assert!(result.is_err());
+        let retry = pool.get_or_connect("slow", &Cancel::never(), || Err("retried".into()));
+        assert_eq!(retry.err().unwrap(), "retried");
+    }
+
+    #[test]
     fn concurrent_turns_initialize_each_server_only_once() {
         let pool = Arc::new(McpPool::default());
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1303,7 +1389,7 @@ mod tests {
             let pool = Arc::clone(&pool);
             let attempts = Arc::clone(&attempts);
             threads.push(std::thread::spawn(move || {
-                pool.get_or_connect("shared", || {
+                pool.get_or_connect("shared", &Cancel::never(), || {
                     attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Err("startup failed".into())
                 }).err().unwrap()
@@ -1715,6 +1801,11 @@ pub fn run_round(
                 continue;
             }
             let root = std::path::Path::new(project_root);
+            // A participant's own workspace root, or the project root when it
+            // named none. The sandbox, when assigned, supersedes it for file
+            // and shell access — this is just the root the participant's
+            // own servers expand.
+            let file_root = file_root_for(&participant_def, root);
             // The sandbox belongs to the conversation, not to the agent, so
             // every participant in a group works in the same box.
             let sandbox = store
@@ -1722,8 +1813,9 @@ pub fn run_round(
                 .and_then(|s| s.get("sandboxId").and_then(|v| v.as_str().map(str::to_string)))
                 .unwrap_or_default();
             let (servers, mcp_errors) =
-                pool.ensure_in_sandbox(&participant_def.mcp, root, &sandbox);
+                pool.ensure_in_sandbox_cancellable(&participant_def.mcp, &file_root, &sandbox, &stop.switch);
             for e in &mcp_errors {
+                if stop.stopped() { break; }
                 let _ = store.append_event(&conv, mark.ev("error", json!({ "message": e })));
                 emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
             }
@@ -1864,7 +1956,7 @@ fn advance(store: &ConvStore, conv: &str, pid: &i64, seq: i64, round: i64, task_
 fn run_participant(
     store: &ConvStore,
     rt: &tokio::runtime::Runtime,
-    stop: &Cancel,
+    stop: &Arc<Cancel>,
     approvals: &Arc<Approvals>,
     servers: &[Arc<McpServer>],
     def: &AgentDef,
@@ -1933,6 +2025,7 @@ fn run_participant(
         &def.policy_mode,
         conv,
         Arc::clone(approvals),
+        Arc::clone(stop),
     );
 
     // What this participant was actually given, on the record — the

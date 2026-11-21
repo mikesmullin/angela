@@ -26,8 +26,8 @@ pub fn names() -> Vec<String> {
         .map(|(name, _)| name).collect()
 }
 
-fn expand(value: &str, project_root: &Path) -> String {
-    let mut s = value.replace("${projectRoot}", &project_root.to_string_lossy());
+fn expand(value: &str, root: &Path) -> String {
+    let mut s = value.replace("${projectRoot}", &root.to_string_lossy());
     while let Some(start) = s.find("${env:") {
         let Some(end_offset) = s[start..].find('}') else { break };
         let end = start + end_offset;
@@ -38,14 +38,18 @@ fn expand(value: &str, project_root: &Path) -> String {
 }
 
 /// Translate a configured stdio server into the MCP client's launch spec.
-pub fn preset(name: &str, project_root: &Path) -> Option<ServerSpec> {
+///
+/// `file_root` is what the agent's `${projectRoot}` expands to: the agent's
+/// own workspace root if it named one, else the project root. One server per
+/// distinct root, because the root lives in the child's env.
+pub fn preset(name: &str, file_root: &Path) -> Option<ServerSpec> {
     let entries = servers();
     let v = entries.get(name)?;
     if v.get("disabled").and_then(|v| v.as_bool()) == Some(true) { return None; }
-    let command = expand(v.get("command")?.as_str()?, project_root);
-    let args = v.get("args").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).map(|v| expand(v, project_root)).collect()).unwrap_or_default();
-    let env = v.get("env").and_then(|v| v.as_object()).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), expand(v, project_root)))).collect()).unwrap_or_default();
-    let cwd = v.get("cwd").and_then(|v| v.as_str()).map(|s| expand(s, project_root)).or_else(|| Some(project_root.to_string_lossy().into_owned()));
+    let command = expand(v.get("command")?.as_str()?, file_root);
+    let args = v.get("args").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).map(|v| expand(v, file_root)).collect()).unwrap_or_default();
+    let env = v.get("env").and_then(|v| v.as_object()).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), expand(v, file_root)))).collect()).unwrap_or_default();
+    let cwd = v.get("cwd").and_then(|v| v.as_str()).map(|s| expand(s, file_root)).or_else(|| Some(file_root.to_string_lossy().into_owned()));
     let framing = match v.get("framing").and_then(|v| v.as_str()) { Some("lsp") | Some("content-length") => Framing::Lsp, _ => Framing::Newline };
     Some(ServerSpec { name: name.to_string(), command, args, cwd, env, framing })
 }

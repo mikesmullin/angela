@@ -18,7 +18,10 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use crate::cancel::Cancel;
+
+const POLL: Duration = Duration::from_millis(50);
 
 use serde_json::{json, Map, Value};
 
@@ -86,6 +89,11 @@ pub struct McpServer {
 impl McpServer {
     /// Spawn, `initialize`, and read the tool list.
     pub fn connect(spec: &ServerSpec, timeout: Duration) -> Result<Arc<Self>, String> {
+        Self::connect_cancellable(spec, timeout, &Cancel::never())
+    }
+
+    pub fn connect_cancellable(spec: &ServerSpec, timeout: Duration, stop: &Cancel) -> Result<Arc<Self>, String> {
+        if stop.stopped() { return Err("stopped".into()); }
         let mut cmd = Command::new(&spec.command);
         cmd.args(&spec.args)
             .stdin(Stdio::piped())
@@ -145,18 +153,18 @@ impl McpServer {
             },
         });
 
-        server.request(
+        server.request_cancellable(
             "initialize",
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": { "name": "angela", "version": "0.1.0" },
             }),
-            timeout,
+            timeout, stop,
         )?;
         server.notify("notifications/initialized", json!({}));
 
-        let listed = server.request("tools/list", json!({}), timeout)?;
+        let listed = server.request_cancellable("tools/list", json!({}), timeout, stop)?;
         let tools = parse_tools(&listed);
 
         // `tools` is set after connect, so rebuild the Arc with it in place.
@@ -184,8 +192,13 @@ impl McpServer {
 
     /// A request that expects a reply.
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        self.request_cancellable(method, params, timeout, &Cancel::never())
+    }
+
+    pub fn request_cancellable(&self, method: &str, params: Value, timeout: Duration, stop: &Cancel) -> Result<Value, String> {
+        if stop.stopped() { return Err("stopped".into()); }
         match &self.transport {
-            Transport::Http { url } => http_rpc(url, method, params, timeout),
+            Transport::Http { url } => http_rpc(url, method, params, timeout, stop),
             Transport::Stdio {
                 pending, next_id, ..
             } => {
@@ -199,11 +212,22 @@ impl McpServer {
                     pending.lock().unwrap().remove(&id);
                     return Err(e);
                 }
-                match rx.recv_timeout(timeout) {
-                    Ok(r) => r,
-                    Err(_) => {
+                let deadline = Instant::now() + timeout;
+                loop {
+                    if stop.stopped() {
                         pending.lock().unwrap().remove(&id);
-                        Err(format!("MCP {} {method} timed out", self.name))
+                        self.notify("notifications/cancelled", json!({ "requestId": id, "reason": "Stopped" }));
+                        return Err("stopped".into());
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        pending.lock().unwrap().remove(&id);
+                        return Err(format!("MCP {} {method} timed out", self.name));
+                    }
+                    match rx.recv_timeout(remaining.min(POLL)) {
+                        Ok(r) => return if stop.stopped() { Err("stopped".into()) } else { r },
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+                        Err(_) => { pending.lock().unwrap().remove(&id); return Err("MCP server exited".into()); }
                     }
                 }
             }
@@ -223,10 +247,14 @@ impl McpServer {
 
     /// `tools/call`, flattened to the text the model should see.
     pub fn call_tool(&self, name: &str, args: &Value, timeout: Duration) -> Result<String, String> {
-        let result = self.request(
+        self.call_tool_cancellable(name, args, timeout, &Cancel::never())
+    }
+
+    pub fn call_tool_cancellable(&self, name: &str, args: &Value, timeout: Duration, stop: &Cancel) -> Result<String, String> {
+        let result = self.request_cancellable(
             "tools/call",
             json!({ "name": name, "arguments": args }),
-            timeout,
+            timeout, stop,
         )?;
         Ok(flatten_content(&result))
     }
@@ -255,7 +283,11 @@ impl Drop for McpServer {
 /// the door. There is no handshake to perform — the facade does its own
 /// against the guest daemon — so this goes straight to `tools/list`.
 pub fn connect_http(name: &str, url: &str, timeout: Duration) -> Result<Arc<McpServer>, String> {
-    let listed = http_rpc(url, "tools/list", json!({}), timeout)?;
+    connect_http_cancellable(name, url, timeout, &Cancel::never())
+}
+
+pub fn connect_http_cancellable(name: &str, url: &str, timeout: Duration, stop: &Cancel) -> Result<Arc<McpServer>, String> {
+    let listed = http_rpc(url, "tools/list", json!({}), timeout, stop)?;
     Ok(Arc::new(McpServer {
         name: name.to_string(),
         tools: parse_tools(&listed),
@@ -274,7 +306,7 @@ pub fn connect_http(name: &str, url: &str, timeout: Duration) -> Result<Arc<McpS
 /// field itself — sending it is an `unknown_field` error — and answers
 /// `{ok, result}` rather than a bare JSON-RPC envelope. Both quirks are
 /// absorbed here so everything above this line sees ordinary MCP.
-fn http_rpc(url: &str, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+fn http_rpc(url: &str, method: &str, params: Value, timeout: Duration, stop: &Cancel) -> Result<Value, String> {
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
 
@@ -291,20 +323,49 @@ fn http_rpc(url: &str, method: &str, params: Value, timeout: Duration) -> Result
         .map_err(|_| format!("bad MCP address: {hostport}"))?;
 
     let body = json!({ "id": 1, "method": method, "params": params }).to_string();
-    let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("MCP over HTTP: cannot reach {hostport}: {e}"))?;
-    sock.set_read_timeout(Some(timeout)).ok();
+    let deadline = Instant::now() + timeout;
+    let mut sock = loop {
+        if stop.stopped() { return Err("stopped".into()); }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { return Err(format!("MCP over HTTP: cannot reach {hostport}: timed out")); }
+        match TcpStream::connect_timeout(&addr, remaining.min(POLL)) {
+            Ok(sock) => break sock,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e) => return Err(format!("MCP over HTTP: cannot reach {hostport}: {e}")),
+        }
+    };
+    sock.set_read_timeout(Some(POLL)).ok();
+    sock.set_write_timeout(Some(POLL)).ok();
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
-    sock.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
-    sock.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
-    sock.flush().ok();
+    for mut bytes in [head.as_bytes(), body.as_bytes()] {
+        while !bytes.is_empty() {
+            if stop.stopped() { return Err("stopped".into()); }
+            if Instant::now() >= deadline { return Err("MCP over HTTP timed out".into()); }
+            match sock.write(bytes) {
+                Ok(0) => return Err("MCP over HTTP: connection closed".into()),
+                Ok(n) => bytes = &bytes[n..],
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => continue,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
 
     let mut raw = Vec::new();
-    sock.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 8192];
+    loop {
+        if stop.stopped() { return Err("stopped".into()); }
+        if Instant::now() >= deadline { return Err("MCP over HTTP timed out".into()); }
+        match sock.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
     let text = String::from_utf8_lossy(&raw).to_string();
     let split = text
         .find("\r\n\r\n")
@@ -496,6 +557,75 @@ pub fn schema_parts(schema: &Value) -> (Value, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_server(script: &str) -> ServerSpec {
+        ServerSpec { name: "test".into(), command: "python3".into(),
+            args: vec!["-u".into(), "-c".into(), script.into()], cwd: None,
+            env: vec![], framing: Framing::Newline }
+    }
+
+    #[test]
+    fn stop_interrupts_stdio_connect() {
+        let stop = Cancel::never();
+        let worker_stop = stop.clone();
+        let spec = fake_server("import sys,time; sys.stdin.readline(); time.sleep(30)");
+        let start = Instant::now();
+        let worker = std::thread::spawn(move || McpServer::connect_cancellable(&spec, Duration::from_secs(20), &worker_stop));
+        std::thread::sleep(Duration::from_millis(100));
+        stop.stop();
+        assert!(worker.join().unwrap().is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stop_interrupts_stdio_tool_and_sends_cancel_notification() {
+        let script = r#"import sys,json
+for line in sys.stdin:
+ m=json.loads(line)
+ if m.get('method') == 'initialize': print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{}}), flush=True)
+ elif m.get('method') == 'tools/list': print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'tools':[]}}), flush=True)
+ elif m.get('method') == 'tools/call': print(json.dumps({'jsonrpc':'2.0','method':'test/called'}), flush=True)
+ elif m.get('method') == 'notifications/cancelled': print(json.dumps({'jsonrpc':'2.0','id':999,'result':m['params']}), flush=True)
+"#;
+        let srv = McpServer::connect(&fake_server(script), Duration::from_secs(2)).unwrap();
+        let (tx, rx) = channel();
+        if let Transport::Stdio { pending, .. } = &srv.transport { pending.lock().unwrap().insert(999, tx); }
+        let stop = Cancel::never();
+        let worker_stop = stop.clone();
+        let worker_srv = srv.clone();
+        let start = Instant::now();
+        let worker = std::thread::spawn(move || worker_srv.call_tool_cancellable("slow", &json!({}), Duration::from_secs(20), &worker_stop));
+        std::thread::sleep(Duration::from_millis(100));
+        stop.stop();
+        assert_eq!(worker.join().unwrap().unwrap_err(), "stopped");
+        let notification = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(notification["requestId"], 3);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stop_interrupts_http_wait() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/rpc", listener.local_addr().unwrap());
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 4096];
+            let _ = socket.read(&mut buf);
+            accepted.send(()).unwrap();
+            let _ = socket.read(&mut buf);
+        });
+        let stop = Cancel::never();
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || connect_http_cancellable("test", &url, Duration::from_secs(20), &worker_stop));
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = Instant::now();
+        stop.stop();
+        assert!(worker.join().unwrap().is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        server.join().unwrap();
+    }
 
     #[test]
     fn text_content_is_joined() {

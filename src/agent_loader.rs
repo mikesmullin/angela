@@ -43,6 +43,9 @@ pub struct AgentDef {
     pub reasoning_effort: String,
     pub models: Vec<String>,
     pub context_window: Option<u64>,
+    /// The workspace this agent works in: the root its filesystem and shell
+    /// MCP servers expand `${projectRoot}` against. `None`/blank means the
+    /// project root; a relative value resolves under that root.
     pub cwd: Option<String>,
     pub env: BTreeMap<String, String>,
     /// MCP preset names, e.g. `["file-io", "term-local"]`.

@@ -31,7 +31,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use crate::cancel::Cancel;
 
 use serde_json::{json, Value};
 
@@ -146,6 +147,11 @@ impl Approvals {
     /// Called from a tool handler, which is to say from inside the turn:
     /// everything that turn would do next is waiting on this.
     pub fn ask(&self, session: &str, tool: &str, command: &str, args: &Value) -> Decision {
+        self.ask_cancellable(session, tool, command, args, &Cancel::never())
+    }
+
+    pub fn ask_cancellable(&self, session: &str, tool: &str, command: &str, args: &Value, stop: &Cancel) -> Decision {
+        if stop.stopped() { return Decision::Deny; }
         let (tx, rx) = mpsc::channel();
         let req = {
             let mut s = self.state.lock().unwrap();
@@ -162,11 +168,16 @@ impl Approvals {
             req
         };
 
-        let decision = match rx.recv_timeout(ASK_TIMEOUT) {
-            Ok(d) => d,
-            // Nobody answered, or the sender was dropped by `forget`. Either
-            // way the answer is no.
-            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => Decision::Deny,
+        let deadline = Instant::now() + ASK_TIMEOUT;
+        let decision = loop {
+            if stop.stopped() { break Decision::Deny; }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { break Decision::Deny; }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(d) => break if stop.stopped() { Decision::Deny } else { d },
+                Err(RecvTimeoutError::Timeout) => {},
+                Err(RecvTimeoutError::Disconnected) => break Decision::Deny,
+            }
         };
 
         let mut s = self.state.lock().unwrap();
@@ -256,6 +267,20 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         panic!("no question was ever asked");
+    }
+
+    #[test]
+    fn stop_cancels_and_removes_a_pending_approval() {
+        let a = Arc::new(Approvals::new());
+        let stop = Cancel::never();
+        let worker_stop = stop.clone();
+        let worker = a.clone();
+        let h = thread::spawn(move || worker.ask_cancellable("s1", "tool", "", &json!({}), &worker_stop));
+        let id = wait_for_question(&a);
+        stop.stop();
+        assert_eq!(h.join().unwrap(), Decision::Deny);
+        assert!(a.pending("s1").is_empty());
+        assert!(!a.resolve(&id, Decision::Allow));
     }
 
     #[test]
