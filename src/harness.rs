@@ -37,6 +37,9 @@ use crate::session_store::{ContextItem, NewEvent, NewSession};
 
 /// How long one tool call may take before the turn gives up on it.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Audio8 may transcribe an hour-long recording locally; the MCP tool has its
+/// own two-hour deadline, and Stop remains available throughout.
+const VIDEO_TRANSCRIPT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60 + 60);
 /// Starting a server should be fast; a hang here would stall the first turn.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -531,7 +534,12 @@ pub fn register_tools(
                         }
                     }
                     if stop.stopped() { return Ok("stopped".into()); }
-                    match srv.call_tool_cancellable(&remote, args, TOOL_TIMEOUT, &stop) {
+                    let timeout = if gate_name == "video_transcribe__transcript" {
+                        VIDEO_TRANSCRIPT_TIMEOUT
+                    } else {
+                        TOOL_TIMEOUT
+                    };
+                    match srv.call_tool_cancellable(&remote, args, timeout, &stop) {
                         Ok(text) => Ok(text),
                         Err(e) => Ok(format!("error: {e}")),
                     }
