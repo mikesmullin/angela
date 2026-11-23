@@ -315,13 +315,15 @@ pub enum Invite {
 ///
 /// A mention always wins. Naming an agent is an unambiguous request for it,
 /// and making a `relevant` agent pass a relevance check before answering a
-/// direct question would be a bug the user cannot work around.
+/// direct question would be a bug the user cannot work around. A sole active
+/// invoked agent is implicitly addressed by the user's message.
 pub fn invitations(
     roster: &[Participant],
     engagement_of: &dyn Fn(&Participant) -> Engagement,
     trigger_text: &str,
 ) -> Vec<(i64, Invite)> {
     let named = mentions(trigger_text);
+    let lone_agent = roster.iter().filter(|p| p.is_agent() && p.active).count() == 1;
     roster
         .iter()
         .filter(|p| p.is_agent() && p.active)
@@ -332,6 +334,7 @@ pub fn invitations(
                 match engagement_of(p) {
                     Engagement::Engaged => Invite::Always,
                     Engagement::Relevant => Invite::Ask,
+                    Engagement::Invoked if lone_agent => Invite::Mentioned,
                     Engagement::Invoked => Invite::Skip,
                 }
             };
@@ -827,6 +830,19 @@ mod tests {
         // Naming an agent is an unambiguous request for it; making a
         // `relevant` one pass a check first would be unfixable from the UI.
         assert_eq!(got, vec![(2, Invite::Mentioned), (3, Invite::Mentioned)]);
+    }
+
+    #[test]
+    fn a_single_invoked_agent_is_addressed_without_a_mention() {
+        let mut inactive = seat("agent", 3, "former");
+        inactive.active = false;
+        let roster = vec![seat("user", 1, "user"), seat("agent", 2, "alice"), inactive];
+        let invoked = |_: &Participant| Engagement::Invoked;
+        assert_eq!(invitations(&roster, &invoked, "hello"), vec![(2, Invite::Mentioned)]);
+        assert_eq!(invitations(&roster, &invoked, "@alice hello"), vec![(2, Invite::Mentioned)]);
+        assert_eq!(invitations(&roster, &invoked, "@someone hello"), vec![(2, Invite::Mentioned)]);
+        assert_eq!(invitations(&roster, &|_| Engagement::Relevant, "hello"), vec![(2, Invite::Ask)]);
+        assert_eq!(invitations(&roster, &|_| Engagement::Engaged, "hello"), vec![(2, Invite::Always)]);
     }
 
     #[test]

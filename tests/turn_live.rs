@@ -5,9 +5,9 @@
 //! `AGL_BASE_URL` / `ANGELA_TEST_MODEL`.
 
 use angela::agent_loader;
-use angela::harness::{run_turn, LiveTabs, McpPool, TurnRequest};
-use angela::conv_store::ConvStore;
+use angela::harness::{run_turn, TurnRequest};
 use serde_json::Value;
+use std::sync::Arc;
 
 fn endpoint_up() -> bool {
     let base = std::env::var("AGL_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234".into());
@@ -35,30 +35,22 @@ fn a_turn_streams_persists_and_is_remembered() {
         .unwrap_or_else(|_| "llama-server:default".into());
 
     let tmp = tempfile::tempdir().unwrap();
-    let store = ConvStore::new(tmp.path()).unwrap();
-    let tabs = LiveTabs::default();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    // No MCP presets: this test is about the turn loop, not tools.
-    let pool = McpPool::default();
-    let cancels = angela::cancel::Cancels::default();
-    // Nothing here is gated, so nothing ever asks — but the turn loop
-    // takes the registry either way.
-    let approvals = std::sync::Arc::new(angela::approvals::Approvals::new());
+    // One AppState — the same handle the chat-control tools take, with the
+    // store and runtime the turn needs living inside it.
+    let app = Arc::new(angela::serve::AppState::new(tmp.path(), 0).unwrap());
     let def = agent_loader::AgentDef::default();
 
     // ---- turn one --------------------------------------------------------
     let mut rows: Vec<Value> = Vec::new();
     run_turn(
-        &store,
-        &tabs,
-        &rt,
+        &app,
+        &app.store,
+        &app.tabs,
+        &app.rt,
         "/tmp",
-        &pool,
-        &cancels,
-        &approvals,
+        &app.mcp,
+        &app.cancels,
+        &app.approvals,
         &def,
         TurnRequest {
             tab_id: "1".into(),
@@ -67,6 +59,7 @@ fn a_turn_streams_persists_and_is_remembered() {
             model: Some(model.clone()),
             new_session: false,
             session_id: None,
+            from: None,
         },
         &mut |v: &Value| {
             rows.push(v.clone());
@@ -91,7 +84,7 @@ fn a_turn_streams_persists_and_is_remembered() {
 
     // ---- it persisted ----------------------------------------------------
     let sid = rows[0]["sessionId"].as_str().unwrap().to_string();
-    let st = store.load(&sid).expect("session on disk");
+    let st = app.store.load(&sid).expect("session on disk");
     assert_eq!(st["turns"], 1);
     assert_eq!(st["status"], "ready");
     assert_eq!(
@@ -99,7 +92,7 @@ fn a_turn_streams_persists_and_is_remembered() {
         "titled from the first user message"
     );
 
-    let msgs = angela::serve::reconstruct_messages(&store, &sid);
+    let msgs = angela::serve::reconstruct_messages(&app.store, &sid);
     assert_eq!(msgs.first().unwrap()["kind"], "user");
     assert!(
         msgs.iter().any(|m| m["kind"] == "assistant"),
@@ -109,13 +102,14 @@ fn a_turn_streams_persists_and_is_remembered() {
     // ---- turn two on the same tab remembers turn one ---------------------
     let mut answer = String::new();
     run_turn(
-        &store,
-        &tabs,
-        &rt,
+        &app,
+        &app.store,
+        &app.tabs,
+        &app.rt,
         "/tmp",
-        &pool,
-        &cancels,
-        &approvals,
+        &app.mcp,
+        &app.cancels,
+        &app.approvals,
         &def,
         TurnRequest {
             tab_id: "1".into(),
@@ -124,6 +118,7 @@ fn a_turn_streams_persists_and_is_remembered() {
             model: Some(model),
             new_session: false,
             session_id: None,
+            from: None,
         },
         &mut |v: &Value| {
             if v["type"] == "assistant_delta" {
@@ -138,32 +133,25 @@ fn a_turn_streams_persists_and_is_remembered() {
         answer.to_lowercase().contains("pineapple"),
         "the second turn lost the first: {answer:?}"
     );
-    let st = store.load(&sid).unwrap();
+    let st = app.store.load(&sid).unwrap();
     assert_eq!(st["turns"], 2, "both turns recorded on ONE session");
-    assert_eq!(store.list().len(), 1, "the tab reused its session");
+    assert_eq!(app.store.list().len(), 1, "the tab reused its session");
 }
 
 #[test]
 fn an_empty_prompt_is_refused_before_any_session_is_made() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = ConvStore::new(tmp.path()).unwrap();
-    let tabs = LiveTabs::default();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let pool = McpPool::default();
-    let cancels = angela::cancel::Cancels::default();
-    let approvals = std::sync::Arc::new(angela::approvals::Approvals::new());
+    let app = Arc::new(angela::serve::AppState::new(tmp.path(), 0).unwrap());
     let def = agent_loader::AgentDef::default();
     let err = run_turn(
-        &store,
-        &tabs,
-        &rt,
+        &app,
+        &app.store,
+        &app.tabs,
+        &app.rt,
         "/tmp",
-        &pool,
-        &cancels,
-        &approvals,
+        &app.mcp,
+        &app.cancels,
+        &app.approvals,
         &def,
         TurnRequest {
             tab_id: "1".into(),
@@ -172,9 +160,10 @@ fn an_empty_prompt_is_refused_before_any_session_is_made() {
             model: None,
             new_session: false,
             session_id: None,
+            from: None,
         },
         &mut |_: &Value| true,
     );
     assert!(err.is_err());
-    assert!(store.list().is_empty(), "no junk session was created");
+    assert!(app.store.list().is_empty(), "no junk session was created");
 }

@@ -243,6 +243,13 @@ impl ConvStore {
         f(&conn)
     }
 
+    /// The identity half of the store: users, devices, capabilities and
+    /// the ACL (see [`crate::identity`]). Same database, same lock
+    /// discipline — one statement per method.
+    pub fn identity(&self) -> crate::identity::Identity<'_> {
+        crate::identity::Identity { conn: &self.conn }
+    }
+
     // -----------------------------------------------------------------------
     // Conversations
     // -----------------------------------------------------------------------

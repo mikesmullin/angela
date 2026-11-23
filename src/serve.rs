@@ -51,7 +51,21 @@ pub struct AppState {
     /// One runtime for the whole server: the HTTP layer is a thread per
     /// connection, but agl is async, so each turn blocks on this.
     pub rt: tokio::runtime::Runtime,
+    /// How a turn is submitted to a session from inside a turn — the
+    /// `chat__sessions_prompt` tool's enqueue path. The host wires this to
+    /// its own pipeline (chat-server bridges to its live event feed so a
+    /// coordinator-submitted prompt reaches open browsers like a typed
+    /// one). `None` on a bare host makes the tool say so instead of
+    /// pretending.
+    pub prompt_sender: Option<PromptSender>,
 }
+
+/// `prompt_sender(session, content, agent, model)` — fire-and-forget. The
+/// implementation must spawn the turn itself: the caller is a tool handler
+/// inside another turn and must return immediately, or a single-slot local
+/// model deadlocks (the calling turn holds the slot the nested turn queues
+/// behind).
+pub type PromptSender = std::sync::Arc<dyn Fn(&str, String, String, String) + Send + Sync>;
 
 impl AppState {
     pub fn new(project_root: impl AsRef<std::path::Path>, port: u16) -> std::io::Result<Self> {
@@ -104,6 +118,7 @@ impl AppState {
             rt: tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?,
+            prompt_sender: None,
         })
     }
 }
@@ -269,6 +284,7 @@ pub fn reconstruct_from_events(events: Vec<EventWrapper>) -> Vec<Value> {
                 "eventId": eid,
                 "kind": if role == "user" { "user" } else { "assistant" },
                 "text": crate::session_store::js_string_of(po.get("content").unwrap()),
+                "from": po.get("from").cloned().unwrap_or(Value::Null),
                 "visible": visible,
                 "telemetry": clone_telemetry(Some(&telemetry)),
                 "goto": goto,
@@ -337,6 +353,20 @@ pub fn reconstruct_from_events(events: Vec<EventWrapper>) -> Vec<Value> {
             messages.push(json!({
                 "id": eid, "eventId": eid, "kind": "system",
                 "text": crate::harness::STOPPED_NOTICE,
+                "visible": visible, "goto": goto,
+            }));
+            continue;
+        }
+        // The turn queue: this turn waited for a free slot of its model
+        // before inference could start. Kept because "why did nothing
+        // happen for a minute?" is answered by it.
+        if wrap.event_type == "queued" {
+            let spec = po.get("spec").and_then(Value::as_str).unwrap_or("");
+            let position = po.get("position").and_then(Value::as_i64).unwrap_or(1);
+            messages.push(json!({
+                "id": eid, "eventId": eid, "kind": "queued",
+                "text": format!("waiting for {spec} slot…"),
+                "spec": spec, "position": position,
                 "visible": visible, "goto": goto,
             }));
             continue;
@@ -1116,6 +1146,7 @@ impl Server {
                         .map(crate::session_store::js_truthy)
                         .unwrap_or(false),
                     session_id: sv("sessionId"),
+                    from: sv("from"),
                 };
                 if !crate::group::mentions(&turn.content).is_empty() {
                     // Resolve first so an invitation affects this very turn,
@@ -1183,12 +1214,12 @@ impl Server {
                     let mut emit = |v: &Value| sink.row(v);
                     let _ = if seated != 1 {
                         harness::run_round(
-                            &st.store, &st.tabs, &st.rt, &st.project_root,
+                            st, &st.store, &st.tabs, &st.rt, &st.project_root,
                             &st.mcp, &st.cancels, &st.approvals, &def, turn, &mut emit,
                         )
                     } else {
                         harness::run_turn(
-                            &st.store, &st.tabs, &st.rt, &st.project_root,
+                            st, &st.store, &st.tabs, &st.rt, &st.project_root,
                             &st.mcp, &st.cancels, &st.approvals, &def, turn, &mut emit,
                         )
                     };

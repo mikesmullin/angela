@@ -347,6 +347,9 @@ pub struct TurnRequest {
     pub new_session: bool,
     /// Resume a specific session (the history rail clicking an old one).
     pub session_id: Option<String>,
+    /// Who said it — the seat's name in a multi-human room (PLAN44 A6).
+    /// `None` is "the user" and renders as "You".
+    pub from: Option<String>,
 }
 
 #[derive(Debug)]
@@ -824,6 +827,7 @@ fn flush_approvals(
 /// turn rather than finishing work nobody will see.
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn(
+    app: &Arc<crate::serve::AppState>,
     store: &ConvStore,
     tabs: &LiveTabs,
     rt: &tokio::runtime::Runtime,
@@ -868,13 +872,15 @@ pub fn run_turn(
     store.set_status(&session_id, "running");
 
     // The user's message is durable before any inference runs: if the model
-    // call fails, the prompt is still in the transcript.
+    // call fails, the prompt is still in the transcript. `from` names the
+    // human who said it — a multi-human room is unreadable without it.
+    let mut user_payload = serde_json::json!({ "role": "user", "content": content });
+    if let Some(from) = req.from.as_ref().filter(|f| !f.trim().is_empty()) {
+        user_payload["from"] = json!(from.trim());
+    }
     let _ = store.append_event(
         &session_id,
-        NewEvent::new(
-            "context_window",
-            json!({ "role": "user", "content": content }),
-        ),
+        NewEvent::new("context_window", user_payload),
     );
 
     // One mark for this whole turn, made before anything it covers — the
@@ -887,10 +893,8 @@ pub fn run_turn(
         0,
     );
 
-    // Engagement applies here too, not only in a group. A lone agent set to
-    // `invoked` should wait to be named, and one set to `relevant` should be
-    // asked — otherwise the field would silently mean nothing until a second
-    // agent joined.
+    // A lone invoked agent is implicitly addressed by the user's message;
+    // relevant agents still pass through their relevance decision.
     if let Some(p) = me.clone() {
         let roster = vec![p];
         let quiet = |store: &ConvStore, emit: &mut dyn FnMut(&Value) -> bool| {
@@ -1025,6 +1029,19 @@ pub fn run_turn(
         Arc::clone(approvals),
         Arc::clone(&stop.switch),
     );
+    // The coordinator family (chat__sessions_* and friends): same gates as
+    // every other tool — registered only if the agent's tool list allows,
+    // each call checked against the allowlist or the approval queue.
+    crate::chat_tools::register(
+        &mut agent,
+        app,
+        def.tools_enabled.as_ref(),
+        &allow_text,
+        &def.policy_mode,
+        &session_id,
+        Arc::clone(approvals),
+        Arc::clone(&stop.switch),
+    );
     let tool_names: Vec<String> = agent.tools.keys().cloned().collect();
 
     emit(&json!({
@@ -1084,6 +1101,23 @@ pub fn run_turn(
         // once it finishes.
         let who = mark.handle.clone();
         let mut on_event = |e: TurnEvent<'_>| match e {
+            // The turn queue: this turn is waiting for a free slot of its
+            // `provider:model`. Durable and on screen immediately — the
+            // user must see why nothing is streaming yet.
+            TurnEvent::Queued { spec, position } => {
+                let w = store.append_event(
+                    &sid,
+                    mark.ev("queued", json!({ "spec": spec, "position": position })),
+                );
+                let event_id = w.map(|x| x.event_id).unwrap_or_default();
+                emit(&json!({
+                    "type": "card",
+                    "card": { "kind": "queued", "text": format!("waiting for {spec} slot…"),
+                              "spec": spec, "position": position,
+                              "eventId": event_id, "turn": mark.id, "handle": who,
+                              "visible": true },
+                }));
+            }
             TurnEvent::Delta { text, channel } => {
                 if first_token_at.is_none() {
                     first_token_at = Some(started.elapsed());
@@ -1477,6 +1511,7 @@ for line in sys.stdin:
             model: None,
             new_session: false,
             session_id: None,
+            from: None,
         };
         let a = resolve_session(&s, &tabs, &req).unwrap();
         tabs.set(
@@ -1504,6 +1539,7 @@ for line in sys.stdin:
                 model: None,
                 new_session: false,
                 session_id: None,
+                from: None,
             },
         )
         .unwrap();
@@ -1525,6 +1561,7 @@ for line in sys.stdin:
                 model: None,
                 new_session: true,
                 session_id: None,
+                from: None,
             },
         )
         .unwrap();
@@ -1549,6 +1586,7 @@ for line in sys.stdin:
                 model: None,
                 new_session: false,
                 session_id: Some(target.clone()),
+                from: None,
             },
         )
         .unwrap();
@@ -1569,6 +1607,7 @@ for line in sys.stdin:
                 model: None,
                 new_session: false,
                 session_id: Some("does-not-exist".into()),
+                from: None,
             },
         )
         .unwrap();
@@ -1663,6 +1702,7 @@ for line in sys.stdin:
 /// is the channel between them.
 #[allow(clippy::too_many_arguments)]
 pub fn run_round(
+    app: &Arc<crate::serve::AppState>,
     store: &ConvStore,
     tabs: &LiveTabs,
     rt: &tokio::runtime::Runtime,
@@ -1694,12 +1734,14 @@ pub fn run_round(
     title_from_first_message(store, &conv, &content);
     store.set_status(&conv, "running");
 
-    // The user's message is durable before any model runs.
+    // The user's message is durable before any model runs. `from` names the
+    // human who said it (PLAN44 A6) — same rule as the single-agent path.
+    let mut user_payload = serde_json::json!({ "role": "user", "content": content });
+    if let Some(from) = req.from.as_ref().filter(|f| !f.trim().is_empty()) {
+        user_payload["from"] = json!(from.trim());
+    }
     let user_node = store
-        .append_event(
-            &conv,
-            NewEvent::new("context_window", json!({ "role": "user", "content": content })),
-        )
+        .append_event(&conv, NewEvent::new("context_window", user_payload))
         .map_err(|e| TurnError::Store(e.to_string()))?;
 
     let roster = store.participants(&conv);
@@ -1708,13 +1750,18 @@ pub fn run_round(
     // Nobody to answer. The message is already durable, so this is a state
     // the user can fix and then re-send from — but silence with no
     // explanation would read as a broken app, so it is stated plainly.
+    // Unless the room has other humans in it: a DM is not a broken agent
+    // queue (PLAN44 A4), and a "no agents" card in a chat is noise.
     if !roster.iter().any(|p| p.is_agent() && p.active) {
-        let notice = "No agents in this conversation yet. \
-                      Invite one with /invite @name — see the Agents rail.";
-        emit(&json!({
-            "type": "card",
-            "card": { "kind": "system", "text": notice, "visible": true },
-        }));
+        let humans = roster.iter().filter(|p| !p.is_agent() && p.active).count();
+        if humans < 2 {
+            let notice = "No agents in this conversation yet. \
+                          Invite one with /invite @name — see the Agents rail.";
+            emit(&json!({
+                "type": "card",
+                "card": { "kind": "system", "text": notice, "visible": true },
+            }));
+        }
         store.set_status(&conv, "ready");
         emit(&json!({
             "type": "done", "ok": true, "sessionId": conv,
@@ -1852,8 +1899,8 @@ pub fn run_round(
                 emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
             }
             let reply = match run_participant(
-                store, rt, &stop.switch, approvals, &servers, &participant_def, &conv, &me, &task,
-                &model, &mark, emit,
+                app, store, rt, &stop.switch, approvals, &servers, &participant_def, &conv, &me,
+                &task, &model, &mark, emit,
             ) {
                 Ok(r) => r,
                 // Not an error card: the user did this on purpose. Leaving
@@ -1986,6 +2033,7 @@ fn advance(store: &ConvStore, conv: &str, pid: &i64, seq: i64, round: i64, task_
 /// role, which is the invariant the whole group design rests on.
 #[allow(clippy::too_many_arguments)]
 fn run_participant(
+    app: &Arc<crate::serve::AppState>,
     store: &ConvStore,
     rt: &tokio::runtime::Runtime,
     stop: &Arc<Cancel>,
@@ -2059,6 +2107,18 @@ fn run_participant(
         Arc::clone(approvals),
         Arc::clone(stop),
     );
+    // Coordinators take part in group rooms too — the same tools, gates,
+    // and (later) the same owner-ACL check as the single-agent path.
+    crate::chat_tools::register(
+        &mut agent,
+        app,
+        def.tools_enabled.as_ref(),
+        &allow_text,
+        &def.policy_mode,
+        conv,
+        Arc::clone(approvals),
+        Arc::clone(stop),
+    );
 
     // What this participant was actually given, on the record — the
     // flattened room prompt, not the user's typed message. They are
@@ -2079,6 +2139,21 @@ fn run_participant(
     let pid = me.id;
     let answer = {
         let mut on_event = |e: TurnEvent<'_>| match e {
+            // Same turn queue as the single-agent path: waiting for a slot.
+            TurnEvent::Queued { spec, position } => {
+                let w = store.append_event(
+                    conv,
+                    mark.ev("queued", json!({ "spec": spec, "position": position })),
+                );
+                let event_id = w.map(|x| x.event_id).unwrap_or_default();
+                emit(&json!({
+                    "type": "card",
+                    "card": { "kind": "queued", "text": format!("waiting for {spec} slot…"),
+                              "spec": spec, "position": position,
+                              "eventId": event_id, "participantId": pid,
+                              "turn": mark.id, "handle": handle, "visible": true },
+                }));
+            }
             TurnEvent::Delta { text, channel } => match channel {
                 Channel::Reasoning => {
                     said.reasoning.push_str(text);

@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when the DDL below changes in a way an existing file must be
 /// brought forward to. Recorded in `schema_meta`.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 11;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -303,6 +303,96 @@ CREATE TABLE IF NOT EXISTS memory_view (
     updated_at      TEXT NOT NULL
 );
 
+-- Identity, devices and the ACL (PLAN44): the WHO, the WHAT and the grants.
+--
+-- `principal` is the user table too — a user is a principal of kind 'user',
+-- a role is a principal of kind 'role'. Two tables for one concept is how
+-- the two drift apart. The admin is the first user row (id 1): exactly one,
+-- by id, and its powers are implicit — no capability or grant rows for it.
+-- `name` is COLLATE NOCASE because the login is case-insensitive.
+CREATE TABLE IF NOT EXISTS principal (
+    id           INTEGER PRIMARY KEY,
+    name         TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    display_name TEXT NOT NULL DEFAULT '',
+    kind         TEXT NOT NULL DEFAULT 'user',   -- 'user' | 'role'
+    created_at   INTEGER NOT NULL,
+    disabled     INTEGER NOT NULL DEFAULT 0
+);
+
+-- One row per issued session cookie (a "recognized device"). The cookie's
+-- value is never stored — only its sha256 and a masked hint to show in the
+-- profile list. `revoked_at` set = the cookie stops validating.
+CREATE TABLE IF NOT EXISTS device (
+    id           INTEGER PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES principal(id),
+    token_hash   TEXT NOT NULL UNIQUE,
+    token_hint   TEXT NOT NULL DEFAULT '',
+    fingerprint  TEXT NOT NULL DEFAULT '',
+    user_agent   TEXT NOT NULL DEFAULT '',
+    ip           TEXT NOT NULL DEFAULT '',
+    created_at   INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    revoked_at   INTEGER
+);
+
+-- Layer 1 account capabilities (PLAN44 catalog). Default deny: a user with
+-- no rows can only take part in sessions others invite it to.
+CREATE TABLE IF NOT EXISTS user_capability (
+    user_id    INTEGER NOT NULL REFERENCES principal(id),
+    capability TEXT NOT NULL,
+    PRIMARY KEY (user_id, capability)
+);
+
+-- Layer 1b user-level allowlists: the ceiling on what this user may grant
+-- to its own agents. '*' = everything; otherwise an exact name per row.
+CREATE TABLE IF NOT EXISTS user_allowlist (
+    user_id    INTEGER NOT NULL REFERENCES principal(id),
+    kind       TEXT NOT NULL,   -- 'models' | 'mcp' | 'tools' | 'sandboxes'
+    pattern    TEXT NOT NULL,   -- '*' or an exact name
+    PRIMARY KEY (user_id, kind, pattern)
+);
+
+-- Layer 2, the WHAT: one row per protected entity. `name` is that entity's
+-- own id/name within its kind.
+CREATE TABLE IF NOT EXISTS resource (
+    id       INTEGER PRIMARY KEY,
+    schema   TEXT NOT NULL DEFAULT 'chat',
+    name     TEXT NOT NULL,
+    kind     TEXT NOT NULL,   -- 'session' | 'agent' | 'project' | 'sandbox' | 'automation'
+    owner_id INTEGER NOT NULL REFERENCES principal(id),
+    UNIQUE (schema, name)
+);
+
+-- Layer 2, the grants. Delegation is `with_grant`: a user may re-share only
+-- privileges its own grant carries it on. `grantor` records who gave it.
+CREATE TABLE IF NOT EXISTS grant_ (
+    grantee    INTEGER NOT NULL REFERENCES principal(id),
+    object_id  INTEGER NOT NULL REFERENCES resource(id),
+    privilege  TEXT NOT NULL,   -- read | post | steer | seat | edit_meta | edit | grant | delete
+    grantor    INTEGER NOT NULL REFERENCES principal(id),
+    with_grant INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (grantee, object_id, privilege)
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_user      ON device(user_id);
+
+-- Who did what as whom (PLAN44 D4/D-catalog `admin.audit`): the identity
+-- transitions only — logins, logouts, and every masquerade, which records
+-- both names. A device fingerprint is a hint; this is the record.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id        INTEGER PRIMARY KEY,
+    at        INTEGER NOT NULL,
+    actor     TEXT NOT NULL,      -- who acted (login name)
+    acting_as TEXT NOT NULL DEFAULT '',  -- masquerade target, when any
+    action    TEXT NOT NULL,      -- 'login' | 'logout' | 'masquerade'
+    detail    TEXT NOT NULL DEFAULT ''   -- ip / fingerprint, the corroborating bits
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at);
+CREATE INDEX IF NOT EXISTS idx_resource_owner   ON resource(owner_id);
+CREATE INDEX IF NOT EXISTS idx_grant_grantee    ON grant_(grantee);
+CREATE INDEX IF NOT EXISTS idx_grant_object     ON grant_(object_id);
+
 CREATE INDEX IF NOT EXISTS idx_nodes_conv_seq       ON nodes(conversation_id, seq);
 CREATE INDEX IF NOT EXISTS idx_nodes_parent         ON nodes(parent_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_conv_part_kind ON nodes(conversation_id, participant_id, kind, seq);
@@ -367,6 +457,11 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE conversation ADD COLUMN sandbox TEXT",
         "ALTER TABLE conversation ADD COLUMN worktree TEXT",
         "ALTER TABLE conversation ADD COLUMN branch_ref TEXT",
+        // Per-user profile (the settings panel stopped being global): a
+        // user's location is theirs alone, and starts empty — a new account
+        // inherits nothing (PLAN44). The username is immutable: it lives in
+        // `name` and no endpoint writes it.
+        "ALTER TABLE principal ADD COLUMN location TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = conn.execute(stmt, []);
     }
