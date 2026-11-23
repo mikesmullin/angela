@@ -189,12 +189,14 @@ impl McpPool {
         (out, errors)
     }
 
-    /// [`ensure`](Self::ensure), as seen from inside the session's sandbox.
+    /// [`ensure`](Self::ensure), as seen from inside the agent's sandbox.
     ///
-    /// A sandbox is a property of the **session**, not of an agent: an
-    /// isolation layer that constrains every participant in it. So this is
-    /// not a per-agent substitution of one server for another — it is the
-    /// session's filesystem and shell, and it applies the same way to
+    /// A sandbox is a property of the **(session → agent) pair** (PLAN55 D2):
+    /// one container per pair, lazily launched at that agent's first turn in
+    /// that session, and it applies to whoever is speaking as that agent —
+    /// whether alone or in a group, where each participant has its own box.
+    /// This is not a per-agent substitution of one server for another — it is
+    /// the container's filesystem and shell, and it applies the same way to
     /// whoever is speaking.
     ///
     /// Two consequences, and they are separate:
@@ -211,8 +213,15 @@ impl McpPool {
     ///   that cannot see the session's working tree cannot take part in
     ///   work happening there.
     ///
-    /// Every other server — the browser, the researcher, the camera — is
-    /// untouched, because none of them is about *this* host's filesystem.
+    /// And **with a sandbox, every remaining server runs inside the
+    /// container too** (PLAN55): an agent that is defined to run in a
+    /// sandbox has *all* of its tool calls executed there — nothing quietly
+    /// touches the host. A server whose config declares a `sandbox` variant
+    /// runs that (the image's own layout, e.g. `/opt/video/server.mjs`);
+    /// anything else runs its regular command inside the box, which
+    /// succeeds when the image ships it and **fails loudly** when it does
+    /// not — an error, never a fallback to a host process. The tool names
+    /// are unchanged either way; only where the process lives differs.
     ///
     /// An unreachable sandbox is an **error, not a fallback**. Silently
     /// leaving the host tools in place would mean a conversation the user
@@ -241,7 +250,31 @@ impl McpPool {
             .filter(|n| !DISPLACED_BY_SANDBOX.contains(&n.as_str()))
             .cloned()
             .collect();
-        let (mut out, mut errors) = self.ensure_cancellable(&kept, file_root, stop);
+        // With a sandbox, EVERY server runs in the container (PLAN55): a
+        // `sandbox` config variant is the image's own command; anything else
+        // runs its regular command inside the box and fails there if the
+        // image does not carry it — an error, never a host fallback.
+        let (mut out, mut errors) = (Vec::new(), Vec::new());
+        for name in &kept {
+            if stop.stopped() { break; }
+            let result = self.get_or_connect(
+                // Per container: two sessions in two boxes need two servers.
+                &format!("{name}:sandbox:{sandbox}"),
+                stop,
+                || {
+                    let guest = crate::mcp_presets::preset_sandbox(name, file_root)
+                        .or_else(|| crate::mcp_presets::preset(name, file_root))
+                        .ok_or_else(|| format!("unknown or uninstalled MCP preset `{name}`"))?;
+                    let spec = crate::sandbox::exec_spec(sandbox, &guest)?;
+                    McpServer::connect_cancellable(&spec, CONNECT_TIMEOUT, stop)
+                        .map_err(|e| format!("MCP `{name}` (in sandbox {sandbox}): {e}"))
+                },
+            );
+            match result {
+                Ok(srv) => out.push(srv),
+                Err(e) => errors.push(e),
+            }
+        }
         if stop.stopped() { return (out, errors); }
 
         // Unconditional: the sandbox is the session's, so every participant
@@ -592,7 +625,10 @@ pub fn build_agent(
             continue;
         }
         if let Some(msg) = item_to_message(&item) {
-            agent.push_context(msg);
+            // At the provider boundary: an attachment in a past turn reaches
+            // the model as pixels, not as its markdown ref (PLAN: images go
+            // to the inference endpoint, not just the transcript).
+            agent.push_context(crate::media::with_images(&store.project_root, msg));
         }
     }
     Ok(agent)
@@ -931,16 +967,49 @@ pub fn run_turn(
     // Where this agent's files and shell begin: its own workspace root if it
     // named one, else the project root.
     let file_root = file_root_for(def, root);
-    // Which machine "the filesystem" means for this conversation.
-    let sandbox = store
-        .load(&session_id)
-        .and_then(|s| s.get("sandboxId").and_then(|v| v.as_str().map(str::to_string)))
-        .unwrap_or_default();
+    // Which machine "the filesystem" means for THIS agent in this conversation:
+    // its own container, per (session → agent) — launched lazily at its first
+    // turn here, blocking until the image boots (PLAN55 D2). `Ok(None)` is the
+    // host (no Containerfile, unchanged behaviour); `Err` is **not** a fallback
+    // to the host — an agent defined to run sandboxed must never quietly write
+    // to the host instead.
+    let sandbox = match crate::sandbox::ensure(store, &session_id, def, &stop.switch) {
+        Ok(id) => id.unwrap_or_default(),
+        Err(msg) => {
+            store.set_status(&session_id, "error");
+            let _ = store.append_event(
+                &session_id,
+                NewEvent::new("error", json!({ "message": msg })),
+            );
+            emit(&json!({ "type": "card", "card": { "kind": "error", "text": msg } }));
+            emit(&json!({ "type": "done", "ok": false, "error": msg, "sessionId": session_id }));
+            return Err(TurnError::Agent(msg));
+        }
+    };
     let (servers, mcp_errors) = pool.ensure_in_sandbox_cancellable(&def.mcp, &file_root, &sandbox, &stop.switch);
     for e in &mcp_errors {
         if stop.stopped() { break; }
         let _ = store.append_event(&session_id, NewEvent::new("error", json!({ "message": e })));
         emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
+    }
+    // PLAN55 security: a sandboxed agent whose container's tool surface did
+    // not come up does not get to run "with the tools missing" — that is
+    // still a run outside its sandbox. The turn is an error, not a degraded
+    // fallback: the host file tools are already displaced, and nothing else
+    // may stand in for the container.
+    if !sandbox.is_empty()
+        && !stop.stopped()
+        && !servers.iter().any(|s| s.name == SANDBOX_SERVER)
+    {
+        let msg = format!(
+            "the sandbox for @{} did not come up — refusing to run outside it",
+            def.name
+        );
+        store.set_status(&session_id, "error");
+        let _ = store.append_event(&session_id, NewEvent::new("error", json!({ "message": msg })));
+        emit(&json!({ "type": "card", "card": { "kind": "error", "text": msg } }));
+        emit(&json!({ "type": "done", "ok": false, "error": msg, "sessionId": session_id }));
+        return Err(TurnError::Agent(msg));
     }
 
     // Timed from before the agent is built so the number covers the whole
@@ -979,7 +1048,9 @@ pub fn run_turn(
     match &task {
         Some(t) => {
             for msg in &t.context {
-                agent.push_context(msg.clone());
+                // At the provider boundary: an attachment in a past turn
+                // reaches the model as pixels, not as its markdown ref.
+                agent.push_context(crate::media::with_images(&store.project_root, msg.clone()));
             }
         }
         // No agent seated — only reachable by calling this directly. Fall
@@ -990,7 +1061,7 @@ pub fn run_turn(
                     continue;
                 }
                 if let Some(msg) = item_to_message(&item) {
-                    agent.push_context(msg);
+                    agent.push_context(crate::media::with_images(&store.project_root, msg));
                 }
             }
         }
@@ -1182,7 +1253,13 @@ pub fn run_turn(
         cancel::block_on(
             rt,
             &stop.switch,
-            agent.run_events(&prompt, true, &mut on_event),
+            // The prompt becomes a Message here so an attachment reaches the
+            // model as pixels — the transcript keeps its markdown either way.
+            agent.run_message(
+                crate::media::with_images(&store.project_root, Message::user(prompt.clone())),
+                true,
+                &mut on_event,
+            ),
         )
     };
 
@@ -1355,24 +1432,28 @@ mod tests {
         assert!(!tools.iter().any(|t| t.starts_with("file_io__")), "{tools:?}");
         assert!(!tools.iter().any(|t| t.starts_with("term_local__")), "{tools:?}");
 
-        // Session-wide, not per-agent: a participant whose own `mcp` list
-        // named no file or shell server still works in the session's
-        // sandbox, because the sandbox is the session's filesystem and the
-        // participant is in the session.
+        // Every other tool runs in the box too (PLAN55 security: with a
+        // sandbox, ALL of the agent's tool calls are the container's). A
+        // server the image does not carry must FAIL here — an error naming
+        // the sandbox, never a quiet run on the host.
         let others: Vec<String> = ["web-researcher"].iter().map(|s| s.to_string()).collect();
         let (also, errors) =
             pool.ensure_in_sandbox(&others, std::path::Path::new(&root), &id);
-        assert!(errors.is_empty(), "{errors:?}");
         let got: Vec<String> = also.iter().map(|s| s.name.clone()).collect();
         assert!(got.contains(&"sandbox".to_string()), "servers were {got:?}");
-        assert!(got.contains(&"web-researcher".to_string()), "servers were {got:?}");
+        if !got.contains(&"web-researcher".to_string()) {
+            assert!(
+                !errors.is_empty(),
+                "an out-of-image server must error, not quietly run on the host"
+            );
+        }
     }
 
-    /// The swap is about *which machine*, so it must take exactly the two
-    /// servers that mean "this machine's files and shell" and leave
-    /// everything else alone. A browser or a researcher is not a filesystem.
+    /// The displacement takes exactly the two servers that mean "this
+    /// machine's files and shell" — the rest keep their names and, in a
+    /// sandbox, run inside the box (PLAN55).
     #[test]
-    fn a_sandbox_displaces_the_host_file_and_shell_servers_and_nothing_else() {
+    fn a_sandbox_displaces_the_host_file_and_shell_servers_and_keeps_the_rest() {
         let names: Vec<String> = ["file-io", "term-local", "web-researcher", "camera"]
             .iter()
             .map(|s| s.to_string())
@@ -1885,18 +1966,45 @@ pub fn run_round(
             // and shell access — this is just the root the participant's
             // own servers expand.
             let file_root = file_root_for(&participant_def, root);
-            // The sandbox belongs to the conversation, not to the agent, so
-            // every participant in a group works in the same box.
-            let sandbox = store
-                .load(&conv)
-                .and_then(|s| s.get("sandboxId").and_then(|v| v.as_str().map(str::to_string)))
-                .unwrap_or_default();
+            // Each participant works in its own container: a sandbox is a
+            // property of the (session → agent) pair, not of the conversation
+            // (PLAN55 D2) — and it is an error, not a fallback, when one
+            // cannot be provided.
+            let sandbox = match crate::sandbox::ensure(store, &conv, &participant_def, &stop.switch) {
+                Ok(id) => id.unwrap_or_default(),
+                Err(msg) => {
+                    let _ = store.append_event(
+                        &conv,
+                        mark.ev("error", json!({ "message": msg, "handle": me.handle })),
+                    );
+                    emit(&json!({ "type": "card", "card": { "kind": "error", "text": msg } }));
+                    continue;
+                }
+            };
             let (servers, mcp_errors) =
                 pool.ensure_in_sandbox_cancellable(&participant_def.mcp, &file_root, &sandbox, &stop.switch);
             for e in &mcp_errors {
                 if stop.stopped() { break; }
                 let _ = store.append_event(&conv, mark.ev("error", json!({ "message": e })));
                 emit(&json!({ "type": "card", "card": { "kind": "error", "text": e } }));
+            }
+            // PLAN55 security: same as the single-agent path — a sandboxed
+            // participant whose container surface is missing does not run
+            // "with the tools missing"; it errors and the round moves on.
+            if !sandbox.is_empty()
+                && !stop.stopped()
+                && !servers.iter().any(|s| s.name == SANDBOX_SERVER)
+            {
+                let msg = format!(
+                    "the sandbox for @{} did not come up — refusing to run outside it",
+                    participant_def.name
+                );
+                let _ = store.append_event(
+                    &conv,
+                    mark.ev("error", json!({ "message": msg, "handle": me.handle })),
+                );
+                emit(&json!({ "type": "card", "card": { "kind": "error", "text": msg } }));
+                continue;
             }
             let reply = match run_participant(
                 app, store, rt, &stop.switch, approvals, &servers, &participant_def, &conv, &me,
@@ -2079,9 +2187,11 @@ fn run_participant(
     })
     .map_err(|e| TurnError::Agent(e.to_string()))?;
     // The conversation as this participant sees it: its own words as its
-    // own turns, everyone else's as `[sender]`-prefixed user turns.
+    // own turns, everyone else's as `[sender]`-prefixed user turns. At the
+    // provider boundary: an attachment in a past turn reaches the model as
+    // pixels, not as its markdown ref.
     for msg in &task.context {
-        agent.push_context(msg.clone());
+        agent.push_context(crate::media::with_images(&store.project_root, msg.clone()));
     }
 
     let session_state = store.load(conv);
@@ -2209,7 +2319,13 @@ fn run_participant(
         cancel::block_on(
             rt,
             stop,
-            agent.run_events(&task.prompt, true, &mut on_event),
+            // The prompt becomes a Message here so an attachment reaches the
+            // model as pixels — the transcript keeps its markdown either way.
+            agent.run_message(
+                crate::media::with_images(&store.project_root, Message::user(task.prompt.clone())),
+                true,
+                &mut on_event,
+            ),
         )
     };
 

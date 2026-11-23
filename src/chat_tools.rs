@@ -404,7 +404,7 @@ pub fn register(
 mod tests {
     use super::*;
     use crate::agent_loader;
-    use crate::session_store::{NewEvent, NewSession};
+    use crate::session_store::NewEvent;
 
     /// An app in a temp dir with a capturing prompt sender.
     fn app_with_capture() -> (Arc<AppState>, Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>) {

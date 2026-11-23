@@ -43,9 +43,24 @@ fn expand(value: &str, root: &Path) -> String {
 /// own workspace root if it named one, else the project root. One server per
 /// distinct root, because the root lives in the child's env.
 pub fn preset(name: &str, file_root: &Path) -> Option<ServerSpec> {
+    spec_of(servers().get(name)?, name, file_root)
+}
+
+/// The same server's **in-sandbox** launch spec (PLAN55): the `sandbox`
+/// variant of its config — the command that runs *inside* a session's
+/// container instead of on the host. The spec returned is the GUEST command;
+/// the caller wraps it in the runtime's `exec` (see
+/// [`crate::sandbox::exec_spec`]). `None` when the server has no sandbox
+/// variant, which is the common case.
+pub fn preset_sandbox(name: &str, file_root: &Path) -> Option<ServerSpec> {
     let entries = servers();
     let v = entries.get(name)?;
     if v.get("disabled").and_then(|v| v.as_bool()) == Some(true) { return None; }
+    spec_of(v.get("sandbox")?, name, file_root)
+}
+
+/// The shared shape of both variants: name/command/args/env/cwd/framing.
+fn spec_of(v: &serde_json::Value, name: &str, file_root: &Path) -> Option<ServerSpec> {
     let command = expand(v.get("command")?.as_str()?, file_root);
     let args = v.get("args").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).map(|v| expand(v, file_root)).collect()).unwrap_or_default();
     let env = v.get("env").and_then(|v| v.as_object()).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), expand(v, file_root)))).collect()).unwrap_or_default();

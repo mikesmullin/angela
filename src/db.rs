@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when the DDL below changes in a way an existing file must be
 /// brought forward to. Recorded in `schema_meta`.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -94,6 +94,19 @@ CREATE TABLE IF NOT EXISTS conversation (
     legacy_format    TEXT,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
+);
+
+-- One sandbox (container) per (session -> agent) pair (PLAN55 D2). The
+-- mapping is the only thing that ties a running container to the conversation
+-- and the agent that owns it; deleting the conversation cascades the rows
+-- (via the FK), and the sbox lifecycle side of it (the actual `container rm`)
+-- is owned by the angela sandbox client at that deletion point.
+CREATE TABLE IF NOT EXISTS session_sandbox (
+    session_id   TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+    agent_name   TEXT NOT NULL,                  -- agents.name; no FK (the definition may be renamed later)
+    container_id TEXT NOT NULL,                  -- sbox-b's id, == the container id
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (session_id, agent_name)
 );
 
 -- The folders that exist, independent of whether anything is in them.
@@ -164,6 +177,7 @@ CREATE TABLE IF NOT EXISTS agents (
     icon           TEXT,
     reasoning_effort TEXT NOT NULL DEFAULT '',
     max_turns      INTEGER,
+    containerfile  TEXT NOT NULL DEFAULT '',  -- PLAN55 D1: absolute host path of the agent's Containerfile; '' = no sandbox.
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
@@ -453,6 +467,7 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE agents ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE agents ADD COLUMN max_turns INTEGER",
         "ALTER TABLE agents ADD COLUMN icon TEXT",
+        "ALTER TABLE agents ADD COLUMN containerfile TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE conversation ADD COLUMN project TEXT",
         "ALTER TABLE conversation ADD COLUMN sandbox TEXT",
         "ALTER TABLE conversation ADD COLUMN worktree TEXT",

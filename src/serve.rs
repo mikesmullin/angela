@@ -58,6 +58,9 @@ pub struct AppState {
     /// one). `None` on a bare host makes the tool say so instead of
     /// pretending.
     pub prompt_sender: Option<PromptSender>,
+    /// How a roster change reaches the host the moment it happens (see
+    /// [`SeatSender`]): an invited person's sidebar updates in real time.
+    pub seat_sender: Option<SeatSender>,
 }
 
 /// `prompt_sender(session, content, agent, model)` — fire-and-forget. The
@@ -66,6 +69,20 @@ pub struct AppState {
 /// model deadlocks (the calling turn holds the slot the nested turn queues
 /// behind).
 pub type PromptSender = std::sync::Arc<dyn Fn(&str, String, String, String) + Send + Sync>;
+
+/// `seat_sender(session)` — fire-and-forget, called the moment a session's
+/// roster changes (a seat added, re-activated or removed). The host wires
+/// this to its live event feed so the person just invited sees the session
+/// appear in their sidebar at once: seating rewrites no session row, so the
+/// feed's change-detector alone would stay silent until an unrelated edit.
+pub type SeatSender = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Tell the host a session's roster just changed (see [`SeatSender`]).
+fn seat_changed(st: &AppState, session: &str) {
+    if let Some(send) = &st.seat_sender {
+        send(session);
+    }
+}
 
 impl AppState {
     pub fn new(project_root: impl AsRef<std::path::Path>, port: u16) -> std::io::Result<Self> {
@@ -119,6 +136,7 @@ impl AppState {
                 .enable_all()
                 .build()?,
             prompt_sender: None,
+            seat_sender: None,
         })
     }
 }
@@ -143,15 +161,40 @@ fn goto_from_meta(meta: &Map<String, Value>) -> Value {
 }
 
 /// Seat known agents mentioned by the user before selecting the turn path.
-fn invite_mentions(store: &ConvStore, session: &str, text: &str) {
+/// Seat the people and agents a message names. Returns how many seats
+/// changed (added or re-activated), so the caller can tell the host's event
+/// feed — an invite must reach the invited person's sidebar at once.
+fn invite_mentions(store: &ConvStore, session: &str, text: &str) -> usize {
     let names = crate::group::mentions(text);
-    if names.is_empty() { return; }
+    if names.is_empty() {
+        return 0;
+    }
     let definitions = store.agents().list();
+    let identity = store.identity();
+    let mut seated = 0;
     for name in names {
+        // A mention is an invitation, and the name resolves the way a person
+        // would read it: an agent by that name first, then a user (a person
+        // in the room, seated exactly like `/invite` seats them).
         if let Some(def) = definitions.iter().find(|d| d.name.eq_ignore_ascii_case(&name)) {
-            store.invite_mentioned_agent(session, def);
+            if store.invite_mentioned_agent(session, def).is_some() {
+                seated += 1;
+            }
+        } else if let Some(user) = identity
+            .user_by_name(&name)
+            .filter(|u| !u.disabled)
+        {
+            let display = if user.display_name.trim().is_empty() {
+                user.name.clone()
+            } else {
+                user.display_name.clone()
+            };
+            if store.invite_user(session, &user.name, &display).is_some() {
+                seated += 1;
+            }
         }
     }
+    seated
 }
 
 /// Rebuild the UI transcript from the log. Port of
@@ -542,6 +585,14 @@ fn agent_from_body(body: &Value, base: Option<crate::agent_loader::AgentDef>) ->
         None => {}
     }
     if let Some(v) = st("cwd") { def.cwd = Some(v).filter(|c| !c.trim().is_empty()); }
+    // PLAN55 D1: the agent's Containerfile (absolute host path). Empty/absent
+    // clears it — the agent runs on the host. A non-absolute path is kept here
+    // and refused by `AgentStore::save`, so the error names what was typed.
+    match o.get("containerFile").or_else(|| o.get("containerfile")) {
+        Some(Value::Null) => def.containerfile = String::new(),
+        Some(Value::String(s)) => def.containerfile = s.trim().to_string(),
+        _ => {}
+    }
     match o.get("contextWindow").or_else(|| o.get("context_window")) {
         Some(Value::Null) => def.context_window = None,
         Some(v) => {
@@ -940,6 +991,68 @@ impl Server {
                 }
                 let body = req.json();
                 let gs = |k: &str| body.get(k).and_then(|v| v.as_str());
+                // A bare `name` resolves the way a mention does: an agent of
+                // that name first, a user next — seating either kind is the
+                // same act (PLAN55-era roster). Idempotent: a name already in
+                // the room is answered, not duplicated.
+                if let Some(name) = gs("name") {
+                    let agent = st
+                        .store
+                        .agents()
+                        .list()
+                        .into_iter()
+                        .find(|d| d.name.eq_ignore_ascii_case(name));
+                    let invited = match &agent {
+                        Some(def) => {
+                            let handle = def.name.to_ascii_lowercase();
+                            st.store.invite_mentioned_agent(id, def).or_else(|| {
+                                st.store
+                                    .participants(id)
+                                    .into_iter()
+                                    .find(|q| q.handle == handle && q.active)
+                            })
+                        }
+                        None => {
+                            let Some(user) = st
+                                .store
+                                .identity()
+                                .user_by_name(name)
+                                .filter(|u| !u.disabled)
+                            else {
+                                sink.json(
+                                    404,
+                                    &json!({
+                                        "error": format!(
+                                                    "no agent or user named {name:?} \
+                                                     — define an agent with + in the Agents rail"
+                                                )
+                                    }),
+                                );
+                                return;
+                            };
+                            let display = if user.display_name.trim().is_empty() {
+                                user.name.clone()
+                            } else {
+                                user.display_name.clone()
+                            };
+                            let handle = crate::conv_store::handle_from(&user.name).to_ascii_lowercase();
+                            st.store.invite_user(id, &user.name, &display).or_else(|| {
+                                st.store
+                                    .participants(id)
+                                    .into_iter()
+                                    .find(|q| q.handle == handle && q.active)
+                            })
+                        }
+                    };
+                    match invited {
+                        Some(p) => {
+                            seat_changed(st, id);
+                            sink.json(200, &json!({ "ok": true, "participant": p.to_json() }))
+                        }
+                        None => sink.json(400, &json!({ "error": "could not seat participant" })),
+                    }
+                    return;
+                }
                 let kind = gs("kind").unwrap_or("agent");
                 let agent_name = gs("agentName").or_else(|| gs("agent"));
                 // An agent definition supplies the system prompt and model
@@ -966,7 +1079,10 @@ impl Server {
                     gs("avatar"),
                     gs("role"),
                 ) {
-                    Some(p) => sink.json(200, &json!({ "ok": true, "participant": p.to_json() })),
+                    Some(p) => {
+                        seat_changed(st, id);
+                        sink.json(200, &json!({ "ok": true, "participant": p.to_json() }))
+                    }
                     None => sink.json(400, &json!({ "error": "could not seat participant" })),
                 }
             }
@@ -1153,7 +1269,9 @@ impl Server {
                     // including the first message of a new session.
                     match harness::resolve_session(&st.store, &st.tabs, &turn) {
                         Ok(id) => {
-                            invite_mentions(&st.store, &id, &turn.content);
+                            if invite_mentions(&st.store, &id, &turn.content) > 0 {
+                                seat_changed(st, &id);
+                            }
                             turn.session_id = Some(id);
                             turn.new_session = false;
                         }
@@ -1300,7 +1418,10 @@ impl Server {
                 let body = req.json();
                 let patch = body.as_object().cloned().unwrap_or_default();
                 match st.store.update_participant(pid, &patch) {
-                    Some(p) => sink.json(200, &json!({ "ok": true, "participant": p.to_json() })),
+                    Some(p) => {
+                        seat_changed(st, &p.conversation_id);
+                        sink.json(200, &json!({ "ok": true, "participant": p.to_json() }))
+                    }
                     None => sink.json(404, &json!({ "error": "not found" })),
                 }
             }
@@ -1312,7 +1433,11 @@ impl Server {
                 };
                 // An agent that has spoken is deactivated, not deleted: its
                 // nodes are in the tree and must keep their author.
+                let conv = st.store.participant(pid).map(|p| p.conversation_id);
                 let ok = st.store.remove_participant(pid);
+                if let Some(conv) = conv {
+                    seat_changed(st, &conv);
+                }
                 sink.json(200, &json!({ "ok": ok, "id": pid }))
             }
 
@@ -1485,6 +1610,36 @@ mod transcript_tests {
         assert_eq!(invitations[0].1, crate::group::Invite::Mentioned);
         invite_mentions(&s, &id, "@video_guy again");
         assert_eq!(s.agent_participants(&id).len(), 1);
+    }
+
+    /// A mention of a person seats the person — the same act `/invite`
+    /// does. A name resolves to an agent first, a user next (PLAN55-era
+    /// roster).
+    #[test]
+    fn a_mention_of_a_person_seats_them_like_an_invite_does() {
+        let (s, id) = conv();
+        // The first account is the admin; alice is simply a person here.
+        s.identity().create_user("Bob", "Bob").unwrap();
+        s.identity().create_user("alice", "Alice").unwrap();
+
+        invite_mentions(&s, &id, "hi @alice and @nobody");
+        let roster = s.participants(&id);
+        let seats: Vec<(String, String)> = roster
+            .iter()
+            .map(|p| (p.kind.clone(), p.handle.clone()))
+            .collect();
+        assert!(seats.contains(&("user".into(), "alice".into())), "{seats:?}");
+        assert!(!seats.iter().any(|(_, h)| h == "nobody"), "{seats:?}");
+
+        // One person, one seat: the mention is idempotent.
+        invite_mentions(&s, &id, "@alice again");
+        assert_eq!(
+            s.participants(&id)
+                .iter()
+                .filter(|p| p.handle == "alice")
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -759,8 +759,8 @@ mod tests {
     fn the_first_user_is_the_admin_and_names_are_case_insensitive() {
         let (store, _d) = id_store();
         let id = store.identity();
-        let Bob = id.create_user("Bob", "Bob").unwrap();
-        assert!(Bob.is_admin(), "the first user is the admin");
+        let bob = id.create_user("Bob", "Bob").unwrap();
+        assert!(bob.is_admin(), "the first user is the admin");
         assert_eq!(id.create_user("Bob", "dup").unwrap_err(), "that name is taken");
         assert!(id.user_by_name("BOB").is_some(), "login is case-insensitive");
         let alice = id.create_user("alice", "Alice").unwrap();

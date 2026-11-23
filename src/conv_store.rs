@@ -601,6 +601,10 @@ impl ConvStore {
         if id.is_empty() || id.contains("..") || id.contains('/') || id.contains('\\') {
             return false;
         }
+        // PLAN55 D2 cascade: the session's sandbox/container instances die
+        // with it. Before the SQL, while the mapping rows are still there —
+        // and outside `with`, because the cascade takes the lock itself.
+        crate::sandbox::destroy_for_session(self, id);
         let n = self.with(|c| {
             // Children before parents: `nodes.parent_id` is a self-reference
             // and ON DELETE CASCADE does not order siblings for us.
@@ -626,6 +630,8 @@ impl ConvStore {
 
     /// Remove every conversation (`angela clean`). Returns the count.
     pub fn clean(&self) -> usize {
+        // PLAN55 D2: every session's sandboxes go with their sessions.
+        crate::sandbox::destroy_all(self);
         self.with(|c| {
             let _ = c.execute("PRAGMA defer_foreign_keys = ON", []);
             let n = c.execute("DELETE FROM conversation", []).unwrap_or(0);
@@ -817,6 +823,37 @@ impl ConvStore {
         })
     }
 
+    /// Invite a named person once — the user twin of
+    /// [`Self::invite_mentioned_agent`]: the same re-seat-don't-duplicate rule,
+    /// for a `user` seat. A mention of a person adds them to the room exactly
+    /// like `/invite` does — same act, either kind of name.
+    pub fn invite_user(&self, conv: &str, name: &str, display_name: &str) -> Option<Participant> {
+        let handle = handle_from(name).to_ascii_lowercase();
+        self.with(|c| {
+            let roster = Self::participants_in(c, conv);
+            if let Some(existing) = roster.iter().find(|p| p.handle == handle) {
+                // An existing seat with this handle is re-seated, not
+                // duplicated — whatever kind it is (a human seat may already
+                // answer to this handle).
+                if existing.active {
+                    return None;
+                }
+                c.execute("UPDATE participants SET active = 1 WHERE id = ?1", params![existing.id]).ok()?;
+                return Self::participants_in(c, conv).into_iter().find(|p| p.id == existing.id);
+            }
+            let seat: i64 = c.query_row(
+                "SELECT COALESCE(MAX(seat), -1) + 1 FROM participants WHERE conversation_id = ?1",
+                params![conv], |r| r.get(0),
+            ).ok()?;
+            c.execute(
+                "INSERT INTO participants (conversation_id, kind, handle, display_name, seat, active, role) VALUES (?1, 'user', ?2, ?3, ?4, 1, 'member')",
+                params![conv, handle, display_name, seat],
+            ).ok()?;
+            let id = c.last_insert_rowid();
+            Self::participants_in(c, conv).into_iter().find(|p| p.id == id)
+        })
+    }
+
     pub fn update_participant(&self, id: i64, patch: &Map<String, Value>) -> Option<Participant> {
         self.with(|c| {
             for (k, v) in patch {
@@ -899,8 +936,123 @@ impl ConvStore {
     }
 
     // -----------------------------------------------------------------------
-    // Nodes: append, walk, fork
+    // Agent-owned sandboxes (PLAN55): one container per (session -> agent) pair.
     // -----------------------------------------------------------------------
+
+    /// The container id for (session, agent), if any has been launched for it.
+    pub fn sandbox_for(&self, conv: &str, agent: &str) -> Option<String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT container_id FROM session_sandbox WHERE session_id = ?1 AND agent_name = ?2",
+                params![conv, agent],
+                |r| r.get(0),
+            ).optional().ok().flatten()
+        })
+    }
+
+    /// Record that (session, agent) now runs in `container_id`. Replaces any
+    /// previous row (a container is rebuilt only if it is gone; the pair is
+    /// stable, so this is effectively a one-time insert per session). Written
+    /// as DELETE+INSERT rather than an upsert: a database created before
+    /// `PRIMARY KEY (session_id, agent_name)` existed has no conflict target
+    /// for `ON CONFLICT`, and the upsert would fail silently.
+    pub fn set_sandbox(&self, conv: &str, agent: &str, container_id: &str) {
+        self.with(|c| {
+            let _ = c.execute(
+                "DELETE FROM session_sandbox WHERE session_id = ?1 AND agent_name = ?2",
+                params![conv, agent],
+            );
+            let _ = c.execute(
+                "INSERT INTO session_sandbox (session_id, agent_name, container_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![conv, agent, container_id, now_iso()],
+            );
+        })
+    }
+
+    /// Every (agent, container_id) pair the session owns, for a teardown on delete.
+    pub fn sandboxes_for(&self, conv: &str) -> Vec<(String, String)> {
+        self.with(|c| {
+            let mut out = Vec::new();
+            if let Ok(mut st) = c.prepare(
+                "SELECT agent_name, container_id FROM session_sandbox WHERE session_id = ?1",
+            ) {
+                if let Ok(it) = st.query_map(params![conv], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                }) {
+                    for r in it { out.push(r.unwrap()); }
+                }
+            }
+            out
+        })
+    }
+
+    /// Drop the (session, agent) row. Returns whether it was there.
+    pub fn forget_sandbox(&self, conv: &str, agent: &str) -> bool {
+        self.with(|c| {
+            let n = c.execute(
+                "DELETE FROM session_sandbox WHERE session_id = ?1 AND agent_name = ?2",
+                params![conv, agent],
+            ).unwrap_or(0);
+            n > 0
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Nodes: append, walk, fork
+    // ------------------------------------------------------------------
+
+    /// Drop every row for a session (used on the delete path, PLAN55 D2).
+    pub fn forget_sandboxes_by_session(&self, conv: &str) {
+        self.with(|c| {
+            let _ = c.execute(
+                "DELETE FROM session_sandbox WHERE session_id = ?1",
+                params![conv],
+            );
+        })
+    }
+
+    /// Every (session_id, agent_name, container_id) row, for the menu and for
+    /// the destroy cascade.
+    pub fn sandbox_rows(&self) -> Vec<(String, String, String)> {
+        self.with(|c| {
+            let mut out = Vec::new();
+            if let Ok(mut st) = c.prepare(
+                "SELECT session_id, agent_name, container_id FROM session_sandbox",
+            ) {
+                if let Ok(it) = st.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                }) {
+                    out.extend(it.filter_map(|r| r.ok()));
+                }
+            }
+            out
+        })
+    }
+
+    /// The conversations this person is seated in (PLAN44 C4 + the roster:
+    /// a named user seat is what makes a room appear in their Projects tree
+    /// and lets them speak in it). `name` is the account name; the seat's
+    /// handle is its lowercased form — what [`Self::invite_user`] writes.
+    pub fn sessions_seating(&self, user_name: &str) -> Vec<String> {
+        let handle = handle_from(user_name).to_ascii_lowercase();
+        self.with(|c| {
+            let mut out = Vec::new();
+            if let Ok(mut st) = c.prepare(
+                "SELECT DISTINCT conversation_id FROM participants \
+                 WHERE kind = 'user' AND handle = ?1",
+            ) {
+                if let Ok(it) = st.query_map(params![handle], |r| r.get::<_, String>(0)) {
+                    out.extend(it.filter_map(|r| r.ok()));
+                }
+            }
+            out
+        })
+    }
 
     /// The shared cursor's node id, or `None` on an empty conversation.
     pub fn cursor(&self, conv: &str) -> Option<String> {

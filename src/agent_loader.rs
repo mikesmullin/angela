@@ -96,6 +96,11 @@ pub struct AgentDef {
     pub max_turns: Option<u32>,
     /// Where it was imported from, if it came from a file. Historical.
     pub file: Option<String>,
+    /// The agent's Containerfile (absolute host path, PLAN55 D1). Empty/`None`
+    /// means no sandbox — the agent runs on the host (unchanged behavior). When
+    /// set, this agent's turns get a container built from the image
+    /// `sbox-<dir of the Containerfile>:latest`; one per (session, agent) pair.
+    pub containerfile: String,
 }
 
 /// The three engagement modes, as a type rather than a loose string.
@@ -163,6 +168,7 @@ impl Default for AgentDef {
             accent_color: None,
             icon: None,
             max_turns: None,
+            containerfile: String::new(),
             file: None,
         }
     }
@@ -230,6 +236,13 @@ impl AgentDef {
             // `null` when unset, which is what the editor shows as a blank
             // box and what the server reads back as "use agl's default".
             "maxTurns": self.max_turns,
+            // `null` when unset, which the editor shows as a blank box; the
+            // server reads "" (no Containerfile) as "run on the host" (PLAN55 D1).
+            "containerFile": if self.containerfile.is_empty() {
+                None
+            } else {
+                Some(self.containerfile.clone())
+            },
             // Only ever set on a definition that came in from a file.
             "agentFile": self.file,
         })
@@ -509,6 +522,7 @@ pub fn from_json(name_hint: &str, v: &Value, file: Option<String>) -> AgentDef {
         accent_color: normalize_hex(&s(get("accentColor").or_else(|| o.get("accent_color")))),
         icon: normalize_icon(&s(get("icon"))),
         max_turns: normalize_max_turns(get("maxTurns").or_else(|| o.get("max_turns"))),
+        containerfile: s(get("containerFile").or_else(|| o.get("containerfile"))),
         file,
     };
     // De-duplicate `models` while keeping order — the JS does this with

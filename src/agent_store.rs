@@ -39,6 +39,10 @@ pub enum AgentError {
     BadName(String),
     Duplicate(String),
     NotFound(String),
+    /// A Containerfile that is not an absolute host path (PLAN55 D1). Refused
+    /// rather than cleared: silently dropping it would leave the agent running
+    /// on the host when its author asked for a sandbox.
+    BadContainerfile(String),
     Db(String),
 }
 
@@ -52,6 +56,10 @@ impl std::fmt::Display for AgentError {
             ),
             AgentError::Duplicate(n) => write!(f, "an agent named \"{n}\" already exists"),
             AgentError::NotFound(n) => write!(f, "no agent named \"{n}\""),
+            AgentError::BadContainerfile(p) => write!(
+                f,
+                "\"{p}\" is not an absolute host path — a Containerfile must be one (PLAN55 D1)"
+            ),
             AgentError::Db(e) => write!(f, "{e}"),
         }
     }
@@ -88,7 +96,8 @@ impl<'a> AgentStore<'a> {
 
     const COLS: &'static str = "id, name, description, model, models, context_window, cwd, env, \
          mcp, allowlist, tools_enabled, policy_mode, parallel_tools, soul, goals, memory, \
-         engagement, starters, avatar, accent_color, reasoning_effort, max_turns, icon";
+         engagement, starters, avatar, accent_color, reasoning_effort, max_turns, icon, \
+         containerfile";
 
     fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentDef> {
         Ok(AgentDef {
@@ -129,6 +138,7 @@ impl<'a> AgentStore<'a> {
             reasoning_effort: r.get(20)?,
             max_turns: r.get::<_, Option<i64>>(21)?.map(|v| v as u32),
             icon: r.get(22)?,
+            containerfile: r.get::<_, String>(23).unwrap_or_default(),
             file: None,
         })
     }
@@ -187,6 +197,14 @@ impl<'a> AgentStore<'a> {
         }
         if !valid_name(&name) {
             return Err(AgentError::BadName(name));
+        }
+        // PLAN55 D1: a Containerfile is an absolute host path or it is nothing.
+        // A relative path would silently name the wrong image (its parent
+        // directory is the image name), so it is refused here rather than
+        // mis-resolved at launch time.
+        let containerfile = def.containerfile.trim().to_string();
+        if !containerfile.is_empty() && !std::path::Path::new(&containerfile).is_absolute() {
+            return Err(AgentError::BadContainerfile(containerfile));
         }
         let engagement = Engagement::parse(&def.engagement).as_str().to_string();
         // Normalised on the way in, so nothing downstream has to wonder
@@ -329,13 +347,14 @@ impl<'a> AgentStore<'a> {
             // written; setting them here beats renumbering twenty-one
             // positional parameters for each one.
             c.execute(
-                "UPDATE agents SET reasoning_effort = ?1, max_turns = ?2, icon = ?3
-                 WHERE id = ?4",
+                "UPDATE agents SET reasoning_effort = ?1, max_turns = ?2, icon = ?3, \
+                 containerfile = ?4 WHERE id = ?5",
                 params![
                     def.reasoning_effort,
                     def.max_turns.map(|v| v as i64),
                     icon,
-                    id
+                    containerfile,
+                    id,
                 ],
             )
             .map_err(|e| AgentError::Db(e.to_string()))?;
