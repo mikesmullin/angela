@@ -87,6 +87,10 @@ fn seat_changed(st: &AppState, session: &str) {
 impl AppState {
     pub fn new(project_root: impl AsRef<std::path::Path>, port: u16) -> std::io::Result<Self> {
         let root = project_root.as_ref().to_path_buf();
+        // The media folder everything hangs off: MCP image blocks and
+        // attachments all live in <project_root>/.angela/media. Registered
+        // once; the first call wins, so later registrations are no-ops.
+        crate::media::set_media_root(root.join(".angela").join("media"));
         let store = ConvStore::new(&root)
             .map_err(|e| std::io::Error::other(format!("conversations.db: {e}")))?;
         // Bring any pre-SQLite sessions in. Idempotent and non-destructive:
@@ -584,7 +588,6 @@ fn agent_from_body(body: &Value, base: Option<crate::agent_loader::AgentDef>) ->
         Some(v) => def.max_turns = crate::agent_loader::normalize_max_turns(Some(v)),
         None => {}
     }
-    if let Some(v) = st("cwd") { def.cwd = Some(v).filter(|c| !c.trim().is_empty()); }
     // PLAN55 D1: the agent's Containerfile (absolute host path). Empty/absent
     // clears it — the agent runs on the host. A non-absolute path is kept here
     // and refused by `AgentStore::save`, so the error names what was typed.
@@ -1190,7 +1193,7 @@ impl Server {
                 }
                 let body = req.json();
                 let mut patch = Map::new();
-                for key in ["purpose", "notes", "routing", "memoryHigh", "title"] {
+                for key in ["purpose", "notes", "routing", "memoryHigh", "title", "workspaceRoot", "worktree"] {
                     if let Some(v) = body.get(key) {
                         patch.insert(key.to_string(), v.clone());
                     }

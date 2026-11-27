@@ -6,10 +6,13 @@
 //! 1. Resolve the tab's session (resume, or create one).
 //! 2. Title a fresh session from its first user message.
 //! 3. Persist the user message as a `context_window` event.
-//! 4. Hydrate the agent's context window **from the log**, then run agl with
+//! 4. Run the **session-properties gate**: park until the session's
+//!    workspace root and worktree are configured (nothing — no container,
+//!    no model call, no engagement decision — runs while parked).
+//! 5. Hydrate the agent's context window **from the log**, then run agl with
 //!    streaming deltas.
-//! 5. Persist reasoning and the assistant reply as events.
-//! 6. Record the completed turn.
+//! 6. Persist reasoning and the assistant reply as events.
+//! 7. Record the completed turn.
 //!
 //! Hydrating from the log rather than from a live in-process agent is what
 //! `build_context_window_items` was written for ("session open / resume"), and
@@ -305,22 +308,26 @@ impl McpPool {
     }
 }
 
-/// The file-system root an agent's MCP servers should believe the disk begins
-/// at: the agent's own workspace root (relative values resolving under the
-/// project root), or the project root when it named none.
+/// The file-system root a session's MCP servers should believe the disk
+/// begins at: the session's `workspaceRoot` — a non-empty absolute path that
+/// is a directory — or the project root when it names none (or names one
+/// that is not usable).
 ///
 /// This is what `${projectRoot}` in the MCP config expands to *for this
-/// agent* — before the per-agent field it was always the project root.
-fn file_root_for(def: &AgentDef, project_root: &std::path::Path) -> std::path::PathBuf {
-    let cwd = def.cwd.as_deref().map(|c| c.trim());
-    match cwd {
-        Some(c) if !c.is_empty() => {
-            let cwd_root: std::path::PathBuf = c.into();
-            if cwd_root.is_absolute() {
-                cwd_root
-            } else {
-                project_root.join(c)
+/// session*. The workspace root is a session property, not an agent one: two
+/// sessions in one checkout can point at different roots, so the agent's own
+/// definition carries nothing here.
+fn file_root_for(store: &ConvStore, session_id: &str, project_root: &std::path::Path) -> std::path::PathBuf {
+    let root = store
+        .load(session_id)
+        .and_then(|m| m.get("workspaceRoot").and_then(Value::as_str).map(String::from));
+    match root {
+        Some(r) if !r.trim().is_empty() => {
+            let p = std::path::PathBuf::from(&r);
+            if p.is_absolute() && p.is_dir() {
+                return p;
             }
+            project_root.to_path_buf()
         }
         _ => project_root.to_path_buf(),
     }
@@ -857,6 +864,150 @@ fn flush_approvals(
     }
 }
 
+/// What the session-properties gate concluded for one turn.
+///
+/// `Proceed` — the session is configured; the turn runs exactly as before.
+/// Every other variant means the caller must return (the rows for the user
+/// have already been emitted, or the caller emits them for the way its
+/// path handles stop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateOutcome {
+    /// The session is configured.
+    Proceed,
+    /// Automation fail-fast: no queued card, no park — the caller returns
+    /// immediately with the error already on the wire.
+    Automation,
+    /// The session was deleted while the gate was waiting.
+    Deleted,
+    /// The user stopped the turn while the gate was waiting.
+    Stopped,
+    /// The deadline elapsed while the session stayed unconfigured.
+    TimedOut,
+}
+
+/// The park loop behind the session-properties gate, factored out of the
+/// two turn paths so the waiting logic is testable without a model.
+///
+/// `load` re-reads the session header each iteration — the embedded hook may
+/// repair the meta between iterations, so the loop never caches the first
+/// answer — `check` is the embedder's readiness question, `stopped` is the
+/// user's stop switch, `elapsed` is the (injectable) clock, `sleep` the
+/// (injectable) wait. The first outcome reached wins.
+fn wait_for_props(
+    load: impl Fn() -> Option<Value>,
+    check: impl Fn(&Value) -> Result<(), String>,
+    stopped: impl Fn() -> bool,
+    elapsed: impl Fn() -> Duration,
+    sleep: impl Fn(Duration),
+    deadline: Duration,
+    tick: Duration,
+) -> GateOutcome {
+    loop {
+        if stopped() {
+            return GateOutcome::Stopped;
+        }
+        let Some(meta) = load() else {
+            return GateOutcome::Deleted;
+        };
+        if check(&meta).is_ok() {
+            return GateOutcome::Proceed;
+        }
+        if elapsed() >= deadline {
+            return GateOutcome::TimedOut;
+        }
+        sleep(tick);
+    }
+}
+
+/// Run the session-properties gate for one turn.
+///
+/// Emits, in order: nothing when the session is already configured; one
+/// queued card when it is parked (a durable event plus the card, shaped like
+/// the turn queue's own queued card); the error card and done row on
+/// fail-fast/failure. All of it at most once per turn.
+///
+/// `elapsed`/`sleep`/`deadline`/`tick` are injectable so the park loop can
+/// be tested without a second of wall time — production passes the real
+/// clock, a 250 ms tick and a 30-minute deadline.
+#[allow(clippy::too_many_arguments)]
+fn gate_props(
+    store: &ConvStore,
+    session_id: &str,
+    mark: &TurnMark,
+    is_automation: bool,
+    is_group: bool,
+    check: &dyn Fn(&Value) -> Result<(), String>,
+    stopped: impl Fn() -> bool,
+    elapsed: impl Fn() -> Duration,
+    sleep: impl Fn(Duration),
+    deadline: Duration,
+    tick: Duration,
+    emit: &mut dyn FnMut(&Value) -> bool,
+) -> GateOutcome {
+    let meta = store.load(session_id).unwrap_or(Value::Null);
+    if let Err(reason) = check(&meta) {
+        // Automations never park: a scheduled run that cannot configure
+        // itself must fail fast, not sit on a 30-minute timer.
+        if is_automation {
+            let text = format!("cannot run: the session is not configured — {reason}");
+            store.set_status(session_id, "error");
+            emit(&json!({ "type": "card", "card": { "kind": "error", "text": text } }));
+            emit(&json!({ "type": "done", "ok": false, "error": text, "sessionId": session_id }));
+            return GateOutcome::Automation;
+        }
+        // Durable and on screen before the wait begins, like the turn
+        // queue's queued card: a parked turn must look like a parked turn.
+        let w = store.append_event(
+            session_id,
+            mark.ev("queued", json!({ "spec": "session properties", "position": 0, "marker": "properties" })),
+        );
+        let event_id = w.map(|x| x.event_id).unwrap_or_default();
+        let mut card = json!({
+            "kind": "queued",
+            "text": "waiting for the session's workspace root and worktree — this message will run once they are set",
+            "spec": "session properties",
+            "position": 0,
+            "marker": "properties",
+            "eventId": event_id,
+            "turn": mark.id,
+            "handle": mark.handle,
+            "visible": true,
+        });
+        if is_group {
+            card["participantId"] = json!(mark.participant);
+        }
+        emit(&json!({ "type": "card", "card": card }));
+
+        match wait_for_props(
+            || store.load(session_id),
+            |m| check(m),
+            stopped,
+            elapsed,
+            sleep,
+            deadline,
+            tick,
+        ) {
+            GateOutcome::Proceed => {}
+            GateOutcome::Deleted => {
+                let text = "session was deleted while waiting";
+                emit(&json!({ "type": "card", "card": { "kind": "error", "text": text } }));
+                emit(&json!({ "type": "done", "ok": false, "error": text, "sessionId": session_id }));
+                return GateOutcome::Deleted;
+            }
+            GateOutcome::Stopped => return GateOutcome::Stopped,
+            GateOutcome::TimedOut => {
+                let text = "timed out waiting for the session's workspace root and worktree";
+                store.set_status(session_id, "error");
+                emit(&json!({ "type": "card", "card": { "kind": "error", "text": text } }));
+                emit(&json!({ "type": "done", "ok": false, "error": text, "sessionId": session_id }));
+                return GateOutcome::TimedOut;
+            }
+            GateOutcome::Automation => unreachable!("automation never parks"),
+        }
+    }
+    GateOutcome::Proceed
+}
+
 /// Run one turn, emitting protocol rows through `emit`.
 ///
 /// `emit` returns `false` when the client has gone away, which stops the
@@ -929,6 +1080,41 @@ pub fn run_turn(
         0,
     );
 
+    // Session-properties gate: nothing runs until the session's workspace
+    // root and worktree are configured — no container, no model call, no
+    // engagement decision. The gate parks, it does not silently wait.
+    let started_gate = std::time::Instant::now();
+    match gate_props(
+        store,
+        &session_id,
+        &mark,
+        req.tab_id == "automation",
+        false,
+        &|m: &Value| crate::session_props::check(m),
+        || stop.stopped(),
+        || started_gate.elapsed(),
+        |_| std::thread::sleep(Duration::from_millis(250)),
+        Duration::from_secs(1800),
+        Duration::from_millis(250),
+        emit,
+    ) {
+        GateOutcome::Proceed => {}
+        GateOutcome::Stopped => {
+            // The Ran::Stopped block, minus the flush — nothing was said yet.
+            let _ = store.append_event(
+                &session_id,
+                mark.ev("stopped", json!({ "reason": "user" })),
+            );
+            // `record_turn_complete` sets the status ready itself, and it
+            // counts the turn — which this was: the user spent one.
+            store.record_turn_complete(&session_id, None);
+            emit(&json!({ "type": "done", "ok": true, "stopped": true, "sessionId": session_id }));
+            return Ok(());
+        }
+        // Automation / Deleted / TimedOut: the rows were emitted by the gate.
+        _ => return Ok(()),
+    }
+
     // A lone invoked agent is implicitly addressed by the user's message;
     // relevant agents still pass through their relevance decision.
     if let Some(p) = me.clone() {
@@ -964,9 +1150,9 @@ pub fn run_turn(
 
     // Tools come up before the model is told they exist.
     let root = std::path::Path::new(project_root);
-    // Where this agent's files and shell begin: its own workspace root if it
-    // named one, else the project root.
-    let file_root = file_root_for(def, root);
+    // Where this session's files and shell begin: its own workspace root if
+    // it named one, else the project root.
+    let file_root = file_root_for(store, &session_id, root);
     // Which machine "the filesystem" means for THIS agent in this conversation:
     // its own container, per (session → agent) — launched lazily at its first
     // turn here, blocking until the image boots (PLAN55 D2). `Ok(None)` is the
@@ -1042,6 +1228,14 @@ pub fn run_turn(
         // enough for a chat reply, not enough for an agent that has to go
         // and look something up first.
         max_turns: def.max_turns.map(|v| v as usize),
+        // At the provider boundary, reshape every message once — a kept
+        // attachment or a tool-result image reaches the model as an image
+        // part, exactly like a past turn's. Registered here rather than at
+        // each hydration site so retained tool messages get it too.
+        message_filter: Some(std::sync::Arc::new({
+            let root = store.project_root.clone();
+            move |msg| crate::media::with_images(&root, msg)
+        })),
         ..Default::default()
     })
     .map_err(|e| TurnError::Agent(e.to_string()))?;
@@ -1759,6 +1953,295 @@ for line in sys.stdin:
         assert_eq!(msgs.len(), 1, "hidden and reasoning rows are not sent");
         assert_eq!(msgs[0].role, "user");
     }
+
+    /// A fake clock that only advances when the injected sleep is called —
+    /// so a park loop either terminates in a dozen instant iterations or it
+    /// runs against a deadline that has not moved.
+    fn fake_clock(tick_ms: u64) -> (Arc<std::sync::atomic::AtomicU64>, impl Fn() -> Duration, impl Fn(Duration)) {
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let now2 = Arc::clone(&now);
+        let elapsed = move || Duration::from_millis(now2.load(std::sync::atomic::Ordering::SeqCst));
+        let now3 = Arc::clone(&now);
+        let sleep = move |_d: Duration| {
+            now3.fetch_add(tick_ms, std::sync::atomic::Ordering::SeqCst);
+        };
+        (now, elapsed, sleep)
+    }
+
+    fn capturing_emit() -> (Arc<std::sync::Mutex<Vec<Value>>>, impl FnMut(&Value) -> bool) {
+        let rows = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rows2 = Arc::clone(&rows);
+        let emit = move |v: &Value| {
+            rows2.lock().unwrap().push(v.clone());
+            true
+        };
+        (rows, emit)
+    }
+
+    fn gate_mark() -> TurnMark {
+        TurnMark::new("bob", None, 0)
+    }
+
+    #[test]
+    fn the_gate_parks_then_proceeds_once_the_session_is_configured() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mark = gate_mark();
+        let (_now, elapsed, sleep) = fake_clock(250);
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = Arc::clone(&calls);
+        let check = move |_m: &Value| {
+            // Err twice (the initial check and the first park iteration),
+            // then the session configures itself.
+            if calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                Err("no workspace root".into())
+            } else {
+                Ok(())
+            }
+        };
+        let (rows, mut emit) = capturing_emit();
+        let outcome = gate_props(
+            &s, &id, &mark, false, false, &check,
+            || false, elapsed, sleep,
+            Duration::from_secs(30), Duration::from_millis(250), &mut emit,
+        );
+        assert_eq!(outcome, GateOutcome::Proceed);
+
+        let rows = rows.lock().unwrap().clone();
+        let queued: Vec<_> = rows.iter().filter(|r| r["type"] == "card" && r["card"]["kind"] == "queued").collect();
+        assert_eq!(queued.len(), 1, "one queued card per turn");
+        let card = &queued[0]["card"];
+        assert_eq!(card["kind"], "queued");
+        assert_eq!(card["spec"], "session properties");
+        assert_eq!(card["position"], 0);
+        assert_eq!(card["marker"], "properties");
+        assert_eq!(card["turn"], mark.id);
+        assert_eq!(card["handle"], "bob");
+        assert_eq!(card["visible"], true);
+        assert!(card["eventId"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
+        assert_eq!(card["text"], "waiting for the session's workspace root and worktree — this message will run once they are set");
+        // The queued event is durable, like the turn queue's.
+        assert!(s.list_events(&id).iter().any(|e| e.event_type == "queued"));
+    }
+
+    #[test]
+    fn the_group_queued_card_carries_participant_id() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The round's gate mark has no participant yet — the room has not been classified.
+        let mark = gate_mark();
+        let (_now, elapsed, sleep) = fake_clock(250);
+        let check = |_m: &Value| Err("no workspace root".to_string());
+        let (rows, mut emit) = capturing_emit();
+        let outcome = gate_props(
+            &s, &id, &mark, false, true, &check,
+            || true, elapsed, sleep,
+            Duration::from_secs(30), Duration::from_millis(250), &mut emit,
+        );
+        assert_eq!(outcome, GateOutcome::Stopped);
+        let rows = rows.lock().unwrap().clone();
+        let card = &rows[0]["card"];
+        assert_eq!(card["kind"], "queued");
+        assert!(card.get("participantId").is_some(), "the group card carries participantId");
+    }
+
+    #[test]
+    fn automation_turns_fail_fast_without_parking() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mark = gate_mark();
+        let check = |_m: &Value| Err("no workspace root".to_string());
+        let (rows, mut emit) = capturing_emit();
+        let outcome = gate_props(
+            &s, &id, &mark, true, false, &check,
+            || false, || Duration::from_millis(0), |_| {},
+            Duration::from_secs(30), Duration::from_millis(250), &mut emit,
+        );
+        assert_eq!(outcome, GateOutcome::Automation);
+
+        let rows = rows.lock().unwrap().clone();
+        assert_eq!(rows.len(), 2, "error card + done, nothing else");
+        assert_eq!(rows[0]["type"], "card");
+        assert_eq!(rows[0]["card"]["kind"], "error");
+        assert_eq!(
+            rows[0]["card"]["text"],
+            "cannot run: the session is not configured — no workspace root"
+        );
+        assert_eq!(rows[1]["type"], "done");
+        assert_eq!(rows[1]["ok"], false);
+        assert_eq!(rows[1]["error"], "cannot run: the session is not configured — no workspace root");
+        assert!(!s.list_events(&id).iter().any(|e| e.event_type == "queued"),
+            "automations never park");
+    }
+
+    #[test]
+    fn the_gate_times_out_when_the_session_never_configures() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mark = gate_mark();
+        let (_now, elapsed, sleep) = fake_clock(250);
+        let check = |_m: &Value| Err("no worktree".to_string());
+        let (rows, mut emit) = capturing_emit();
+        let outcome = gate_props(
+            &s, &id, &mark, false, false, &check,
+            || false, elapsed, sleep,
+            Duration::from_millis(500), Duration::from_millis(250), &mut emit,
+        );
+        assert_eq!(outcome, GateOutcome::TimedOut);
+
+        let rows = rows.lock().unwrap().clone();
+        // queued card + error card + done
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1]["card"]["kind"], "error");
+        assert_eq!(
+            rows[1]["card"]["text"],
+            "timed out waiting for the session's workspace root and worktree"
+        );
+        assert_eq!(rows[2]["type"], "done");
+        assert_eq!(rows[2]["ok"], false);
+    }
+
+    #[test]
+    fn the_gate_stops_when_the_switch_is_thrown_while_parked() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mark = gate_mark();
+        let (_now, elapsed, sleep) = fake_clock(250);
+        let check = |_m: &Value| Err("no workspace root".to_string());
+        let (rows, mut emit) = capturing_emit();
+        let outcome = gate_props(
+            &s, &id, &mark, false, false, &check,
+            || true, elapsed, sleep,
+            Duration::from_secs(30), Duration::from_millis(250), &mut emit,
+        );
+        assert_eq!(outcome, GateOutcome::Stopped);
+        // The queued card is still on the wire — the user must see the turn parked.
+        let rows = rows.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["card"]["kind"], "queued");
+    }
+
+    #[test]
+    fn the_gate_reports_a_deleted_session() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(s.delete(&id));
+        let mark = gate_mark();
+        let (_now, elapsed, sleep) = fake_clock(250);
+        let check = |_m: &Value| Err("no workspace root".to_string());
+        let (rows, mut emit) = capturing_emit();
+        let outcome = gate_props(
+            &s, &id, &mark, false, false, &check,
+            || false, elapsed, sleep,
+            Duration::from_secs(30), Duration::from_millis(250), &mut emit,
+        );
+        assert_eq!(outcome, GateOutcome::Deleted);
+        let rows = rows.lock().unwrap().clone();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1]["card"]["kind"], "error");
+        assert_eq!(rows[1]["card"]["text"], "session was deleted while waiting");
+        assert_eq!(rows[2]["type"], "done");
+        assert_eq!(rows[2]["ok"], false);
+    }
+
+    #[test]
+    fn the_wait_loop_is_first_outcome_wins() {
+        // A load that starts answering null: nothing may fall through to a
+        // later outcome (the park loop returns the first thing it sees).
+        let outcome = wait_for_props(
+            || None,
+            |_m: &Value| Ok(()),
+            || false,
+            || Duration::from_secs(0),
+            |_| {},
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        );
+        assert_eq!(outcome, GateOutcome::Deleted);
+
+        let outcome = wait_for_props(
+            || Some(Value::Null),
+            |_m: &Value| Ok(()),
+            || false,
+            || Duration::from_secs(0),
+            |_| {},
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        );
+        assert_eq!(outcome, GateOutcome::Proceed);
+
+        let outcome = wait_for_props(
+            || Some(Value::Null),
+            |_m: &Value| Err("no".into()),
+            || false,
+            || Duration::from_secs(5),
+            |_| {},
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        );
+        assert_eq!(outcome, GateOutcome::TimedOut);
+
+        let outcome = wait_for_props(
+            || Some(Value::Null),
+            |_m: &Value| Err("no".into()),
+            || true,
+            || Duration::from_secs(0),
+            |_| {},
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        );
+        assert_eq!(outcome, GateOutcome::Stopped);
+    }
+
+    #[test]
+    fn file_root_for_picks_the_session_workspace_root_when_usable() {
+        let (tmp, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let project = std::path::Path::new("/nonexistent-project-root");
+
+        // No workspaceRoot: the project root.
+        assert_eq!(file_root_for(&s, &id, project), project.to_path_buf());
+
+        let workspace = tmp.path().to_path_buf();
+        let mut patch = serde_json::Map::new();
+        patch.insert("workspaceRoot".into(), json!(workspace.to_string_lossy().to_string()));
+        s.update_meta(&id, patch).unwrap();
+        assert_eq!(file_root_for(&s, &id, project), workspace);
+
+        // A relative value is refused — the absolute-path rule is what makes
+        // the tool jail meaningful.
+        let mut patch = serde_json::Map::new();
+        patch.insert("workspaceRoot".into(), json!("relative/path"));
+        s.update_meta(&id, patch).unwrap();
+        assert_eq!(file_root_for(&s, &id, project), project.to_path_buf());
+
+        // Absolute but not a directory: project root, not the jail.
+        let mut patch = serde_json::Map::new();
+        patch.insert("workspaceRoot".into(), json!("/definitely/not/a/directory"));
+        s.update_meta(&id, patch).unwrap();
+        assert_eq!(file_root_for(&s, &id, project), project.to_path_buf());
+    }
 }
 
 // ===========================================================================
@@ -1826,6 +2309,39 @@ pub fn run_round(
         .map_err(|e| TurnError::Store(e.to_string()))?;
 
     let roster = store.participants(&conv);
+
+    // Session-properties gate, before the round's classification and the
+    // speakers' containers: nothing runs until the session's workspace root
+    // and worktree are configured. The round has no per-participant mark yet
+    // — the gate covers the whole conversation before anyone is chosen.
+    // (Automations fail fast instead of parking.)
+    let gate_mark = TurnMark::new(&def.name, None, 0);
+    let started_gate = std::time::Instant::now();
+    match gate_props(
+        store,
+        &conv,
+        &gate_mark,
+        req.tab_id == "automation",
+        true,
+        &|m: &Value| crate::session_props::check(m),
+        || stop.stopped(),
+        || started_gate.elapsed(),
+        |_| std::thread::sleep(Duration::from_millis(250)),
+        Duration::from_secs(1800),
+        Duration::from_millis(250),
+        emit,
+    ) {
+        GateOutcome::Proceed => {}
+        GateOutcome::Stopped => {
+            // Same shape as a speaker's stop in the round: run_round hands the
+            // error up with the turn's mark and no done row — the room has no
+            // round to settle (nothing was published yet).
+            return Err(TurnError::Stopped);
+        }
+        // Automation / Deleted / TimedOut: the rows were emitted by the gate.
+        _ => return Ok(()),
+    }
+
     let header = store.load(&conv).unwrap_or(Value::Null);
 
     // Nobody to answer. The message is already durable, so this is a state
@@ -1961,11 +2477,11 @@ pub fn run_round(
                 continue;
             }
             let root = std::path::Path::new(project_root);
-            // A participant's own workspace root, or the project root when it
-            // named none. The sandbox, when assigned, supersedes it for file
-            // and shell access — this is just the root the participant's
-            // own servers expand.
-            let file_root = file_root_for(&participant_def, root);
+            // The session's workspace root, or the project root when it named
+            // none. The sandbox, when assigned, supersedes it for file and
+            // shell access — this is just the root the participant's own
+            // servers expand.
+            let file_root = file_root_for(store, &conv, root);
             // Each participant works in its own container: a sandbox is a
             // property of the (session → agent) pair, not of the conversation
             // (PLAN55 D2) — and it is an error, not a fallback, when one
@@ -2183,6 +2699,14 @@ fn run_participant(
         // enough for a chat reply, not enough for an agent that has to go
         // and look something up first.
         max_turns: def.max_turns.map(|v| v as usize),
+        // At the provider boundary, reshape every message once — a kept
+        // attachment or a tool-result image reaches the model as an image
+        // part, exactly like a past turn's. Registered here rather than at
+        // each hydration site so retained tool messages get it too.
+        message_filter: Some(std::sync::Arc::new({
+            let root = store.project_root.clone();
+            move |msg| crate::media::with_images(&root, msg)
+        })),
         ..Default::default()
     })
     .map_err(|e| TurnError::Agent(e.to_string()))?;

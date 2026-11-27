@@ -71,11 +71,16 @@ CREATE TABLE IF NOT EXISTS conversation (
     -- derived from the '/' in the name, so moving a folder is one UPDATE
     -- and there is no tree to keep consistent with the labels.
     project          TEXT,
+    -- The session-scoped file-io jail: the host directory its tools believe
+    -- the disk begins at. A plain string (an absolute path), not a foreign
+    -- key — the embedder owns the directory, not the database.
+    workspace_root   TEXT,
     -- Where this conversation's work happens. `sandbox` names a box in the
     -- sbox service; `worktree` and `branch` name the checkout bound into
-    -- it. They are opaque ids owned by other services, so they are plain
-    -- text with no constraint — a sandbox destroyed elsewhere leaves a
-    -- dangling id here, and the UI falls back rather than failing.
+    -- it. `worktree` holds a JSON object record (provisioned/path/…) and is
+    -- the thing the tools see; `branch` names the branch it was cut at.
+    -- They are plain text with no constraint — a sandbox destroyed elsewhere
+    -- leaves a dangling id here, and the UI falls back rather than failing.
     sandbox          TEXT,
     worktree         TEXT,
     branch_ref       TEXT,
@@ -151,6 +156,9 @@ CREATE TABLE IF NOT EXISTS agents (
     model          TEXT NOT NULL DEFAULT '',
     models         TEXT NOT NULL DEFAULT '[]',
     context_window INTEGER,
+    -- Retained for rollback: the column still exists but nothing reads or
+    -- writes it anymore. The workspace root moved to the session; an agent's
+    -- cwd is gone (see session_props.rs).
     cwd            TEXT,
     env            TEXT NOT NULL DEFAULT '{}',
     mcp            TEXT NOT NULL DEFAULT '[]',
@@ -472,6 +480,7 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE conversation ADD COLUMN sandbox TEXT",
         "ALTER TABLE conversation ADD COLUMN worktree TEXT",
         "ALTER TABLE conversation ADD COLUMN branch_ref TEXT",
+        "ALTER TABLE conversation ADD COLUMN workspace_root TEXT",
         // Per-user profile (the settings panel stopped being global): a
         // user's location is theirs alone, and starts empty — a new account
         // inherits nothing (PLAN44). The username is immutable: it lives in

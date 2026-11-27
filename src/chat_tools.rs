@@ -64,8 +64,12 @@ fn one(
     agent: &mut Agent,
     tool: &str,
     description: &str,
-    properties: Value,
-    required: Vec<String>,
+    // The tool's FULL input schema (the same shape MCP servers hand out);
+    // `Agent::tool` wants the properties map and required list separately,
+    // so it is split here — one split, every tool. Passing the full schema
+    // through turned `type`/`required` into property names and the wire
+    // schema into something any validating endpoint rejects.
+    schema: Value,
     enabled: Option<&Vec<String>>,
     allow_text: &str,
     enforce: bool,
@@ -85,6 +89,7 @@ fn one(
     let session = session.to_string();
     let approvals = Arc::clone(approvals);
     let stop = Arc::clone(stop);
+    let (properties, required) = crate::mcp::schema_parts(&schema);
     agent
         .tool(&gate_name, description, properties, required, move |args: &Value| {
             let gate_name = &gate_for_body;
@@ -149,7 +154,6 @@ pub fn register(
                 "query": { "type": "string", "description": "optional substring to filter titles/ids by" }
             }
         }),
-        vec![],
         enabled,
         allow_text,
         enforce,
@@ -215,7 +219,6 @@ pub fn register(
             },
             "required": ["sessionId"]
         }),
-        vec!["sessionId".into()],
         enabled,
         allow_text,
         enforce,
@@ -267,7 +270,6 @@ pub fn register(
                 "model": { "type": "string", "description": "provider:model, blank for the agent default" }
             }
         }),
-        vec![],
         enabled,
         allow_text,
         enforce,
@@ -327,7 +329,6 @@ pub fn register(
             },
             "required": ["sessionId", "content"]
         }),
-        vec!["sessionId".into(), "content".into()],
         enabled,
         allow_text,
         enforce,
@@ -368,7 +369,6 @@ pub fn register(
             },
             "required": ["sessionId"]
         }),
-        vec!["sessionId".into()],
         enabled,
         allow_text,
         enforce,

@@ -2,7 +2,7 @@
 //!
 //!   angela-serve [--port 8763] [-c <project-root>]
 //!
-//! Defaults match the JS (`src/serve.mjs`): port 8763, project root = cwd.
+//! Defaults match the JS (`src/serve.mjs`): port 8763, project root = the process working directory.
 //! `chat-server` in psicom/chat proxies `/api/*` to this address, so running
 //! this in place of `bun run src/serve.mjs` needs no front-end change.
 

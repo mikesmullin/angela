@@ -58,4 +58,5 @@ pub mod sandbox;
 pub mod serve;
 pub mod projects;
 pub mod settings;
+pub mod session_props;
 pub mod session_store;

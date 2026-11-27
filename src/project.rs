@@ -10,7 +10,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Project root: an explicit `-c/--config` path, else the process cwd.
+/// Project root: an explicit `-c/--config` path, else the process working directory.
 pub fn resolve_project_root(config_path: Option<&str>) -> PathBuf {
     match config_path {
         Some(p) if !p.trim().is_empty() => {

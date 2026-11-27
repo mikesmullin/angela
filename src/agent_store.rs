@@ -94,7 +94,7 @@ impl<'a> AgentStore<'a> {
         AgentStore { store }
     }
 
-    const COLS: &'static str = "id, name, description, model, models, context_window, cwd, env, \
+    const COLS: &'static str = "id, name, description, model, models, context_window, env, \
          mcp, allowlist, tools_enabled, policy_mode, parallel_tools, soul, goals, memory, \
          engagement, starters, avatar, accent_color, reasoning_effort, max_turns, icon, \
          containerfile";
@@ -107,15 +107,14 @@ impl<'a> AgentStore<'a> {
             model: r.get(3)?,
             models: parse_list(r.get(4)?),
             context_window: r.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u64),
-            cwd: r.get(6)?,
             env: r
-                .get::<_, Option<String>>(7)?
+                .get::<_, Option<String>>(6)?
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default(),
-            mcp: parse_list(r.get(8)?),
-            allowlist: r.get(9)?,
+            mcp: parse_list(r.get(7)?),
+            allowlist: r.get(8)?,
             // NULL is "every tool", which is not the same as an empty list.
-            tools_enabled: r.get::<_, Option<String>>(10)?.and_then(|t| {
+            tools_enabled: r.get::<_, Option<String>>(9)?.and_then(|t| {
                 let v: Vec<String> = serde_json::from_str(&t).ok()?;
                 if v.is_empty() {
                     None
@@ -123,22 +122,22 @@ impl<'a> AgentStore<'a> {
                     Some(v)
                 }
             }),
-            policy_mode: r.get(11)?,
-            parallel_tools: r.get::<_, i64>(12)? != 0,
-            soul: r.get(13)?,
-            goals: r.get(14)?,
-            memory: r.get(15)?,
-            engagement: r.get(16)?,
+            policy_mode: r.get(10)?,
+            parallel_tools: r.get::<_, i64>(11)? != 0,
+            soul: r.get(12)?,
+            goals: r.get(13)?,
+            memory: r.get(14)?,
+            engagement: r.get(15)?,
             starters: r
-                .get::<_, Option<String>>(17)?
+                .get::<_, Option<String>>(16)?
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default(),
-            avatar: r.get(18)?,
-            accent_color: r.get(19)?,
-            reasoning_effort: r.get(20)?,
-            max_turns: r.get::<_, Option<i64>>(21)?.map(|v| v as u32),
-            icon: r.get(22)?,
-            containerfile: r.get::<_, String>(23).unwrap_or_default(),
+            avatar: r.get(17)?,
+            accent_color: r.get(18)?,
+            reasoning_effort: r.get(19)?,
+            max_turns: r.get::<_, Option<i64>>(20)?.map(|v| v as u32),
+            icon: r.get(21)?,
+            containerfile: r.get::<_, String>(22).unwrap_or_default(),
             file: None,
         })
     }
@@ -274,19 +273,18 @@ impl<'a> AgentStore<'a> {
                     c.execute(
                         "UPDATE agents SET
                            name = ?1, description = ?2, model = ?3, models = ?4,
-                           context_window = ?5, cwd = ?6, env = ?7, mcp = ?8, allowlist = ?9,
-                           tools_enabled = ?10, policy_mode = ?11, parallel_tools = ?12,
-                           soul = ?13, goals = ?14, memory = ?15, engagement = ?16,
-                           starters = ?17, avatar = ?18, accent_color = ?19,
-                           updated_at = ?20
-                         WHERE id = ?21",
+                           context_window = ?5, env = ?6, mcp = ?7, allowlist = ?8,
+                           tools_enabled = ?9, policy_mode = ?10, parallel_tools = ?11,
+                           soul = ?12, goals = ?13, memory = ?14, engagement = ?15,
+                           starters = ?16, avatar = ?17, accent_color = ?18,
+                           updated_at = ?19
+                         WHERE id = ?20",
                         params![
                             name,
                             def.description,
                             def.model,
                             json_text(&json!(def.models)),
                             def.context_window.map(|v| v as i64),
-                            def.cwd,
                             json_text(&Value::Object(env)),
                             json_text(&json!(def.mcp)),
                             def.allowlist,
@@ -310,19 +308,18 @@ impl<'a> AgentStore<'a> {
                 None => {
                     c.execute(
                         "INSERT INTO agents
-                           (name, description, model, models, context_window, cwd, env, mcp,
+                           (name, description, model, models, context_window, env, mcp,
                             allowlist, tools_enabled, policy_mode, parallel_tools, soul, goals,
                             memory, engagement, starters, avatar, accent_color,
                             created_at, updated_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                                 ?15, ?16, ?17, ?18, ?19, ?20, ?20)",
+                                 ?15, ?16, ?17, ?18, ?19, ?19)",
                         params![
                             name,
                             def.description,
                             def.model,
                             json_text(&json!(def.models)),
                             def.context_window.map(|v| v as i64),
-                            def.cwd,
                             json_text(&Value::Object(env)),
                             json_text(&json!(def.mcp)),
                             def.allowlist,

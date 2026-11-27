@@ -528,6 +528,35 @@ fn parse_tools(listed: &Value) -> Vec<ToolDef> {
         .unwrap_or_default()
 }
 
+/// Save an MCP image block's bytes to the media root and return the file
+/// name. `None` when the block is not decodable, the root is unregistered,
+/// the data is oversized or the write fails.
+fn media_ref_for_image(item: &Value) -> Option<String> {
+    use base64::Engine as _;
+    let data = item.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    // Servers wrap long blocks in newlines; the alphabet does not care.
+    let data: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if data.is_empty() {
+        return None;
+    }
+    let mime = item.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
+    let bytes = base64::engine::general_purpose::STANDARD.decode(&data).ok()?;
+    crate::media::save_media_bytes(&bytes, ext_from_mime(mime))
+}
+
+/// File extension for an MCP image block's `mimeType`. Unknown types become
+/// `bin` — the model never reads the bytes, but an extension that is honest
+/// about the shape is still worth having.
+fn ext_from_mime(mime: &str) -> &'static str {
+    match mime.trim().to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "bin",
+    }
+}
+
 /// MCP returns `content: [{type:'text', text}, …]`. The model wants text.
 ///
 /// An `isError` result is still returned as text rather than raised: the
@@ -546,8 +575,26 @@ pub fn flatten_content(result: &Value) -> String {
                         out.push_str(t);
                     }
                 }
-                // Images and resources have no text form the model can read
-                // here; name them so a turn does not look silently empty.
+                // An image block is not a thing the model can read here, but
+                // it can be *saved*: the bytes join the media folder and the
+                // tool result carries a `/media/…` ref, which reaches the
+                // model as an image part at the provider boundary like any
+                // other attachment. If the save fails, the marker tells the
+                // model the block was there rather than silently dropping it.
+                Some("image") => match media_ref_for_image(item) {
+                    Some(name) => {
+                        out.push_str(&format!("\n![image](/media/{name})\n"));
+                    }
+                    None => {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str("[image content omitted]");
+                    }
+                },
+                // Resources (and anything else) have no text form the model
+                // can read here; name them so a turn does not look silently
+                // empty.
                 Some(other) => {
                     if !out.is_empty() {
                         out.push('\n');
@@ -730,6 +777,41 @@ for line in sys.stdin:
     #[test]
     fn non_text_content_is_named_rather_than_dropped() {
         let r = json!({ "content": [{"type":"image","data":"…"}] });
+        assert_eq!(flatten_content(&r), "[image content omitted]");
+    }
+
+    #[test]
+    fn an_image_block_becomes_a_media_ref_with_the_bytes_on_disk() {
+        let root = crate::media::test_media_root();
+        use base64::Engine as _;
+        let data = base64::engine::general_purpose::STANDARD.encode(b"PNGDATA");
+        let r = json!({ "content": [{"type":"image","data":data,"mimeType":"image/png"}] });
+        let out = flatten_content(&r);
+        assert!(out.contains("![image](/media/"), "{out}");
+        assert!(out.contains(".png)"), "{out}");
+        let name = out
+            .split_once("/media/")
+            .and_then(|(_, rest)| rest.split(')').next())
+            .unwrap()
+            .to_string();
+        assert!(name.starts_with("mcp-"), "{name}");
+        let bytes = std::fs::read(root.join(&name)).expect("file saved");
+        assert_eq!(bytes, b"PNGDATA");
+    }
+
+    #[test]
+    fn an_oversized_image_block_falls_back_to_the_marker() {
+        use base64::Engine as _;
+        let big = vec![7u8; 20 * 1024 * 1024 + 1];
+        let data = base64::engine::general_purpose::STANDARD.encode(&big);
+        let r = json!({ "content": [{"type":"image","data":data,"mimeType":"image/png"}] });
+        assert_eq!(flatten_content(&r), "[image content omitted]");
+    }
+
+    #[test]
+    fn an_unreadable_image_block_falls_back_to_the_marker() {
+        // Not valid base64 — never reaches the save path, and never panics.
+        let r = json!({ "content": [{"type":"image","data":"!!!","mimeType":"image/png"}] });
         assert_eq!(flatten_content(&r), "[image content omitted]");
     }
 

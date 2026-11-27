@@ -195,6 +195,22 @@ fn from_json_text(s: Option<String>) -> Value {
     s.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
 }
 
+/// The `worktree` column holds a provisioned-worktree record as JSON text —
+/// `provisioned`, `path`, and the embedder's own bookkeeping hung off it.
+/// Everything else (absence, empty, a legacy plain string) reads back as
+/// `null`; the legacy `worktreeId` mapping above is what carries a bare id.
+fn worktree_record(raw: Option<String>) -> Value {
+    let Some(s) = raw else { return Value::Null };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Value::Null;
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(v) if v.is_object() => v,
+        _ => Value::Null,
+    }
+}
+
 /// A handle from an agent name: lowercase, non-alphanumerics folded to `-`.
 /// Handles are what `@mentions` match on, so they have to be typeable.
 pub fn handle_from(name: &str) -> String {
@@ -356,7 +372,7 @@ impl ConvStore {
                         context_window, mcp, project_root, project, sandbox, worktree,
                         branch_ref, config, overrides, turns,
                         round_index, round_status, routing, purpose, notes, memory_high,
-                        legacy_format, created_at, updated_at
+                        legacy_format, created_at, updated_at, workspace_root
                    FROM conversation WHERE id = ?1",
                 params![id],
                 |r| {
@@ -399,6 +415,11 @@ impl ConvStore {
                         "legacyFormat": r.get::<_, Option<String>>(30)?,
                         "createdAt": r.get::<_, String>(31)?,
                         "updatedAt": r.get::<_, String>(32)?,
+                        "workspaceRoot": r.get::<_, Option<String>>(33)?,
+                        // The stored record is a JSON text; anything else — a
+                        // legacy plain string (a bare id), or junk — is not a
+                        // checkout, and reads back as null.
+                        "worktree": worktree_record(r.get::<_, Option<String>>(19)?),
                     }))
                 },
             )
@@ -462,6 +483,7 @@ impl ConvStore {
             "allowlistSource" | "allowlist_source" => "allowlist_source",
             "contextWindow" | "context_window" => "context_window",
             "projectRoot" | "project_root" => "project_root",
+            "workspaceRoot" | "workspace_root" => "workspace_root",
             // The folder it is filed under — distinct from `project_root`,
             // which is where its files are. Two sessions on one checkout may
             // sit in different folders, and often do.
@@ -489,7 +511,8 @@ impl ConvStore {
         })
     }
 
-    const JSON_COLUMNS: &'static [&'static str] = &["mcp", "config", "overrides", "approve_mode"];
+    const JSON_COLUMNS: &'static [&'static str] =
+        &["mcp", "config", "overrides", "approve_mode", "worktree"];
 
     /// Patch header fields. Unknown keys are ignored rather than fatal:
     /// `lastPromptTokens` and friends still arrive from older call sites and
@@ -605,6 +628,10 @@ impl ConvStore {
         // with it. Before the SQL, while the mapping rows are still there —
         // and outside `with`, because the cascade takes the lock itself.
         crate::sandbox::destroy_for_session(self, id);
+        // The embedder may want to reap the session's worktree when its
+        // session goes away. Best-effort: it runs after the cascade and
+        // never fails the delete.
+        crate::session_props::on_session_deleted(id);
         let n = self.with(|c| {
             // Children before parents: `nodes.parent_id` is a self-reference
             // and ON DELETE CASCADE does not order siblings for us.
@@ -1955,6 +1982,76 @@ mod tests {
         assert_eq!(meta["allowlistMode"], "unrestricted");
         assert_eq!(meta["contextWindow"], 8192);
         assert!(meta["lastPromptTokens"].is_null());
+    }
+
+    #[test]
+    fn workspace_root_and_worktree_round_trip_through_create_load_and_update_meta() {
+        let s = store();
+        let id = conv(&s);
+        let meta = s.load(&id).unwrap();
+        assert!(meta["workspaceRoot"].is_null());
+        assert!(meta["worktree"].is_null());
+
+        let mut patch = Map::new();
+        patch.insert("workspaceRoot".into(), json!("/tmp/session-workspace"));
+        patch.insert(
+            "worktree".into(),
+            json!({ "provisioned": true, "path": "/tmp/session-worktree" }),
+        );
+        let meta = s.update_meta(&id, patch).unwrap();
+        assert_eq!(meta["workspaceRoot"], "/tmp/session-workspace");
+        assert_eq!(
+            meta["worktree"],
+            json!({ "provisioned": true, "path": "/tmp/session-worktree" })
+        );
+
+        // Read back fresh, not just from the patch's own echo.
+        let meta = s.load(&id).unwrap();
+        assert_eq!(meta["workspaceRoot"], "/tmp/session-workspace");
+        assert_eq!(meta["worktree"]["path"], "/tmp/session-worktree");
+        assert_eq!(meta["worktree"]["provisioned"], true);
+    }
+
+    #[test]
+    fn a_workspace_root_can_be_cleared_with_a_null_patch() {
+        let s = store();
+        let id = conv(&s);
+        let mut patch = Map::new();
+        patch.insert("workspaceRoot".into(), json!("/tmp/session-workspace"));
+        s.update_meta(&id, patch).unwrap();
+        let mut patch = Map::new();
+        patch.insert("workspaceRoot".into(), Value::Null);
+        let meta = s.update_meta(&id, patch).unwrap();
+        assert!(meta["workspaceRoot"].is_null());
+    }
+
+    #[test]
+    fn a_legacy_plain_string_worktree_column_reads_back_as_null() {
+        let s = store();
+        let id = conv(&s);
+        // The pre-record column held a bare worktree id, written as plain text.
+        s.with(|c| c.execute(
+            "UPDATE conversation SET worktree = ?1 WHERE id = ?2",
+            params!["bare-worktree-id", id],
+        ))
+        .unwrap();
+        let meta = s.load(&id).unwrap();
+        // Not a checkout record — but the legacy mapping still carries the id.
+        assert!(meta["worktree"].is_null());
+        assert_eq!(meta["worktreeId"], "bare-worktree-id");
+    }
+
+    #[test]
+    fn a_worktree_record_that_is_not_an_object_reads_back_as_null() {
+        let s = store();
+        let id = conv(&s);
+        s.with(|c| c.execute(
+            "UPDATE conversation SET worktree = ?1 WHERE id = ?2",
+            params!["[\"a\", \"b\"]", id],
+        ))
+        .unwrap();
+        let meta = s.load(&id).unwrap();
+        assert!(meta["worktree"].is_null());
     }
 
     #[test]

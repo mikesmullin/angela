@@ -43,10 +43,6 @@ pub struct AgentDef {
     pub reasoning_effort: String,
     pub models: Vec<String>,
     pub context_window: Option<u64>,
-    /// The workspace this agent works in: the root its filesystem and shell
-    /// MCP servers expand `${projectRoot}` against. `None`/blank means the
-    /// project root; a relative value resolves under that root.
-    pub cwd: Option<String>,
     pub env: BTreeMap<String, String>,
     /// MCP preset names, e.g. `["file-io", "term-local"]`.
     pub mcp: Vec<String>,
@@ -146,7 +142,6 @@ impl Default for AgentDef {
             reasoning_effort: String::new(),
             models: Vec::new(),
             context_window: None,
-            cwd: None,
             env: BTreeMap::new(),
             mcp: Vec::new(),
             allowlist: String::new(),
@@ -217,7 +212,6 @@ impl AgentDef {
             "reasoningEffort": self.reasoning_effort,
             "models": self.models,
             "contextWindow": self.context_window,
-            "cwd": self.cwd,
             "env": self.env,
             "mcp": self.mcp,
             "allowlist": self.allowlist,
@@ -296,17 +290,21 @@ pub const MAX_TURNS_CEILING: u32 = 1000;
 /// A turn budget from user input, or `None` to leave agl's default.
 ///
 /// Accepts a number or a string, because the field arrives from a JSON body
-/// one way and an HTML number input the other. Zero, negative and junk all
-/// mean "unset" rather than "no turns at all": an agent that cannot take a
-/// single turn is never what someone meant to configure.
+/// one way and an HTML number input the other. **Zero means "no limit"** —
+/// the agent loop runs until the model stops asking for tools. Negative and
+/// junk mean "unset" rather than "no turns at all": an agent that cannot
+/// take a single turn is never what someone meant to configure.
 pub fn normalize_max_turns(raw: Option<&Value>) -> Option<u32> {
     let n = match raw? {
         Value::Number(n) => n.as_f64()?,
         Value::String(t) => t.trim().parse::<f64>().ok()?,
         _ => return None,
     };
-    if !n.is_finite() || n < 1.0 {
+    if !n.is_finite() || n < 0.0 {
         return None;
+    }
+    if n == 0.0 {
+        return Some(0);
     }
     Some((n as u32).min(MAX_TURNS_CEILING))
 }
@@ -450,14 +448,6 @@ pub fn from_json(name_hint: &str, v: &Value, file: Option<String>) -> AgentDef {
         context_window: get("contextWindow")
             .or_else(|| o.get("context_window"))
             .and_then(|x| x.as_u64()),
-        cwd: {
-            let c = s(get("cwd"));
-            if c.is_empty() {
-                None
-            } else {
-                Some(c)
-            }
-        },
         env: get("env")
             .and_then(|e| e.as_object())
             .map(|m| {
@@ -705,10 +695,15 @@ mod tests {
         assert_eq!(n(Some(&json!("12"))), Some(12));
         assert_eq!(n(Some(&json!(" 12 "))), Some(12));
         assert_eq!(n(Some(&json!(1))), Some(1));
-        // Unset, in every form it arrives as. Zero and negative included:
+        // Zero is "no limit" — spelled explicitly so an agent can run until
+        // the model stops asking for tools.
+        assert_eq!(n(Some(&json!(0))), Some(0));
+        assert_eq!(n(Some(&json!("0"))), Some(0));
+        assert_eq!(n(Some(&json!(" 0 "))), Some(0));
+        // Unset, in every form it arrives as. Negative and junk included:
         // an agent that cannot take a single turn is never what someone
         // meant to configure, so it means "default", not "mute".
-        for v in [json!(null), json!(""), json!("   "), json!(0), json!(-3), json!("abc"), json!(true)] {
+        for v in [json!(null), json!(""), json!("   "), json!(-3), json!("abc"), json!(true)] {
             assert_eq!(n(Some(&v)), None, "{v}");
         }
         assert_eq!(n(None), None);
