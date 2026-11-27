@@ -87,7 +87,85 @@ fn is_descendant(to: &str, from: &str) -> bool {
     to == from || to.starts_with(&format!("{from}/"))
 }
 
+/// Properties that a project can supply to descendants. Identity, roster and
+/// runtime state are intentionally excluded. Empty and null values inherit.
+pub const INHERITABLE: &[&str] = &["purpose", "notes", "routing", "memoryHigh", "workspaceRoot", "worktree"];
+
+pub fn ancestors(raw: &str) -> Vec<String> {
+    let Ok(name) = normalize(raw) else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut path = String::new();
+    for part in name.split('/') {
+        if !path.is_empty() { path.push('/'); }
+        path.push_str(part);
+        out.push(path.clone());
+    }
+    out
+}
+
+fn present(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Object(m) => !m.is_empty(),
+        _ => true,
+    }
+}
+
 impl ConvStore {
+    pub fn project_props(&self, name: &str) -> Value {
+        self.with(|c| c.query_row("SELECT settings FROM projects WHERE name = ?1", params![name], |r| r.get::<_, String>(0))
+            .ok().and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .filter(Value::is_object).unwrap_or_else(|| json!({})))
+    }
+
+    pub fn set_project_props(&self, raw: &str, patch: &Value) -> Result<Value, String> {
+        let name = normalize(raw)?;
+        let patch = patch.as_object().ok_or("settings must be an object")?;
+        if patch.keys().any(|k| !INHERITABLE.contains(&k.as_str())) {
+            return Err("unknown project setting".into());
+        }
+        let mut props = self.project_props(&name);
+        let obj = props.as_object_mut().unwrap();
+        for (key, value) in patch {
+            if present(value) { obj.insert(key.clone(), value.clone()); } else { obj.remove(key); }
+        }
+        let encoded = serde_json::to_string(&props).map_err(|e| e.to_string())?;
+        self.with(|c| c.execute("INSERT INTO projects (name, created_at, settings) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET settings=excluded.settings", params![name, now_iso(), encoded]).map_err(|e| e.to_string()))?;
+        Ok(props)
+    }
+
+    /// Returns both authored metadata and its root-to-leaf effective view.
+    pub fn effective_session(&self, id: &str) -> Option<Value> {
+        let session = self.load(id)?;
+        let mut inherited = serde_json::Map::new();
+        let mut chain = Vec::new();
+        for name in ancestors(session.get("project").and_then(Value::as_str).unwrap_or("")) {
+            let props = self.project_props(&name);
+            if let Some(obj) = props.as_object() {
+                for (key, value) in obj {
+                    if present(value) { inherited.insert(key.clone(), value.clone()); }
+                }
+                if !obj.is_empty() { chain.push(json!({"name": name, "props": props})); }
+            }
+        }
+        let mut effective = session.clone();
+        let obj = effective.as_object_mut()?;
+        for (key, value) in &inherited {
+            if !obj.get(key).is_some_and(present) { obj.insert(key.clone(), value.clone()); }
+        }
+        Some(json!({"session": session, "effective": effective, "inherited": inherited, "chain": chain}))
+    }
+
+    pub fn inherited_worktree(&self, id: &str) -> Option<Value> {
+        self.with(|c| c.query_row("SELECT record FROM inherited_worktree WHERE session_id = ?1", params![id], |r| r.get::<_, String>(0)).ok().and_then(|s| serde_json::from_str(&s).ok()))
+    }
+
+    pub fn set_inherited_worktree(&self, id: &str, record: &Value) -> Result<(), String> {
+        let encoded = serde_json::to_string(record).map_err(|e| e.to_string())?;
+        self.with(|c| c.execute("INSERT INTO inherited_worktree(session_id, record) VALUES (?1, ?2) ON CONFLICT(session_id) DO UPDATE SET record=excluded.record", params![id, encoded]).map(|_| ()).map_err(|e| e.to_string()))
+    }
+
     /// Every folder that exists: registered, in use, or both.
     ///
     /// Sorted, so the tree the UI builds is stable between reads — an
@@ -142,7 +220,7 @@ impl ConvStore {
                         )
                         .unwrap_or(0)
                     });
-                json!({ "id": name, "name": name, "icon": "brackets-angle", "count": n })
+                json!({ "id": name, "name": name, "icon": "brackets-angle", "count": n, "props": self.project_props(name) })
             })
             .collect();
         json!({ "projects": out })
@@ -186,9 +264,8 @@ impl ConvStore {
         let cut = from.len() as i64 + 1;
         self.with(|c| {
             let _ = c.execute(
-                "INSERT INTO projects (name, created_at) VALUES (?1, ?2)
-                 ON CONFLICT(name) DO NOTHING",
-                params![to, now],
+                "INSERT INTO projects (name, created_at, settings) SELECT ?1, ?2, settings FROM projects WHERE name = ?3 ON CONFLICT(name) DO UPDATE SET settings=excluded.settings",
+                params![to, now, from],
             );
             let _ = c.execute(
                 "UPDATE OR REPLACE projects SET name = ?1 || substr(name, ?2) WHERE name LIKE ?3",
@@ -363,6 +440,39 @@ mod tests {
     fn assigning_to_a_conversation_that_is_not_there_is_an_error() {
         let s = store();
         assert!(s.assign_project("nope", "x").is_err());
+    }
+
+    #[test]
+    fn project_settings_follow_ancestry_and_session_overrides() {
+        let s = store();
+        let id = conv(&s, "example");
+        s.assign_project(&id, "a/b/c").unwrap();
+        s.set_project_props("a", &json!({"purpose":"root", "notes":"root notes", "workspaceRoot":"/tmp"})).unwrap();
+        s.set_project_props("a/b/c", &json!({"purpose":"child", "notes":""})).unwrap();
+        let view = s.effective_session(&id).unwrap();
+        assert_eq!(view["effective"]["purpose"], "child");
+        assert_eq!(view["effective"]["notes"], "root notes");
+        assert_eq!(view["chain"].as_array().unwrap().len(), 2);
+        let mut patch = serde_json::Map::new();
+        patch.insert("purpose".into(), json!("session"));
+        patch.insert("notes".into(), json!(""));
+        s.update_meta(&id, patch).unwrap();
+        let view = s.effective_session(&id).unwrap();
+        assert_eq!(view["effective"]["purpose"], "session");
+        assert_eq!(view["effective"]["notes"], "root notes");
+        assert_eq!(view["session"]["purpose"], "session");
+        s.rename_project("a", "z").unwrap();
+        assert_eq!(s.project_props("z")["notes"], "root notes");
+        assert_eq!(s.effective_session(&id).unwrap()["effective"]["notes"], "root notes");
+    }
+
+    #[test]
+    fn project_props_reject_identity_and_can_be_cleared() {
+        let s = store();
+        assert!(s.set_project_props("a", &json!({"title":"no"})).is_err());
+        s.set_project_props("a", &json!({"purpose":"one"})).unwrap();
+        s.set_project_props("a", &json!({"purpose":null})).unwrap();
+        assert_eq!(s.project_props("a"), json!({}));
     }
 
     #[test]

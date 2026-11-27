@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when the DDL below changes in a way an existing file must be
 /// brought forward to. Recorded in `schema_meta`.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -123,7 +123,14 @@ CREATE TABLE IF NOT EXISTS session_sandbox (
 -- of which the UI offers as ordinary gestures.
 CREATE TABLE IF NOT EXISTS projects (
     name       TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    settings TEXT NOT NULL DEFAULT '{}'
+);
+
+-- Resolved inherited checkouts are runtime state, not authored session settings.
+CREATE TABLE IF NOT EXISTS inherited_worktree (
+    session_id TEXT PRIMARY KEY REFERENCES conversation(id) ON DELETE CASCADE,
+    record TEXT NOT NULL
 );
 
 -- App settings: one row per key.
@@ -490,6 +497,7 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
     // result is discarded rather than branched on — cheaper and less
     // fragile than reading `pragma_table_info` for each one.
     for stmt in [
+        "ALTER TABLE projects ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'",
         "ALTER TABLE participants ADD COLUMN engagement TEXT",
         "ALTER TABLE agents ADD COLUMN accent_color TEXT",
         "ALTER TABLE agents ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''",

@@ -1103,7 +1103,7 @@ impl Server {
             // threading before a chat is genuinely large.
             ("POST", path) if matches!(session_route(path), Some((_, "compact"))) => {
                 let (id, _) = session_route(path).unwrap();
-                let Some(meta) = st.store.load(id) else {
+                let Some(meta) = st.store.effective_session(id).and_then(|v| v.get("effective").cloned()) else {
                     sink.json(404, &json!({ "error": "not found" }));
                     return;
                 };

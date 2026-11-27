@@ -451,7 +451,7 @@ pub fn plan(
     reply_required: bool,
     how_you_got_here: &str,
 ) -> Option<Task> {
-    let header = store.load(conv)?;
+    let header = store.effective_session(conv)?.get("effective")?.clone();
     let title = header
         .get("title")
         .and_then(|v| v.as_str())

@@ -288,9 +288,9 @@ impl ConvStore {
                    (id, ordinal, api_version, kind, title, agent, agent_file, model, status,
                     policy_mode, approve_mode, allowlist, allowlist_source, context_window,
                     mcp, project_root, config, overrides, allowlist_mode, turns,
-                    created_at, updated_at)
+                    created_at, updated_at, routing)
                  VALUES (?1, ?2, 'conv/v1', 'conversation', ?3, ?4, ?5, ?6, 'ready',
-                         ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, 0, ?16, ?16)",
+                         ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, 0, ?16, ?16, '')",
                 params![
                     id,
                     ordinal,

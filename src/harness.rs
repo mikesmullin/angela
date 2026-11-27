@@ -319,7 +319,8 @@ impl McpPool {
 /// definition carries nothing here.
 fn file_root_for(store: &ConvStore, session_id: &str, project_root: &std::path::Path) -> std::path::PathBuf {
     let root = store
-        .load(session_id)
+        .effective_session(session_id)
+        .and_then(|m| m.get("effective").cloned())
         .and_then(|m| m.get("workspaceRoot").and_then(Value::as_str).map(String::from));
     match root {
         Some(r) if !r.trim().is_empty() => {
@@ -914,7 +915,7 @@ fn queue_wait(
         // The card says why this message waits, so its row says so before
         // anything is decided about it — including on the very first look,
         // so a message about to start is still seen in the queue first.
-        let meta = store.load(session_id).unwrap_or(Value::Null);
+        let meta = store.effective_session(session_id).and_then(|v| v.get("effective").cloned()).unwrap_or(Value::Null);
         let gate_ok = match check(&meta) {
             Ok(()) => true,
             Err(reason) => {
@@ -987,7 +988,7 @@ pub fn run_turn(
     // The agent's setting overrides the session's selected model.
     let model = Some(def.model.clone()).filter(|m| !m.trim().is_empty())
         .or_else(|| req.model.clone().filter(|m| !m.trim().is_empty()))
-        .or_else(|| req.session_id.as_deref().and_then(|id| store.load(id))
+        .or_else(|| req.session_id.as_deref().and_then(|id| store.effective_session(id).and_then(|v| v.get("effective").cloned()))
             .and_then(|v| v.get("model").and_then(Value::as_str).map(String::from))
             .filter(|m| !m.trim().is_empty()))
         .unwrap_or_else(|| DEFAULT_MODEL.into());
@@ -1213,7 +1214,7 @@ pub fn run_turn(
     let mut agent = Agent::factory(Factory {
         model: Some(model.clone()),
         slot: held_slots.get(&agl::agent::queue_spec(&model)).cloned(),
-        reasoning_effort: turn_reasoning(def, store.load(&session_id).as_ref()),
+        reasoning_effort: turn_reasoning(def, store.effective_session(&session_id).and_then(|v| v.get("effective").cloned()).as_ref()),
         system_prompt: Some(system.clone()).filter(|p| !p.trim().is_empty()),
         retain_history: Some(true),
         parallel_tools: Some(true),
@@ -1255,7 +1256,7 @@ pub fn run_turn(
         }
     }
     // Session rules supplement this agent's own rules.
-    let session_state = store.load(&session_id);
+    let session_state = store.effective_session(&session_id).and_then(|v| v.get("effective").cloned());
     let overridden = session_state
         .as_ref()
         .and_then(|s| s.get("allowlist"))
@@ -1971,6 +1972,22 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn queue_gate_receives_inherited_properties() {
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"].as_str().unwrap().to_string();
+        s.assign_project(&id, "parent/child").unwrap();
+        s.set_project_props("parent", &json!({"workspaceRoot": "/tmp"})).unwrap();
+        let q = crate::queue::Queues::new();
+        let item = s.queue_push(&id, "hello", "", "coder", "", "1");
+        let check = |m: &Value| {
+            if m.get("workspaceRoot").and_then(Value::as_str) == Some("/tmp") { Ok(()) }
+            else { Err("missing inherited root".into()) }
+        };
+        let outcome = queue_wait(&q, &s, &id, &item, true, &check, &|| {}, &[], |_| {}, Duration::from_millis(1));
+        assert!(matches!(outcome, QueueOutcome::Started(_)));
+    }
+
+    #[test]
     fn a_queued_message_says_why_it_waits() {
         let (_t, s) = store();
         let id = s.create(NewSession::default()).unwrap()["id"]
@@ -2254,7 +2271,7 @@ pub fn run_round(
 
     let roster = store.participants(&conv);
 
-    let header = store.load(&conv).unwrap_or(Value::Null);
+    let header = store.effective_session(&conv).and_then(|v| v.get("effective").cloned()).unwrap_or(Value::Null);
 
     // Nobody to answer. The message is already durable, so this is a state
     // the user can fix and then re-send from — but silence with no
@@ -2283,6 +2300,7 @@ pub fn run_round(
     let routing = header
         .get("routing")
         .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
         .unwrap_or("everyone")
         .to_string();
 
@@ -2562,7 +2580,7 @@ pub fn run_round(
 /// here (the session's model changed mid-round) acquires its own — correct,
 /// just without the atomic handoff.
 fn round_slot_specs(store: &ConvStore, conv: &str, def: &AgentDef) -> Vec<String> {
-    let header = store.load(conv).unwrap_or(Value::Null);
+    let header = store.effective_session(conv).and_then(|v| v.get("effective").cloned()).unwrap_or(Value::Null);
     let agents = store.agents();
     let mut out: Vec<String> = Vec::new();
     for me in store.agent_participants(conv) {
@@ -2636,7 +2654,7 @@ fn run_participant(
     let mut agent = Agent::factory(Factory {
         model: Some(model.to_string()),
         slot: held_slots.get(&agl::agent::queue_spec(model)).cloned(),
-        reasoning_effort: turn_reasoning(def, store.load(conv).as_ref()),
+        reasoning_effort: turn_reasoning(def, store.effective_session(conv).and_then(|v| v.get("effective").cloned()).as_ref()),
         system_prompt: Some(system.clone()),
         // The history is pushed explicitly below, and must not also
         // accumulate across participants.
@@ -2666,7 +2684,7 @@ fn run_participant(
         agent.push_context(crate::media::with_images(&store.project_root, msg.clone()));
     }
 
-    let session_state = store.load(conv);
+    let session_state = store.effective_session(conv).and_then(|v| v.get("effective").cloned());
     let overridden = session_state
         .as_ref()
         .and_then(|s| s.get("allowlist"))
@@ -2824,7 +2842,7 @@ fn lead_assignment(
     else {
         return Vec::new();
     };
-    let header = store.load(conv).unwrap_or(Value::Null);
+    let header = store.effective_session(conv).and_then(|v| v.get("effective").cloned()).unwrap_or(Value::Null);
     let prompt = crate::group::routing_prompt(
         header.get("title").and_then(|v| v.as_str()).unwrap_or("untitled"),
         header.get("purpose").and_then(|v| v.as_str()),
