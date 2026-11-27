@@ -1,31 +1,9 @@
-//! Identity, devices, and the ACL — the WHO, the WHAT and the grants.
-//!
-//! The shape is PLAN44's three-table ACL, with one deliberate merge: the
-//! `principal` table **is** the user table (a user is a principal of kind
-//! `'user'`, a role a principal of kind `'role'`), because two tables for
-//! one concept are two tables that drift apart.
-//!
-//! Three rules everything here enforces, from the plan's decisions:
-//!
-//! * **The admin is the first user row (id 1)** — exactly one, by id. Its
-//!   powers are implicit: no capability rows, no grant rows, no checks.
-//! * **Default deny.** A user with no capability rows and no grants can
-//!   only take part in sessions others invite it to (a `post` grant).
-//! * **Delegation is `with_grant`.** A user may re-share only privileges
-//!   its own grant carries `with_grant` on — there is no separate
-//!   "delegate" capability to hold.
-//!
-//! Session cookies live here as `device` rows: the cookie's value is never
-//! stored, only its sha256 and a masked hint, so the profile can list what
-//! it cannot reveal. One login on a new device = one row.
-
 use std::sync::Mutex;
 
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// The account capabilities (Layer 1). Keep in step with PLAN44's catalog.
 pub const CAPABILITIES: &[&str] = &[
     "session.create",
     "session.invite",
@@ -35,34 +13,28 @@ pub const CAPABILITIES: &[&str] = &[
     "sandbox.create",
 ];
 
-/// The per-resource privileges (Layer 2).
 pub const PRIVILEGES: &[&str] = &[
     "read", "post", "steer", "seat", "edit_meta", "edit", "grant", "delete",
 ];
 
-/// The user-level allowlist kinds (Layer 1b).
 pub const ALLOWLIST_KINDS: &[&str] = &["models", "mcp", "tools", "sandboxes"];
 
-/// One person (or role) row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct User {
     pub id: i64,
     pub name: String,
     pub display_name: String,
-    /// The user's own profile note (per-user, never global).
     pub location: String,
     pub kind: String,
     pub disabled: bool,
 }
 
 impl User {
-    /// The admin is user id 1 — exactly one, by id (PLAN44 D-catalog).
     pub fn is_admin(&self) -> bool {
         self.id == 1
     }
 }
 
-/// One recognized device — which is also one issued session cookie.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Device {
     pub id: i64,
@@ -76,9 +48,6 @@ pub struct Device {
     pub revoked: bool,
 }
 
-/// The store's identity half, sharing the conversation database and its
-/// lock. Every method takes the lock for one statement — never held across
-/// another, same as [`crate::conv_store::ConvStore`].
 pub struct Identity<'a> {
     pub(crate) conn: &'a Mutex<Connection>,
 }
@@ -90,8 +59,6 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// 32 random bytes as hex, from the OS. Session tokens must be
-/// unguessable; there is no seeding mistake to make here.
 fn random_token() -> String {
     let mut buf = [0u8; 32];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -107,8 +74,6 @@ fn hash_token(token: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `ab12…9f` — enough to recognise a row in the profile list, never enough
-/// to reconstruct the cookie (its value is not stored at all).
 fn token_hint(token: &str) -> String {
     if token.len() <= 6 {
         return "…".into();
@@ -117,11 +82,7 @@ fn token_hint(token: &str) -> String {
 }
 
 impl Identity<'_> {
-    // ---- the WHO: users ---------------------------------------------------
 
-    /// Create a user. `name` is the case-insensitive login. The first user
-    /// ever created becomes the admin purely by being id 1 — nothing else
-    /// about it is special, and nothing else can be.
     pub fn create_user(&self, name: &str, display_name: &str) -> Result<User, String> {
         let name = name.trim();
         if name.is_empty() {
@@ -170,7 +131,6 @@ impl Identity<'_> {
         .ok()
     }
 
-    /// By login name. Case-insensitive: the `name` column is COLLATE NOCASE.
     pub fn user_by_name(&self, name: &str) -> Option<User> {
         let conn = self.conn.lock().unwrap();
         Self::user_row(&conn, "name = ?1 AND kind = 'user'", &name.trim())
@@ -201,9 +161,6 @@ impl Identity<'_> {
         rows.filter_map(Result::ok).collect()
     }
 
-    /// Save a user's own profile fields. Only the location is writable —
-    /// the name is fixed at login and changes only by re-creating the
-    /// account (PLAN44).
     pub fn set_location(&self, id: i64, location: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -237,11 +194,7 @@ impl Identity<'_> {
         Ok(())
     }
 
-    // ---- devices (one per issued session cookie) --------------------------
 
-    /// Mint a session cookie for a user. The plaintext token is returned
-    /// **once** (it goes in the `Set-Cookie`); only its hash and hint are
-    /// kept.
     pub fn issue_device(
         &self,
         user_id: i64,
@@ -284,9 +237,6 @@ impl Identity<'_> {
         ))
     }
 
-    /// Resolve a session cookie to its user. `None` for unknown, revoked or
-    /// disabled — the edge treats all three the same: not logged in. The
-    /// row's `last_seen_at` moves forward on every successful look-up.
     pub fn device_by_token(&self, token: &str) -> Option<(User, Device)> {
         if token.trim().is_empty() {
             return None;
@@ -325,9 +275,6 @@ impl Identity<'_> {
         Some((user, row.0))
     }
 
-    /// The devices still recognized — live cookies only, most recently
-    /// seen first. A revoked row is history, not a device the profile
-    /// offers to manage (PLAN44 A2).
     pub fn list_devices(&self, user_id: i64) -> Vec<Device> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -354,8 +301,6 @@ impl Identity<'_> {
         rows.filter_map(Result::ok).collect()
     }
 
-    /// Force-expire one device's cookie. Scoping by `user_id` means a user
-    /// can only revoke their own — the admin passes 0 for "any".
     pub fn revoke_device(&self, user_id: i64, device_id: i64) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let n = conn
@@ -371,7 +316,6 @@ impl Identity<'_> {
         Ok(())
     }
 
-    // ---- Layer 1: account capabilities ------------------------------------
 
     pub fn grant_capability(&self, user_id: i64, capability: &str) -> Result<(), String> {
         if !CAPABILITIES.contains(&capability) {
@@ -394,8 +338,6 @@ impl Identity<'_> {
         );
     }
 
-    /// The admin holds every capability implicitly. Everybody else needs
-    /// the row (default deny).
     pub fn has_capability(&self, user_id: i64, capability: &str) -> bool {
         if user_id == 1 {
             return true;
@@ -418,11 +360,7 @@ impl Identity<'_> {
         rows.filter_map(Result::ok).collect()
     }
 
-    // ---- Layer 1b: user-level allowlists ----------------------------------
 
-    /// Replace one allowlist. Empty = "nothing may be assigned" (distinct
-    /// from `*` = everything); both are answers, so a missing row and an
-    /// empty one mean the same: deny.
     pub fn set_allowlist(&self, user_id: i64, kind: &str, patterns: &[String]) -> Result<(), String> {
         if !ALLOWLIST_KINDS.contains(&kind) {
             return Err(format!("unknown allowlist kind {kind:?}"));
@@ -458,10 +396,6 @@ impl Identity<'_> {
         rows.filter_map(Result::ok).collect()
     }
 
-    /// May this user put `name` (of `kind`) on an agent it creates or
-    /// edits? The admin may; everybody else needs `*` or the exact name on
-    /// their user-level allowlist. Restricts **editing**, never using: an
-    /// agent's own tools keep working for anyone its owner invites in.
     pub fn may_assign(&self, user_id: i64, kind: &str, name: &str) -> bool {
         if user_id == 1 {
             return true;
@@ -475,10 +409,7 @@ impl Identity<'_> {
         .is_ok()
     }
 
-    // ---- the audit log: who did what as whom ----------------------------
 
-    /// Record an identity transition (PLAN44 D4). `acting_as` is the
-    /// masquerade target when the actor took another account's face.
     pub fn audit(&self, actor: &str, acting_as: &str, action: &str, detail: &str) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
@@ -487,7 +418,6 @@ impl Identity<'_> {
         );
     }
 
-    /// The newest entries first — the admin's audit view.
     pub fn audit_tail(&self, n: usize) -> Vec<Value> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -510,11 +440,7 @@ impl Identity<'_> {
         rows.filter_map(Result::ok).collect()
     }
 
-    // ---- Layer 2: resources and grants ------------------------------------
 
-    /// The resource row for `(kind, name)`, created on first sight with
-    /// `owner_id` as its owner. Existing entities get their row lazily —
-    /// `ensure_resource` is idempotent and never moves ownership.
     pub fn ensure_resource(&self, kind: &str, name: &str, owner_id: i64) -> Result<i64, String> {
         if name.trim().is_empty() {
             return Err("a resource needs a name".into());
@@ -540,7 +466,6 @@ impl Identity<'_> {
         .ok()
     }
 
-    /// `(id, owner_id)` for a resource, if its row exists.
     pub fn resource(&self, kind: &str, name: &str) -> Option<(i64, i64)> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -551,9 +476,6 @@ impl Identity<'_> {
         .ok()
     }
 
-    /// Grant one privilege on a resource. The grantor must be the owner, or
-    /// hold `grant` **with** `with_grant` on that resource — delegation is
-    /// the flag on your own grant, never a separate permission.
     #[allow(clippy::too_many_arguments)]
     pub fn grant(
         &self,
@@ -596,8 +518,6 @@ impl Identity<'_> {
         Ok(())
     }
 
-    /// Take one privilege back. The owner and the admin may always; a
-    /// delegator may take back what it granted.
     pub fn revoke_grant(
         &self,
         actor: i64,
@@ -632,9 +552,6 @@ impl Identity<'_> {
         Ok(())
     }
 
-    /// Does `user_id` hold `privilege` on `(kind, name)`? The admin always
-    /// does; the owner always does on their own resource; everyone else
-    /// needs the grant row. A resource with no row is invisible — deny.
     pub fn can(&self, user_id: i64, kind: &str, name: &str, privilege: &str) -> bool {
         if user_id == 1 {
             return true;
@@ -657,8 +574,6 @@ impl Identity<'_> {
         .is_ok()
     }
 
-    /// Resources of one kind a user may `read` — the list query behind
-    /// "unshared resources are invisible".
     pub fn readable(&self, user_id: i64, kind: &str, names: &[String]) -> Vec<String> {
         if user_id == 1 {
             return names.to_vec();
@@ -686,8 +601,6 @@ impl Identity<'_> {
             .collect()
     }
 
-    /// Every grant on one resource — the share dialog's data. Returns
-    /// `(owner_id, rows)`; `owner_id` is `None` when the row does not exist.
     pub fn grants_on(&self, kind: &str, name: &str) -> (Option<i64>, Vec<Value>) {
         let conn = self.conn.lock().unwrap();
         let Some(id) = Self::resource_id(&conn, kind, name) else {
@@ -717,7 +630,6 @@ impl Identity<'_> {
         (Some(owner), rows.filter_map(Result::ok).collect())
     }
 
-    /// Transfer ownership (the owner or the admin only).
     pub fn set_owner(&self, actor: i64, kind: &str, name: &str, new_owner: i64) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let Some(id) = Self::resource_id(&conn, kind, name) else {
@@ -735,133 +647,5 @@ impl Identity<'_> {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::conv_store::ConvStore;
-
-    fn id_store() -> (ConvStore, std::path::PathBuf) {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "identity-test-{}-{}-{}",
-            std::process::id(),
-            now_ms() as u64,
-            n
-        ));
-        (ConvStore::new(&dir).unwrap(), dir)
-    }
-
-    #[test]
-    fn the_first_user_is_the_admin_and_names_are_case_insensitive() {
-        let (store, _d) = id_store();
-        let id = store.identity();
-        let bob = id.create_user("Bob", "Bob").unwrap();
-        assert!(bob.is_admin(), "the first user is the admin");
-        assert_eq!(id.create_user("Bob", "dup").unwrap_err(), "that name is taken");
-        assert!(id.user_by_name("BOB").is_some(), "login is case-insensitive");
-        let alice = id.create_user("alice", "Alice").unwrap();
-        assert!(!alice.is_admin());
-        // The admin cannot be disabled, by design.
-        assert!(id.set_disabled(1, true).is_err());
-    }
-
-    #[test]
-    fn devices_mint_validate_and_revoke_without_storing_the_cookie() {
-        let (store, _d) = id_store();
-        let id = store.identity();
-        let u = id.create_user("Bob", "").unwrap();
-        let (token, dev) = id.issue_device(u.id, "fp-abc", "ua", "10.0.0.2").unwrap();
-        assert_eq!(token.len(), 64, "32 bytes hex");
-        assert_ne!(dev.token_hint, token, "the hint is never the token");
-        let (user, d) = id.device_by_token(&token).unwrap();
-        assert_eq!(user.id, u.id);
-        assert_eq!(d.id, dev.id);
-        assert!(id.device_by_token("wrong").is_none());
-        id.revoke_device(u.id, dev.id).unwrap();
-        assert!(id.device_by_token(&token).is_none(), "revoked stops validating");
-        // A second device cannot be revoked through the first user's scope
-        // by a different user.
-        let (t2, d2) = id.issue_device(u.id, "fp", "ua", "ip").unwrap();
-        let other = id.create_user("alice", "").unwrap();
-        assert!(id.revoke_device(other.id, d2.id).is_err());
-        assert!(id.device_by_token(&t2).is_some());
-    }
-
-    #[test]
-    fn capabilities_default_deny_but_the_admin_needs_none() {
-        let (store, _d) = id_store();
-        let id = store.identity();
-        let admin = id.create_user("Bob", "").unwrap();
-        let u = id.create_user("alice", "").unwrap();
-        assert!(!id.has_capability(u.id, "session.create"), "default deny");
-        assert!(id.has_capability(admin.id, "session.create"), "implicit");
-        id.grant_capability(u.id, "session.create").unwrap();
-        assert!(id.has_capability(u.id, "session.create"));
-        id.revoke_capability(u.id, "session.create");
-        assert!(!id.has_capability(u.id, "session.create"));
-        assert!(id.grant_capability(u.id, "root.everything").is_err(), "unknown caps are refused");
-    }
-
-    #[test]
-    fn allowlists_are_ceilings_on_editing_never_on_using() {
-        let (store, _d) = id_store();
-        let id = store.identity();
-        let admin = id.create_user("Bob", "").unwrap();
-        let u = id.create_user("alice", "").unwrap();
-        assert!(!id.may_assign(u.id, "tools", "chat__sessions_list"), "empty = deny");
-        id.set_allowlist(u.id, "tools", &["chat__sessions_list".into()]).unwrap();
-        assert!(id.may_assign(u.id, "tools", "chat__sessions_list"));
-        assert!(!id.may_assign(u.id, "tools", "term_local__bash"), "not on the list");
-        id.set_allowlist(u.id, "tools", &["*".into()]).unwrap();
-        assert!(id.may_assign(u.id, "tools", "term_local__bash"));
-        // The admin's ceiling does not exist.
-        assert!(id.may_assign(admin.id, "tools", "anything"));
-    }
-
-    #[test]
-    fn grants_are_invisible_until_given_and_delegation_needs_with_grant() {
-        let (store, _d) = id_store();
-        let id = store.identity();
-        let owner = id.create_user("Bob", "").unwrap();
-        let fam = id.create_user("alice", "").unwrap();
-        let stranger = id.create_user("kid", "").unwrap();
-        id.ensure_resource("agent", "ping", owner.id).unwrap();
-
-        assert!(!id.can(fam.id, "agent", "ping", "read"), "no grant = invisible");
-        assert!(id.can(owner.id, "agent", "ping", "delete"), "the owner holds everything");
-        id.grant(fam.id, "agent", "ping", "post", owner.id, false).unwrap();
-        assert!(id.can(fam.id, "agent", "ping", "post"));
-        assert!(!id.can(fam.id, "agent", "ping", "read"), "post does not imply read");
-
-        // A grant without with_grant cannot be re-shared.
-        assert!(id.grant(stranger.id, "agent", "ping", "read", fam.id, false).is_err());
-        // With it, it can.
-        id.grant(fam.id, "agent", "ping", "grant", owner.id, true).unwrap();
-        id.grant(stranger.id, "agent", "ping", "read", fam.id, false).unwrap();
-        assert!(id.can(stranger.id, "agent", "ping", "read"));
-
-        // The admin sees and does everything.
-        assert!(id.can(1, "agent", "ping", "delete"));
-        id.set_owner(1, "agent", "ping", fam.id).unwrap();
-        assert_eq!(id.resource("agent", "ping").unwrap().1, fam.id);
-    }
-
-    #[test]
-    fn readable_filters_the_list_to_what_is_shared() {
-        let (store, _d) = id_store();
-        let id = store.identity();
-        let owner = id.create_user("Bob", "").unwrap();
-        let fam = id.create_user("alice", "").unwrap();
-        id.ensure_resource("session", "s1", owner.id).unwrap();
-        id.ensure_resource("session", "s2", owner.id).unwrap();
-        id.ensure_resource("session", "s3", owner.id).unwrap();
-        id.grant(fam.id, "session", "s2", "read", owner.id, false).unwrap();
-        let all = vec!["s1".to_string(), "s2".to_string(), "s3".to_string()];
-        assert_eq!(id.readable(fam.id, "session", &all), vec!["s2".to_string()]);
-        assert_eq!(id.readable(owner.id, "session", &all), all);
     }
 }

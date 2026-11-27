@@ -1,11 +1,3 @@
-//! `angela-serve` — bind the angela HTTP surface.
-//!
-//!   angela-serve [--port 8763] [-c <project-root>]
-//!
-//! Defaults match the JS (`src/serve.mjs`): port 8763, project root = the process working directory.
-//! `chat-server` in psicom/chat proxies `/api/*` to this address, so running
-//! this in place of `bun run src/serve.mjs` needs no front-end change.
-
 use std::sync::Arc;
 
 use angela::http;

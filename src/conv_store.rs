@@ -1,34 +1,3 @@
-//! `ConvStore` — conversations as a tree in SQLite.
-//!
-//! This is the replacement for [`crate::session_store::SessionStore`]. The
-//! method names are deliberately the same, because every one of them is a
-//! call site in `harness.rs` or `serve.rs` and the point of the change is the
-//! storage model, not the harness. What differs underneath:
-//!
-//! | `SessionStore` | `ConvStore` |
-//! |---|---|
-//! | `append_event` writes a line at the end of a file | writes a node whose parent is the cursor, then moves the cursor onto it |
-//! | `list_events` reads the whole file | walks cursor → parent → … → root and reverses |
-//! | a `context_meta` line patches visibility | an `UPDATE` on the node's `visible` column |
-//! | two roles, `user` and `assistant` | N participants, each a row with a handle |
-//!
-//! A conversation that is never forked behaves **identically** to the old
-//! log: every node's parent is the one before it, the cursor sits on the
-//! tail, and the cursor→root path is every node in `seq` order. That
-//! equivalence is what makes the migration a no-op from the UI's side, and
-//! it is asserted directly in the tests at the bottom of this file.
-//!
-//! Forking is then a two-step with no new concepts: point the cursor at any
-//! node, append. The old branch is still there, still reachable, because
-//! nothing was ever rewritten — the only thing that changed is which path
-//! the walk finds.
-//!
-//! The header the API speaks is still the legacy camelCase object
-//! (`createdAt`, `policyMode`, `contextWindow`, …), produced by
-//! [`ConvStore::load`] from the `conversation` row. Keeping that shape means
-//! the SPA, the NDJSON card vocabulary and the existing route contracts did
-//! not have to move at the same time as the database.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -41,7 +10,6 @@ use crate::session_store::{
     Goto, NewEvent, NewSession,
 };
 
-/// Event kinds whose author is an agent participant rather than the human.
 const AGENT_KINDS: &[&str] = &[
     "reasoning",
     "tool_call",
@@ -54,7 +22,6 @@ const AGENT_KINDS: &[&str] = &[
     "harness",
 ];
 
-/// One seat in the conversation.
 #[derive(Debug, Clone)]
 pub struct Participant {
     pub id: i64,
@@ -69,9 +36,6 @@ pub struct Participant {
     pub seat: i64,
     pub active: bool,
     pub role: Option<String>,
-    /// Per-conversation engagement override. `None` means "whatever the
-    /// agent definition currently says", so editing an agent changes how it
-    /// behaves in the conversations it is already seated in.
     pub engagement: Option<String>,
 }
 
@@ -84,16 +48,6 @@ impl Participant {
         self.to_json_with(None)
     }
 
-    /// The seat, with how its agent is drawn folded in.
-    ///
-    /// Resolved from the definition at read time rather than copied at seat
-    /// time, like the system prompt and `engagement`: recolouring an agent —
-    /// or giving it a different icon — has to change it in the conversations
-    /// it is already seated in.
-    ///
-    /// Takes the whole definition rather than one appearance field per
-    /// parameter, so the caller looks the agent up once however many of
-    /// these the roster ends up carrying.
     pub fn to_json_with(&self, def: Option<&crate::agent_loader::AgentDef>) -> Value {
         json!({
             "id": self.id,
@@ -113,7 +67,6 @@ impl Participant {
     }
 }
 
-/// A node as the tree sees it: the event plus its position.
 #[derive(Debug, Clone)]
 pub struct TreeNode {
     pub id: String,
@@ -133,13 +86,8 @@ pub struct TreeNode {
 }
 
 impl TreeNode {
-    /// The node as the old wrapped-event shape, so every reader written
-    /// against the JSONL log keeps working.
     pub fn to_event(&self) -> EventWrapper {
         let mut meta = self.meta.clone();
-        // `visible` and `goto` live in columns now; project them back into
-        // `meta` only when they say something, so the serialised shape stays
-        // as close to the old log as it can.
         if !self.visible {
             meta.insert("visible".into(), Value::Bool(false));
         }
@@ -173,15 +121,11 @@ impl TreeNode {
     }
 }
 
-/// Durable conversations in `<root>/.angela/conversations.db`.
 pub struct ConvStore {
     pub project_root: PathBuf,
     conn: Mutex<Connection>,
 }
 
-// ---------------------------------------------------------------------------
-// Small conversions
-// ---------------------------------------------------------------------------
 
 fn to_json_text(v: &Value) -> Option<String> {
     if v.is_null() {
@@ -195,10 +139,6 @@ fn from_json_text(s: Option<String>) -> Value {
     s.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
 }
 
-/// The `worktree` column holds a provisioned-worktree record as JSON text —
-/// `provisioned`, `path`, and the embedder's own bookkeeping hung off it.
-/// Everything else (absence, empty, a legacy plain string) reads back as
-/// `null`; the legacy `worktreeId` mapping above is what carries a bare id.
 fn worktree_record(raw: Option<String>) -> Value {
     let Some(s) = raw else { return Value::Null };
     let trimmed = s.trim();
@@ -211,8 +151,6 @@ fn worktree_record(raw: Option<String>) -> Value {
     }
 }
 
-/// A handle from an agent name: lowercase, non-alphanumerics folded to `-`.
-/// Handles are what `@mentions` match on, so they have to be typeable.
 pub fn handle_from(name: &str) -> String {
     let mut out = String::new();
     let mut last_dash = true;
@@ -243,7 +181,6 @@ impl ConvStore {
         })
     }
 
-    /// An in-memory store rooted at `project_root` — for tests.
     pub fn memory(project_root: impl AsRef<Path>) -> rusqlite::Result<Self> {
         Ok(ConvStore {
             project_root: project_root.as_ref().to_path_buf(),
@@ -251,32 +188,20 @@ impl ConvStore {
         })
     }
 
-    /// Run `f` with the connection. Every public method funnels through here
-    /// so there is exactly one place the lock is taken, and no method can
-    /// deadlock by calling another while holding it.
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         f(&conn)
     }
 
-    /// The identity half of the store: users, devices, capabilities and
-    /// the ACL (see [`crate::identity`]). Same database, same lock
-    /// discipline — one statement per method.
     pub fn identity(&self) -> crate::identity::Identity<'_> {
         crate::identity::Identity { conn: &self.conn }
     }
 
-    // -----------------------------------------------------------------------
-    // Conversations
-    // -----------------------------------------------------------------------
 
     pub fn create(&self, meta: NewSession) -> rusqlite::Result<Value> {
         let id = new_session_id();
         let root = self.project_root.to_string_lossy().into_owned();
         self.with(|c| {
-            // `max + 1`, never `count + 1`: closing tab 2 of {1,2,3} and
-            // making a new one must give 4. A reused number would collide
-            // with a live tab's key in the strip.
             let ordinal: i64 = c
                 .query_row("SELECT COALESCE(MAX(ordinal), 0) + 1 FROM conversation", [], |r| {
                     r.get(0)
@@ -308,12 +233,6 @@ impl ConvStore {
                     meta.config.as_ref().and_then(to_json_text),
                     meta.overrides.as_ref().and_then(to_json_text),
                     now,
-                    // Written here rather than left NULL for the reader to
-                    // default, because the reader cannot tell a session
-                    // created under this default from one created before it.
-                    // Changing the fallback instead would silently move every
-                    // existing conversation to `unrestricted`, which is not a
-                    // thing to do retroactively to a tool policy.
                     meta.allowlist_mode.clone().unwrap_or_else(|| "unrestricted".into()),
                 ],
             )?;
@@ -322,14 +241,9 @@ impl ConvStore {
                  VALUES (?1, 0, NULL, ?2)",
                 params![id, now],
             )?;
-            // A new conversation is **you, alone**. Agents join by invitation
-            // (`/invite @name`), so the roster starts out saying honestly
-            // that nobody is listening yet rather than quietly seating
-            // whichever agent happened to be the default.
             Self::seed_roster(c, &id)?;
             Ok::<(), rusqlite::Error>(())
         })?;
-        // The opening lifecycle beat, so the log reads the same as it did.
         let _ = self.append_event(
             &id,
             NewEvent::new(
@@ -347,7 +261,6 @@ impl ConvStore {
         Ok(self.load(&id).unwrap_or(Value::Null))
     }
 
-    /// Seat the human. Agents are invited, never assumed.
     fn seed_roster(c: &Connection, conv: &str) -> rusqlite::Result<()> {
         c.execute(
             "INSERT OR IGNORE INTO participants
@@ -358,8 +271,6 @@ impl ConvStore {
         Ok(())
     }
 
-    /// The conversation header, in the legacy camelCase shape the HTTP
-    /// surface speaks.
     pub fn load(&self, id: &str) -> Option<Value> {
         self.with(|c| Self::load_in(c, id))
     }
@@ -395,11 +306,7 @@ impl ConvStore {
                         "contextWindow": r.get::<_, Option<i64>>(14)?,
                         "mcp": from_json_text(r.get::<_, Option<String>>(15)?),
                         "projectRoot": r.get::<_, String>(16)?,
-                        // Empty rather than null: the UI binds it straight
-                        // into a picker, and "" is the no-folder answer.
                         "project": r.get::<_, Option<String>>(17)?.unwrap_or_default(),
-                        // Empty rather than null, like `project`: these bind
-                        // straight into pickers whose no-selection answer is "".
                         "sandboxId": r.get::<_, Option<String>>(18)?.unwrap_or_default(),
                         "worktreeId": r.get::<_, Option<String>>(19)?.unwrap_or_default(),
                         "branchId": r.get::<_, Option<String>>(20)?.unwrap_or_default(),
@@ -417,9 +324,6 @@ impl ConvStore {
                         "updatedAt": r.get::<_, String>(32)?,
                         "workspaceRoot": r.get::<_, Option<String>>(33)?,
                         "soulAppendage": r.get::<_, Option<String>>(34)?,
-                        // The stored record is a JSON text; anything else — a
-                        // legacy plain string (a bare id), or junk — is not a
-                        // checkout, and reads back as null.
                         "worktree": worktree_record(r.get::<_, Option<String>>(19)?),
                     }))
                 },
@@ -440,9 +344,6 @@ impl ConvStore {
             )
             .unwrap_or(0);
         o.insert("eventCount".into(), json!(count));
-        // The `last*Tokens` header columns are gone: the newest gen_info node
-        // already holds them, and a cached duplicate was one more field that
-        // could disagree with the log.
         let last = c
             .query_row(
                 "SELECT gen_prompt_tokens, gen_completion_tokens, gen_total_tokens
@@ -469,7 +370,6 @@ impl ConvStore {
         Some(out)
     }
 
-    /// Which legacy header key maps onto which column.
     fn column_for(key: &str) -> Option<&'static str> {
         Some(match key {
             "ordinal" => "ordinal",
@@ -485,14 +385,7 @@ impl ConvStore {
             "contextWindow" | "context_window" => "context_window",
             "projectRoot" | "project_root" => "project_root",
             "workspaceRoot" | "workspace_root" => "workspace_root",
-            // The folder it is filed under — distinct from `project_root`,
-            // which is where its files are. Two sessions on one checkout may
-            // sit in different folders, and often do.
             "project" => "project",
-            // Where its work happens. `branchRef`, not `branch`: a
-            // conversation already has *branches* in the memory tree, and
-            // one word for two unrelated things is how a patch lands on the
-            // wrong column.
             "sandbox" | "sandboxId" => "sandbox",
             "worktree" | "worktreeId" => "worktree",
             "branchRef" | "branch_ref" | "branchId" => "branch_ref",
@@ -504,7 +397,6 @@ impl ConvStore {
             "soulAppendage" | "soul_appendage" => "soul_appendage",
             "notes" => "notes",
             "memoryHigh" | "memory_high" => "memory_high",
-            // JSON-valued columns
             "mcp" => "mcp",
             "config" => "config",
             "overrides" => "overrides",
@@ -516,9 +408,6 @@ impl ConvStore {
     const JSON_COLUMNS: &'static [&'static str] =
         &["mcp", "config", "overrides", "approve_mode", "worktree"];
 
-    /// Patch header fields. Unknown keys are ignored rather than fatal:
-    /// `lastPromptTokens` and friends still arrive from older call sites and
-    /// are now derived, so accepting-and-dropping them is the honest answer.
     pub fn update_meta(&self, id: &str, patch: Map<String, Value>) -> Option<Value> {
         self.with(|c| {
             for (k, v) in &patch {
@@ -586,7 +475,6 @@ impl ConvStore {
         );
     }
 
-    /// Conversation ids, newest first (ids sort chronologically).
     pub fn list(&self) -> Vec<String> {
         self.with(|c| {
             let mut st = match c.prepare("SELECT id FROM conversation ORDER BY id DESC") {
@@ -618,25 +506,13 @@ impl ConvStore {
         })
     }
 
-    /// Delete a conversation and everything hanging off it.
-    ///
-    /// Refuses a traversal-shaped id even though SQL has no path to traverse:
-    /// the same id reaches the legacy file cleanup below, which does.
     pub fn delete(&self, id: &str) -> bool {
         if id.is_empty() || id.contains("..") || id.contains('/') || id.contains('\\') {
             return false;
         }
-        // PLAN55 D2 cascade: the session's sandbox/container instances die
-        // with it. Before the SQL, while the mapping rows are still there —
-        // and outside `with`, because the cascade takes the lock itself.
         crate::sandbox::destroy_for_session(self, id);
-        // The embedder may want to reap the session's worktree when its
-        // session goes away. Best-effort: it runs after the cascade and
-        // never fails the delete.
         crate::session_props::on_session_deleted(id);
         let n = self.with(|c| {
-            // Children before parents: `nodes.parent_id` is a self-reference
-            // and ON DELETE CASCADE does not order siblings for us.
             let _ = c.execute("PRAGMA defer_foreign_keys = ON", []);
             let n = c
                 .execute("DELETE FROM conversation WHERE id = ?1", params![id])
@@ -645,9 +521,6 @@ impl ConvStore {
             let _ = c.execute("DELETE FROM queue_items WHERE conversation_id = ?1", params![id]);
             n
         });
-        // The pre-migration files, if this project still has them: the user
-        // asked for the conversation gone, and leaving a copy that a
-        // re-migration would resurrect is not "gone".
         let legacy = self.project_root.join(".angela").join("sessions");
         for ext in ["json", "jsonl"] {
             let p = legacy.join(format!("{id}.{ext}"));
@@ -658,9 +531,7 @@ impl ConvStore {
         n > 0
     }
 
-    /// Remove every conversation (`angela clean`). Returns the count.
     pub fn clean(&self) -> usize {
-        // PLAN55 D2: every session's sandboxes go with their sessions.
         crate::sandbox::destroy_all(self);
         self.with(|c| {
             let _ = c.execute("PRAGMA defer_foreign_keys = ON", []);
@@ -671,9 +542,6 @@ impl ConvStore {
         })
     }
 
-    /// Every pre-`ordinal` conversation gets a number. Kept for parity with
-    /// the file store; the migration already numbers what it imports, so this
-    /// normally finds nothing.
     pub fn backfill_ordinals(&self) -> usize {
         self.with(|c| {
             let rows: Vec<String> = {
@@ -707,9 +575,6 @@ impl ConvStore {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Participants
-    // -----------------------------------------------------------------------
 
     pub fn participants(&self, conv: &str) -> Vec<Participant> {
         self.with(|c| Self::participants_in(c, conv))
@@ -762,9 +627,6 @@ impl ConvStore {
         })
     }
 
-    /// Seat a new participant. The handle is made unique within the
-    /// conversation by suffixing, because a duplicate handle would make
-    /// `@mention` routing ambiguous and silently address the wrong agent.
     pub fn add_participant(
         &self,
         conv: &str,
@@ -824,14 +686,11 @@ impl ConvStore {
         })
     }
 
-    /// Invite a named agent once. The roster check and insert share the store
-    /// lock so concurrent messages cannot create duplicate seats.
     pub fn invite_mentioned_agent(&self, conv: &str, def: &crate::agent_loader::AgentDef) -> Option<Participant> {
         let handle = def.name.to_ascii_lowercase();
         self.with(|c| {
             let roster = Self::participants_in(c, conv);
             if let Some(existing) = roster.iter().find(|p| p.handle == handle) {
-                // A mention addresses an existing seat, including a human.
                 if existing.kind != "agent" || existing.agent_name.as_deref() != Some(def.name.as_str()) || existing.active {
                     return None;
                 }
@@ -854,18 +713,11 @@ impl ConvStore {
         })
     }
 
-    /// Invite a named person once — the user twin of
-    /// [`Self::invite_mentioned_agent`]: the same re-seat-don't-duplicate rule,
-    /// for a `user` seat. A mention of a person adds them to the room exactly
-    /// like `/invite` does — same act, either kind of name.
     pub fn invite_user(&self, conv: &str, name: &str, display_name: &str) -> Option<Participant> {
         let handle = handle_from(name).to_ascii_lowercase();
         self.with(|c| {
             let roster = Self::participants_in(c, conv);
             if let Some(existing) = roster.iter().find(|p| p.handle == handle) {
-                // An existing seat with this handle is re-seated, not
-                // duplicated — whatever kind it is (a human seat may already
-                // answer to this handle).
                 if existing.active {
                     return None;
                 }
@@ -915,9 +767,6 @@ impl ConvStore {
         self.participant(id)
     }
 
-    /// Soft-remove: a participant whose nodes are in the tree cannot be
-    /// deleted without orphaning them, so an agent that has spoken is
-    /// deactivated instead and keeps its authorship.
     pub fn remove_participant(&self, id: i64) -> bool {
         self.with(|c| {
             let spoke: i64 = c
@@ -939,7 +788,6 @@ impl ConvStore {
         })
     }
 
-    /// The human seat, creating it if an imported conversation lacked one.
     pub fn user_participant(&self, conv: &str) -> Option<Participant> {
         self.with(|c| {
             if let Some(p) = Self::participants_in(c, conv)
@@ -958,7 +806,6 @@ impl ConvStore {
         })
     }
 
-    /// Active agent seats in `seat` order — the rotation a round speaks in.
     pub fn agent_participants(&self, conv: &str) -> Vec<Participant> {
         self.participants(conv)
             .into_iter()
@@ -966,11 +813,7 @@ impl ConvStore {
             .collect()
     }
 
-    // -----------------------------------------------------------------------
-    // Agent-owned sandboxes (PLAN55): one container per (session -> agent) pair.
-    // -----------------------------------------------------------------------
 
-    /// The container id for (session, agent), if any has been launched for it.
     pub fn sandbox_for(&self, conv: &str, agent: &str) -> Option<String> {
         self.with(|c| {
             c.query_row(
@@ -981,12 +824,6 @@ impl ConvStore {
         })
     }
 
-    /// Record that (session, agent) now runs in `container_id`. Replaces any
-    /// previous row (a container is rebuilt only if it is gone; the pair is
-    /// stable, so this is effectively a one-time insert per session). Written
-    /// as DELETE+INSERT rather than an upsert: a database created before
-    /// `PRIMARY KEY (session_id, agent_name)` existed has no conflict target
-    /// for `ON CONFLICT`, and the upsert would fail silently.
     pub fn set_sandbox(&self, conv: &str, agent: &str, container_id: &str) {
         self.with(|c| {
             let _ = c.execute(
@@ -1001,8 +838,6 @@ impl ConvStore {
         })
     }
 
-    /// Remember the bind mounts so a running sandbox is never reused after
-    /// its session's checkout changes. NULL identifies an older unknown mount.
     pub fn sandbox_mount(&self, conv: &str, agent: &str) -> Option<(String, String)> {
         self.with(|c| c.query_row(
             "SELECT mount_path, git_dir FROM session_sandbox WHERE session_id = ?1 AND agent_name = ?2",
@@ -1017,7 +852,6 @@ impl ConvStore {
         ).and_then(|n| if n == 1 { Ok(()) } else { Err(rusqlite::Error::QueryReturnedNoRows) }))
     }
 
-    /// Every (agent, container_id) pair the session owns, for a teardown on delete.
     pub fn sandboxes_for(&self, conv: &str) -> Vec<(String, String)> {
         self.with(|c| {
             let mut out = Vec::new();
@@ -1034,7 +868,6 @@ impl ConvStore {
         })
     }
 
-    /// Drop the (session, agent) row. Returns whether it was there.
     pub fn forget_sandbox(&self, conv: &str, agent: &str) -> bool {
         self.with(|c| {
             let n = c.execute(
@@ -1045,11 +878,7 @@ impl ConvStore {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Nodes: append, walk, fork
-    // ------------------------------------------------------------------
 
-    /// Drop every row for a session (used on the delete path, PLAN55 D2).
     pub fn forget_sandboxes_by_session(&self, conv: &str) {
         self.with(|c| {
             let _ = c.execute(
@@ -1059,8 +888,6 @@ impl ConvStore {
         })
     }
 
-    /// Every (session_id, agent_name, container_id) row, for the menu and for
-    /// the destroy cascade.
     pub fn sandbox_rows(&self) -> Vec<(String, String, String)> {
         self.with(|c| {
             let mut out = Vec::new();
@@ -1081,18 +908,7 @@ impl ConvStore {
         })
     }
 
-    /// The conversations this person is seated in (PLAN44 C4 + the roster:
-    /// a named user seat is what makes a room appear in their Projects tree
-    /// and lets them speak in it). `name` is the account name; the seat's
-    /// handle is its lowercased form — what [`Self::invite_user`] writes.
-    // ── the message queue ─────────────────────────────────────────────
-    //
-    // Prompts waiting to become turns. Kept apart from `nodes` on purpose:
-    // a queued message is not history, it is pending work. Its row here is
-    // deleted the moment its turn starts, and the `context_window` node it
-    // then appends becomes the durable record.
 
-    /// Put a message in the queue. Returns its id.
     pub fn queue_push(
         &self,
         conv: &str,
@@ -1121,7 +937,6 @@ impl ConvStore {
         id
     }
 
-    /// One queued row, or None when it is gone (started, or dequeued).
     pub fn queue_row(&self, conv: &str, id: &str) -> Option<Value> {
         self.with(|c| {
             c.query_row(
@@ -1147,8 +962,6 @@ impl ConvStore {
         })
     }
 
-    /// This session's waiting messages, oldest first — what the "waiting
-    /// for" card draws.
     pub fn queue_list(&self, conv: &str) -> Vec<Value> {
         self.with(|c| {
             let mut st = match c.prepare(
@@ -1174,8 +987,6 @@ impl ConvStore {
         })
     }
 
-    /// Every queued row, every session — the feed's snapshot and the boot
-    /// recovery's work list.
     pub fn queue_all(&self) -> Vec<Value> {
         self.with(|c| {
             let mut st = match c.prepare(
@@ -1205,9 +1016,6 @@ impl ConvStore {
         })
     }
 
-    /// Take a message back out of the queue — the dequeue. Answers the row
-    /// it removed, or None when it was no longer queued (a message that has
-    /// started has no row here: its turn owns it now).
     pub fn queue_remove(&self, conv: &str, id: &str) -> Option<Value> {
         let row = self.queue_row(conv, id)?;
         self.with(|c| {
@@ -1219,7 +1027,6 @@ impl ConvStore {
         Some(row)
     }
 
-    /// Record why one message is waiting, for the card.
     pub fn queue_set_reason(&self, conv: &str, id: &str, reason: &str) -> bool {
         self.with(|c| {
             c.execute(
@@ -1247,7 +1054,6 @@ impl ConvStore {
         })
     }
 
-    /// The shared cursor's node id, or `None` on an empty conversation.
     pub fn cursor(&self, conv: &str) -> Option<String> {
         self.with(|c| Self::cursor_in(c, conv))
     }
@@ -1264,9 +1070,6 @@ impl ConvStore {
         .flatten()
     }
 
-    /// Move the cursor. This *is* the fork primitive: point it at any node,
-    /// then append — the new node becomes that node's child and the branch
-    /// the cursor came from is untouched.
     pub fn set_cursor(&self, conv: &str, node_id: Option<&str>) -> bool {
         self.with(|c| {
             if let Some(n) = node_id {
@@ -1293,16 +1096,10 @@ impl ConvStore {
         })
     }
 
-    /// Append an event as a child of the cursor, then advance the cursor.
     pub fn append_event(&self, conv: &str, ev: NewEvent) -> rusqlite::Result<EventWrapper> {
         self.append_event_at(conv, None, ev)
     }
 
-    /// Append an event under an explicit parent (`None` = under the cursor).
-    ///
-    /// Passing a parent that is not the cursor is a fork; the cursor still
-    /// ends up on the new node, because the thing you just said is the thing
-    /// you are now talking from.
     pub fn append_event_at(
         &self,
         conv: &str,
@@ -1345,9 +1142,6 @@ impl ConvStore {
                 |r| r.get(0),
             )
             .unwrap_or(1);
-        // The acyclicity guarantee, checked rather than assumed: a parent
-        // always has a smaller seq, so cursor→root cannot revisit a node and
-        // the walk needs no visited set.
         if parent_id.is_some() && pseq >= seq {
             return Err(rusqlite::Error::InvalidParameterName(format!(
                 "parent seq {pseq} is not older than child seq {seq}"
@@ -1407,7 +1201,6 @@ impl ConvStore {
                 goto_enabled as i64,
                 goto_label,
                 ts,
-                // NaN becomes NULL, as the file store's guard did.
                 ev.duration_ms.filter(|d| d.is_finite()),
                 now_iso(),
                 tool_name,
@@ -1457,8 +1250,6 @@ impl ConvStore {
         })
     }
 
-    /// The display text for a node kind, so the UI and the flattened group
-    /// prompt do not each re-dig it out of `payload`.
     fn content_of(kind: &str, po: Option<&Map<String, Value>>) -> Option<String> {
         let p = po?;
         let s = |k: &str| p.get(k).filter(|v| js_truthy(v)).map(js_string_of);
@@ -1471,12 +1262,6 @@ impl ConvStore {
         }
     }
 
-    /// Who said it, when the caller did not say.
-    ///
-    /// `role: user` is the human; the agent-authored kinds go to the first
-    /// active agent, which is exactly right for a two-seat conversation and
-    /// is overridden explicitly (`NewEvent::speaker`) once a round has more
-    /// than one agent in it.
     fn infer_speaker(c: &Connection, conv: &str, kind: &str, role: Option<&str>) -> Option<i64> {
         let roster = Self::participants_in(c, conv);
         match role {
@@ -1547,11 +1332,6 @@ impl ConvStore {
         })
     }
 
-    /// The rendered conversation: the cursor → oldest-ancestor path, in
-    /// chronological order.
-    ///
-    /// For a conversation that was never forked this is every node in `seq`
-    /// order — byte-for-byte what reading the old `.jsonl` gave.
     pub fn path(&self, conv: &str) -> Vec<TreeNode> {
         self.with(|c| Self::path_in(c, conv))
     }
@@ -1560,9 +1340,6 @@ impl ConvStore {
         let Some(tip) = Self::cursor_in(c, conv) else {
             return Vec::new();
         };
-        // The recursive CTE walks parents. It terminates because every
-        // parent's seq is strictly smaller than its child's (enforced in
-        // `insert_node`), so the chain is finite and acyclic.
         let sql = format!(
             "WITH RECURSIVE up(id) AS (
                  SELECT ?1
@@ -1584,8 +1361,6 @@ impl ConvStore {
         out
     }
 
-    /// Every node in the conversation, all branches, `seq` order — what the
-    /// tree view draws.
     pub fn all_nodes(&self, conv: &str) -> Vec<TreeNode> {
         self.with(|c| {
             let mut st = match c.prepare(&format!(
@@ -1603,7 +1378,6 @@ impl ConvStore {
         })
     }
 
-    /// A node's direct children — the branches leaving it.
     pub fn children(&self, node_id: &str) -> Vec<TreeNode> {
         self.with(|c| {
             let mut st = match c.prepare(&format!(
@@ -1621,22 +1395,14 @@ impl ConvStore {
         })
     }
 
-    /// The old wrapped-event view of the rendered path.
     pub fn list_events(&self, conv: &str) -> Vec<EventWrapper> {
         self.path(conv).iter().map(|n| n.to_event()).collect()
     }
 
-    /// Same, with any migrated `context_meta` rows folded forward.
-    ///
-    /// New writes never produce `context_meta` — visibility is a column now —
-    /// but an imported log may still contain some, and they have to mean what
-    /// they meant.
     pub fn list_events_folded(&self, conv: &str) -> Vec<EventWrapper> {
         fold_event_metas(self.list_events(conv))
     }
 
-    /// Hide or show one node. The `UPDATE` that replaces appending a
-    /// `context_meta` patch.
     pub fn set_visibility(&self, node_id: &str, visible: bool) -> bool {
         self.with(|c| {
             c.execute(
@@ -1659,11 +1425,7 @@ impl ConvStore {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Participant views (watermarks) and own sessions
-    // -----------------------------------------------------------------------
 
-    /// `(last_seen_seq, round_index, reply_required, round_status)`.
     pub fn participant_view(&self, conv: &str, pid: i64) -> (i64, i64, bool, Option<String>) {
         self.with(|c| {
             c.query_row(
@@ -1723,12 +1485,6 @@ impl ConvStore {
         });
     }
 
-    /// One agent's own `(prompt, reply)` history, oldest first.
-    ///
-    /// This is the participant's **private** LLM history, not the shared
-    /// room: it is what makes its context window byte-stable across turns
-    /// (so the provider's prompt cache holds) and independent of which branch
-    /// the room is currently on.
     pub fn own_session(&self, pid: i64) -> Vec<(String, String)> {
         self.with(|c| {
             let mut st = match c.prepare(
@@ -1772,11 +1528,7 @@ impl ConvStore {
         });
     }
 
-    // -----------------------------------------------------------------------
-    // Readers the harness and the HTTP layer share with the file store
-    // -----------------------------------------------------------------------
 
-    /// The visible user/assistant exchange — for a title or a summary.
     pub fn list_visible_context_messages(&self, conv: &str) -> Vec<Value> {
         let mut out = Vec::new();
         for n in self.path(conv) {
@@ -1803,17 +1555,10 @@ impl ConvStore {
         out
     }
 
-    /// Hydrate the provider-facing context window from the rendered path.
-    ///
-    /// Delegates to the file store's hydration so there is **one**
-    /// implementation of the tool-call merging and JS-era coercions; the only
-    /// difference is where the events came from.
     pub fn build_context_window_items(&self, conv: &str) -> Vec<ContextItem> {
         crate::session_store::context_items_from_events(self.list_events_folded(conv))
     }
 
-    /// The newest `gen_info` telemetry on the rendered path, as the metrics
-    /// row reads it.
     pub fn last_gen_info(&self, conv: &str) -> Value {
         for n in self.path(conv).into_iter().rev() {
             if n.kind == "gen_info" && !n.payload.is_null() {
@@ -1826,14 +1571,6 @@ impl ConvStore {
         Value::Null
     }
 
-    /// The memory tree's leaves: the messages on the **rendered path**, in
-    /// order.
-    ///
-    /// Derived, not stored, and derived from the *path* rather than from
-    /// every node in the conversation. That matters once a conversation has
-    /// branched: the append order of all nodes interleaves messages that
-    /// were never on the same branch, and summarising those together would
-    /// describe a conversation nobody had.
     pub fn memory_leaves(&self, conv: &str) -> Vec<String> {
         self.path(conv)
             .into_iter()
@@ -1845,7 +1582,6 @@ impl ConvStore {
             .collect()
     }
 
-    /// The leaf list the memory tree was last built against.
     pub fn memory_tree_leaves(&self, conv: &str) -> Vec<String> {
         self.with(|c| {
             let mut st = match c.prepare(
@@ -1862,18 +1598,6 @@ impl ConvStore {
         })
     }
 
-    /// Bring the memory tree into line with the current path, keeping every
-    /// summary that is still true.
-    ///
-    /// The leaf list only ever *extends* while you talk on one branch, so a
-    /// summary of messages 0..8 is as valid after the ninth message as
-    /// before it — rebuilding the whole tree per turn would be pure waste.
-    /// Switching branches is different: the lists diverge at the fork, and
-    /// every node covering a message at or after that point is now a summary
-    /// of the wrong conversation. So: find the first index where the two
-    /// lists differ, and drop exactly the nodes whose span reaches it.
-    ///
-    /// Returns the number of leaves on the current path.
     pub fn sync_memory_tree(&self, conv: &str) -> usize {
         let now = self.memory_leaves(conv);
         let was = self.memory_tree_leaves(conv);
@@ -1881,13 +1605,9 @@ impl ConvStore {
             .iter()
             .zip(was.iter())
             .position(|(a, b)| a != b)
-            // No difference in the overlap: the shorter list is a prefix of
-            // the longer, so only what the shorter one lacks is new.
             .unwrap_or_else(|| now.len().min(was.len()));
 
         self.with(|c| {
-            // A node (l, i) covers [i·2^l, (i+1)·2^l). It is stale exactly
-            // when its span end runs past the divergence point.
             let _ = c.execute(
                 "DELETE FROM memory_nodes
                   WHERE conversation_id = ?1
@@ -1895,8 +1615,6 @@ impl ConvStore {
                 params![conv, diverged as i64],
             );
             if was.len() != now.len() || diverged < was.len() {
-                // The view is a list of coordinates over the old list; it
-                // has to be refitted rather than patched.
                 let _ = c.execute(
                     "DELETE FROM memory_view WHERE conversation_id = ?1",
                     params![conv],
@@ -1917,7 +1635,6 @@ impl ConvStore {
         now.len()
     }
 
-    /// Every node's text by id, for rendering a memory view's leaves.
     pub fn node_texts(&self, conv: &str) -> HashMap<String, (String, String)> {
         let mut out = HashMap::new();
         for n in self.all_nodes(conv) {
@@ -1926,437 +1643,5 @@ impl ConvStore {
             }
         }
         out
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn store() -> ConvStore {
-        ConvStore::memory("/tmp/proj").unwrap()
-    }
-
-    fn conv(s: &ConvStore) -> String {
-        s.create(NewSession {
-            agent: Some("default".into()),
-            model: Some("llama-server:default".into()),
-            ..Default::default()
-        })
-        .unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    }
-
-    #[test]
-    fn a_new_conversation_is_you_alone() {
-        let s = store();
-        let id = conv(&s);
-        let meta = s.load(&id).unwrap();
-        assert_eq!(meta["ordinal"], 1);
-        assert_eq!(meta["status"], "ready");
-        assert_eq!(meta["turns"], 0);
-        assert_eq!(meta["eventCount"], 1);
-        let roster = s.participants(&id);
-        // Nobody is listening until you invite them. Seating the header's
-        // agent here would mean a conversation that silently has a
-        // participant the roster never showed you choosing.
-        assert_eq!(roster.len(), 1);
-        assert_eq!(roster[0].kind, "user");
-        assert_eq!(roster[0].handle, "user");
-        assert!(s.agent_participants(&id).is_empty());
-    }
-
-    #[test]
-    fn ordinals_are_max_plus_one_so_a_delete_never_reissues_a_number() {
-        let s = store();
-        let a = conv(&s);
-        let b = conv(&s);
-        let c = conv(&s);
-        assert_eq!(s.load(&c).unwrap()["ordinal"], 3);
-        assert!(s.delete(&b));
-        let d = conv(&s);
-        // `count + 1` would have handed out 3 twice.
-        assert_eq!(s.load(&d).unwrap()["ordinal"], 4);
-        assert_eq!(s.load(&a).unwrap()["ordinal"], 1);
-    }
-
-    #[test]
-    fn an_unforked_conversation_reads_back_exactly_as_a_linear_log() {
-        let s = store();
-        let id = conv(&s);
-        for i in 0..4 {
-            s.append_event(
-                &id,
-                NewEvent::new(
-                    "context_window",
-                    json!({ "role": if i % 2 == 0 { "user" } else { "assistant" },
-                            "content": format!("m{i}") }),
-                ),
-            )
-            .unwrap();
-        }
-        let evs = s.list_events(&id);
-        // The created beat plus four rows, in order, every parent the one
-        // before it: the tree walk and a file read agree.
-        assert_eq!(evs.len(), 5);
-        let texts: Vec<String> = evs
-            .iter()
-            .filter(|e| e.event_type == "context_window")
-            .map(|e| e.payload["content"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(texts, vec!["m0", "m1", "m2", "m3"]);
-        let nodes = s.path(&id);
-        for w in nodes.windows(2) {
-            assert_eq!(w[1].parent_id.as_deref(), Some(w[0].id.as_str()));
-            assert!(w[0].seq < w[1].seq);
-        }
-    }
-
-    #[test]
-    fn a_fork_leaves_the_original_branch_intact_and_reachable() {
-        let s = store();
-        let id = conv(&s);
-        let a = s
-            .append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"q"})))
-            .unwrap();
-        let b = s
-            .append_event(&id, NewEvent::new("context_window", json!({"role":"assistant","content":"answer A"})))
-            .unwrap();
-        // Fork: point back at the question, ask again.
-        assert!(s.set_cursor(&id, Some(&a.event_id)));
-        let c2 = s
-            .append_event(&id, NewEvent::new("context_window", json!({"role":"assistant","content":"answer B"})))
-            .unwrap();
-
-        let on_b: Vec<String> = s
-            .list_events(&id)
-            .iter()
-            .filter_map(|e| e.payload["content"].as_str().map(String::from))
-            .collect();
-        assert_eq!(on_b, vec!["q", "answer B"], "the new branch renders");
-
-        // The original is untouched, and pointing at it brings it back.
-        assert!(s.set_cursor(&id, Some(&b.event_id)));
-        let on_a: Vec<String> = s
-            .list_events(&id)
-            .iter()
-            .filter_map(|e| e.payload["content"].as_str().map(String::from))
-            .collect();
-        assert_eq!(on_a, vec!["q", "answer A"]);
-
-        // Both children hang off the question.
-        let kids = s.children(&a.event_id);
-        assert_eq!(kids.len(), 2);
-        assert_eq!(s.all_nodes(&id).len(), 4);
-        let _ = c2;
-    }
-
-    #[test]
-    fn forking_at_the_root_makes_a_second_root_rather_than_an_error() {
-        let s = store();
-        let id = conv(&s);
-        s.append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"one"})))
-            .unwrap();
-        // No parent at all: a second branch root.
-        s.set_cursor(&id, None);
-        s.append_event_at(
-            &id,
-            None,
-            NewEvent::new("context_window", json!({"role":"user","content":"two"})),
-        )
-        .unwrap();
-        let path: Vec<String> = s
-            .list_events(&id)
-            .iter()
-            .filter_map(|e| e.payload["content"].as_str().map(String::from))
-            .collect();
-        assert_eq!(path, vec!["two"], "a root branch renders alone");
-        let roots = s
-            .all_nodes(&id)
-            .into_iter()
-            .filter(|n| n.parent_id.is_none())
-            .count();
-        assert_eq!(roots, 2);
-    }
-
-    #[test]
-    fn visibility_is_an_update_not_an_appended_patch() {
-        let s = store();
-        let id = conv(&s);
-        let e = s
-            .append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"hi"})))
-            .unwrap();
-        let before = s.load(&id).unwrap()["eventCount"].as_u64().unwrap();
-        assert!(s.set_visibility(&e.event_id, false));
-        // No new node: the old format needed a whole extra log line for this.
-        assert_eq!(s.load(&id).unwrap()["eventCount"].as_u64().unwrap(), before);
-        let ev = s.list_events(&id).into_iter().find(|x| x.event_id == e.event_id).unwrap();
-        assert!(!ev.visible());
-        assert!(s.set_visibility(&e.event_id, true));
-        let ev = s.list_events(&id).into_iter().find(|x| x.event_id == e.event_id).unwrap();
-        assert!(ev.visible());
-    }
-
-    #[test]
-    fn a_turn_bumps_turns_and_appends_the_lifecycle_beat() {
-        let s = store();
-        let id = conv(&s);
-        s.record_turn_complete(&id, Some(12.5));
-        let meta = s.load(&id).unwrap();
-        assert_eq!(meta["turns"], 1);
-        assert_eq!(meta["status"], "ready");
-        let last = s.list_events(&id).pop().unwrap();
-        assert_eq!(last.event_type, "session");
-        assert_eq!(last.payload["kind"], "turn_complete");
-        assert_eq!(last.duration_ms, Some(12.5));
-    }
-
-    #[test]
-    fn last_token_counts_come_from_the_newest_gen_info_not_a_cached_column() {
-        let s = store();
-        let id = conv(&s);
-        for (p, t) in [(10, 20), (30, 70)] {
-            s.append_event(
-                &id,
-                NewEvent::new(
-                    "gen_info",
-                    json!({ "prompt_tokens": p, "completion_tokens": t - p, "total_tokens": t }),
-                ),
-            )
-            .unwrap();
-        }
-        let meta = s.load(&id).unwrap();
-        assert_eq!(meta["lastPromptTokens"], 30);
-        assert_eq!(meta["lastTotalTokens"], 70);
-        assert_eq!(meta["lastCompletionTokens"], 40);
-    }
-
-    #[test]
-    fn update_meta_maps_camel_case_and_shrugs_at_derived_keys() {
-        let s = store();
-        let id = conv(&s);
-        let mut patch = Map::new();
-        patch.insert("title".into(), json!("a title"));
-        patch.insert("allowlistMode".into(), json!("unrestricted"));
-        patch.insert("contextWindow".into(), json!(8192));
-        // Still sent by older call sites; derived now, so it must not error.
-        patch.insert("lastPromptTokens".into(), json!(99));
-        let meta = s.update_meta(&id, patch).unwrap();
-        assert_eq!(meta["title"], "a title");
-        assert_eq!(meta["allowlistMode"], "unrestricted");
-        assert_eq!(meta["contextWindow"], 8192);
-        assert!(meta["lastPromptTokens"].is_null());
-    }
-
-    #[test]
-    fn workspace_root_and_worktree_round_trip_through_create_load_and_update_meta() {
-        let s = store();
-        let id = conv(&s);
-        let meta = s.load(&id).unwrap();
-        assert!(meta["workspaceRoot"].is_null());
-        assert!(meta["worktree"].is_null());
-
-        let mut patch = Map::new();
-        patch.insert("workspaceRoot".into(), json!("/tmp/session-workspace"));
-        patch.insert(
-            "worktree".into(),
-            json!({ "provisioned": true, "path": "/tmp/session-worktree" }),
-        );
-        let meta = s.update_meta(&id, patch).unwrap();
-        assert_eq!(meta["workspaceRoot"], "/tmp/session-workspace");
-        assert_eq!(
-            meta["worktree"],
-            json!({ "provisioned": true, "path": "/tmp/session-worktree" })
-        );
-
-        // Read back fresh, not just from the patch's own echo.
-        let meta = s.load(&id).unwrap();
-        assert_eq!(meta["workspaceRoot"], "/tmp/session-workspace");
-        assert_eq!(meta["worktree"]["path"], "/tmp/session-worktree");
-        assert_eq!(meta["worktree"]["provisioned"], true);
-    }
-
-    #[test]
-    fn a_workspace_root_can_be_cleared_with_a_null_patch() {
-        let s = store();
-        let id = conv(&s);
-        let mut patch = Map::new();
-        patch.insert("workspaceRoot".into(), json!("/tmp/session-workspace"));
-        s.update_meta(&id, patch).unwrap();
-        let mut patch = Map::new();
-        patch.insert("workspaceRoot".into(), Value::Null);
-        let meta = s.update_meta(&id, patch).unwrap();
-        assert!(meta["workspaceRoot"].is_null());
-    }
-
-    #[test]
-    fn a_legacy_plain_string_worktree_column_reads_back_as_null() {
-        let s = store();
-        let id = conv(&s);
-        // The pre-record column held a bare worktree id, written as plain text.
-        s.with(|c| c.execute(
-            "UPDATE conversation SET worktree = ?1 WHERE id = ?2",
-            params!["bare-worktree-id", id],
-        ))
-        .unwrap();
-        let meta = s.load(&id).unwrap();
-        // Not a checkout record — but the legacy mapping still carries the id.
-        assert!(meta["worktree"].is_null());
-        assert_eq!(meta["worktreeId"], "bare-worktree-id");
-    }
-
-    #[test]
-    fn a_worktree_record_that_is_not_an_object_reads_back_as_null() {
-        let s = store();
-        let id = conv(&s);
-        s.with(|c| c.execute(
-            "UPDATE conversation SET worktree = ?1 WHERE id = ?2",
-            params!["[\"a\", \"b\"]", id],
-        ))
-        .unwrap();
-        let meta = s.load(&id).unwrap();
-        assert!(meta["worktree"].is_null());
-    }
-
-    #[test]
-    fn a_new_conversation_starts_unrestricted() {
-        let store = store();
-        let v = store.create(NewSession::default()).unwrap();
-        let id = v["id"].as_str().unwrap().to_string();
-        assert_eq!(store.load(&id).unwrap()["allowlistMode"], "unrestricted");
-
-        // Written to the row, not inferred by the reader: a session made
-        // before this default must keep reading as `allowlist`, and a NULL
-        // is the only way to tell the two apart.
-        let legacy = store.create(NewSession::default()).unwrap();
-        let lid = legacy["id"].as_str().unwrap().to_string();
-        store
-            .with(|c| {
-                c.execute(
-                    "UPDATE conversation SET allowlist_mode = NULL WHERE id = ?1",
-                    rusqlite::params![lid],
-                )?;
-                Ok::<(), rusqlite::Error>(())
-            })
-            .unwrap();
-        assert_eq!(store.load(&lid).unwrap()["allowlistMode"], "allowlist");
-
-        // An explicit choice still wins over the default.
-        let strict = store
-            .create(NewSession {
-                allowlist_mode: Some("allowlist".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        let sid = strict["id"].as_str().unwrap().to_string();
-        assert_eq!(store.load(&sid).unwrap()["allowlistMode"], "allowlist");
-    }
-
-    #[test]
-    fn a_duplicate_handle_is_suffixed_so_mentions_stay_unambiguous() {
-        let s = store();
-        let id = conv(&s);
-        let a = s
-            .add_participant(&id, "agent", "scout", Some("Scout"), Some("scout"), None, "", None, None)
-            .unwrap();
-        let b = s
-            .add_participant(&id, "agent", "scout", Some("Scout"), Some("scout"), None, "", None, None)
-            .unwrap();
-        assert_eq!(a.handle, "scout");
-        assert_eq!(b.handle, "scout-2");
-    }
-
-    #[test]
-    fn an_agent_that_has_spoken_is_deactivated_rather_than_deleted() {
-        let s = store();
-        let id = conv(&s);
-        let p = s
-            .add_participant(&id, "agent", "bob", Some("Bob"), Some("bob"), None, "", None, None)
-            .unwrap();
-        s.append_event(
-            &id,
-            NewEvent {
-                event_type: "context_window".into(),
-                payload: json!({ "role": "assistant", "content": "hi" }),
-                speaker: Some(p.id),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(s.remove_participant(p.id));
-        let still = s.participants(&id).into_iter().find(|x| x.id == p.id).unwrap();
-        assert!(!still.active, "its authorship of an existing node must survive");
-    }
-
-    #[test]
-    fn the_speaker_is_recorded_so_two_agents_do_not_blur_together() {
-        let s = store();
-        let id = conv(&s);
-        let bob = s
-            .add_participant(&id, "agent", "bob", Some("Bob"), Some("bob"), None, "", None, None)
-            .unwrap();
-        let u = s.user_participant(&id).unwrap();
-        s.append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"q"})))
-            .unwrap();
-        s.append_event(
-            &id,
-            NewEvent {
-                event_type: "context_window".into(),
-                payload: json!({ "role": "assistant", "content": "from bob" }),
-                speaker: Some(bob.id),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let nodes = s.path(&id);
-        let user_node = nodes.iter().find(|n| n.role.as_deref() == Some("user")).unwrap();
-        let bob_node = nodes.iter().find(|n| n.role.as_deref() == Some("assistant")).unwrap();
-        assert_eq!(user_node.participant_id, Some(u.id));
-        assert_eq!(bob_node.participant_id, Some(bob.id));
-    }
-
-    #[test]
-    fn memory_leaves_index_only_renderable_rows_densely() {
-        let s = store();
-        let id = conv(&s);
-        s.append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"a"}))).unwrap();
-        s.append_event(&id, NewEvent::new("reasoning", json!({"text":"think"}))).unwrap();
-        s.append_event(&id, NewEvent::new("gen_info", json!({"total_tokens": 5}))).unwrap();
-        s.append_event(&id, NewEvent::new("context_window", json!({"role":"assistant","content":"b"}))).unwrap();
-        let leaves = s.memory_leaves(&id);
-        assert_eq!(leaves.len(), 2, "reasoning and telemetry are not messages");
-        assert_eq!(s.sync_memory_tree(&id), 2, "the recorded list agrees");
-        assert_eq!(s.memory_tree_leaves(&id), leaves);
-    }
-
-    #[test]
-    fn a_parent_older_than_its_child_is_refused() {
-        let s = store();
-        let id = conv(&s);
-        let first = s.path(&id)[0].id.clone();
-        // Hand-craft the violation: a node claiming a parent appended later.
-        let latest = s
-            .append_event(&id, NewEvent::new("context_window", json!({"role":"user","content":"x"})))
-            .unwrap();
-        let res = s.with(|c| {
-            c.execute(
-                "UPDATE nodes SET parent_id = ?1 WHERE id = ?2",
-                params![latest.event_id, first],
-            )
-        });
-        // SQLite will take the UPDATE; the guarantee lives on the insert path,
-        // which is where every real write goes.
-        assert!(res.is_ok());
-        let direct = s.with(|c| {
-            ConvStore::insert_node(
-                c,
-                &id,
-                Some(&latest.event_id),
-                NewEvent::new("context_window", json!({"role":"user","content":"y"})),
-            )
-        });
-        assert!(direct.is_ok(), "a genuinely older parent is fine");
     }
 }

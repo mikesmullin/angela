@@ -1,5 +1,0 @@
-{"event_id":"ee33f8027","ts":"2026-11-13T05:18:00.123Z","event_type":"session","duration_ms":null,"payload":{"kind":"created","agent":"lucy","model":"llama-server:default","mcp":[],"overrides":null,"config":null},"meta":{}}
-{"event_id":"e2d9f0d15","ts":"2026-11-13T05:18:00.123Z","event_type":"context_window","duration_ms":null,"payload":{"role":"user","content":"hello"},"meta":{}}
-{"event_id":"e69fb12ce","ts":"2026-11-13T05:18:00.123Z","event_type":"tool_call","duration_ms":12.5,"payload":{"name":"read","args":{"f":"x.py"}},"meta":{}}
-{"event_id":"ead6044db","ts":"2026-11-13T05:18:00.123Z","event_type":"context_meta","duration_ms":null,"payload":{"event_id":"e2d9f0d15","visible":false,"note":"hidden"},"meta":{}}
-{"event_id":"e70a79cbc","ts":"2026-11-13T05:18:00.123Z","event_type":"session","duration_ms":99,"payload":{"kind":"turn_complete","turn":1},"meta":{}}

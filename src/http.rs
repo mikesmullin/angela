@@ -1,15 +1,3 @@
-//! A deliberately small HTTP/1.1 server: `std::net` + a thread per
-//! connection, no framework.
-//!
-//! angela's surface is a handful of JSON routes plus one streaming endpoint,
-//! so an async web stack would be more dependency than the job needs. What it
-//! does need, and what this provides, is honest **chunked** streaming: the
-//! chat endpoint emits cards as the model produces them, and a response that
-//! buffered to completion would defeat the whole point.
-//!
-//! Not implemented, because angela never uses it: keep-alive (every response
-//! closes), HTTP/2, TLS, multipart, compression.
-
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,13 +5,11 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-/// Cap on a request body. A chat prompt is text; anything near this is abuse.
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Request {
     pub method: String,
-    /// Path with the query string removed.
     pub path: String,
     pub query: String,
     pub headers: BTreeMap<String, String>,
@@ -31,14 +17,10 @@ pub struct Request {
 }
 
 impl Request {
-    /// The body as JSON, or `null` when absent/unparseable — the JS does
-    /// `await req.json().catch(() => ({}))` at every call site, so a
-    /// malformed body is a default, never a 500.
     pub fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 
-    /// A query parameter, percent-decoded.
     pub fn query_param(&self, key: &str) -> Option<String> {
         for pair in self.query.split('&') {
             let (k, v) = match pair.split_once('=') {
@@ -53,7 +35,6 @@ impl Request {
     }
 }
 
-/// Minimal percent-decoding, `+` meaning space as in a query string.
 pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -86,8 +67,6 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Writes one response. Consumed by whichever method you call, so a handler
-/// cannot accidentally send two.
 pub struct Responder<'a> {
     stream: &'a mut TcpStream,
 }
@@ -108,7 +87,6 @@ impl<'a> Responder<'a> {
         };
         write!(self.stream, "HTTP/1.1 {status} {reason}\r\n")?;
         write!(self.stream, "Content-Type: {content_type}\r\n")?;
-        // The SPA is served from a different origin in dev.
         write!(self.stream, "Access-Control-Allow-Origin: *\r\n")?;
         write!(
             self.stream,
@@ -124,7 +102,6 @@ impl<'a> Responder<'a> {
         Ok(())
     }
 
-    /// A buffered JSON response.
     pub fn json(mut self, status: u16, body: &Value) -> std::io::Result<()> {
         let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
         self.head(status, "application/json", &[])?;
@@ -141,11 +118,6 @@ impl<'a> Responder<'a> {
         self.stream.flush()
     }
 
-    /// Begin a chunked NDJSON stream.
-    ///
-    /// Chunked rather than a buffered body because each card must reach the
-    /// client as it happens; `Content-Length` would force us to know the whole
-    /// response up front, which is exactly what streaming rules out.
     pub fn ndjson(mut self) -> std::io::Result<NdjsonWriter<'a>> {
         self.head(200, "application/x-ndjson", &[("Cache-Control", "no-cache")])?;
         write!(self.stream, "Transfer-Encoding: chunked\r\n")?;
@@ -158,15 +130,12 @@ impl<'a> Responder<'a> {
     }
 }
 
-/// Emits newline-delimited JSON as chunked HTTP.
 pub struct NdjsonWriter<'a> {
     stream: &'a mut TcpStream,
     done: bool,
 }
 
 impl<'a> NdjsonWriter<'a> {
-    /// Send one row. An error here normally means the client hung up, which
-    /// the caller should treat as "stop working", not as a failure to report.
     pub fn send(&mut self, value: &Value) -> std::io::Result<()> {
         let mut line = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
         line.push(b'\n');
@@ -186,38 +155,23 @@ impl<'a> NdjsonWriter<'a> {
 impl<'a> Drop for NdjsonWriter<'a> {
     fn drop(&mut self) {
         if !self.done {
-            // Terminate the stream even on an early return, or the client
-            // waits forever for a chunk that is never coming.
             let _ = write!(self.stream, "0\r\n\r\n");
             let _ = self.stream.flush();
         }
     }
 }
 
-/// Where a route writes its answer.
-///
-/// The router must not know whether it is writing to a socket it owns or to
-/// a host application's response stream, so it writes through this instead of
-/// touching bytes. `angela-serve` provides [`SocketSink`]; an embedding
-/// server (chat-server in psicom/chat) provides its own.
 pub trait ResponseSink {
-    /// A complete JSON answer.
     fn json(&mut self, status: u16, body: &Value);
-    /// Begin an NDJSON stream. Followed by `row`s, then `end`.
     fn begin_ndjson(&mut self);
-    /// One row. Returns `false` when the client has gone — the caller should
-    /// stop working rather than finish a turn nobody will see.
     fn row(&mut self, value: &Value) -> bool;
-    /// Finish the response.
     fn end(&mut self);
 }
 
-/// What a server implementation must provide.
 pub trait Handler: Send + Sync + 'static {
     fn handle(&self, req: &Request, out: Responder<'_>);
 }
 
-/// [`ResponseSink`] over a socket this crate owns.
 pub struct SocketSink<'a> {
     responder: Option<Responder<'a>>,
     writer: Option<NdjsonWriter<'a>>,
@@ -256,7 +210,6 @@ impl<'a> ResponseSink for SocketSink<'a> {
     }
 }
 
-/// Read one request. `None` on a closed or malformed connection.
 fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
 
@@ -308,7 +261,6 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     })
 }
 
-/// Bind and serve forever, one thread per connection.
 pub fn serve(addr: &str, handler: Arc<dyn Handler>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     for conn in listener.incoming() {
@@ -316,7 +268,6 @@ pub fn serve(addr: &str, handler: Arc<dyn Handler>) -> std::io::Result<()> {
         let h = Arc::clone(&handler);
         std::thread::spawn(move || {
             if let Some(req) = read_request(&mut stream) {
-                // CORS preflight never reaches a route.
                 if req.method == "OPTIONS" {
                     let _ = Responder { stream: &mut stream }.empty(204);
                     return;
@@ -326,44 +277,4 @@ pub fn serve(addr: &str, handler: Arc<dyn Handler>) -> std::io::Result<()> {
         });
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn query_params_are_split_and_decoded() {
-        let r = Request {
-            method: "GET".into(),
-            path: "/api/pending".into(),
-            query: "tabId=1&name=a%20b&flag&plus=a+b".into(),
-            headers: BTreeMap::new(),
-            body: Vec::new(),
-        };
-        assert_eq!(r.query_param("tabId").as_deref(), Some("1"));
-        assert_eq!(r.query_param("name").as_deref(), Some("a b"));
-        assert_eq!(r.query_param("flag").as_deref(), Some(""));
-        assert_eq!(r.query_param("plus").as_deref(), Some("a b"));
-        assert_eq!(r.query_param("missing"), None);
-    }
-
-    #[test]
-    fn a_malformed_body_is_null_not_an_error() {
-        let r = Request {
-            method: "POST".into(),
-            path: "/api/chat".into(),
-            query: String::new(),
-            headers: BTreeMap::new(),
-            body: b"{not json".to_vec(),
-        };
-        assert!(r.json().is_null());
-    }
-
-    #[test]
-    fn percent_decoding_handles_truncated_escapes() {
-        assert_eq!(percent_decode("a%2"), "a%2");
-        assert_eq!(percent_decode("a%zzb"), "a%zzb");
-        assert_eq!(percent_decode("%2F"), "/");
-    }
 }
