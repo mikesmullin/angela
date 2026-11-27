@@ -864,148 +864,102 @@ fn flush_approvals(
     }
 }
 
-/// What the session-properties gate concluded for one turn.
+/// What the message queue concluded for one message.
 ///
-/// `Proceed` — the session is configured; the turn runs exactly as before.
-/// Every other variant means the caller must return (the rows for the user
-/// have already been emitted, or the caller emits them for the way its
-/// path handles stop).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GateOutcome {
-    /// The session is configured.
-    Proceed,
-    /// Automation fail-fast: no queued card, no park — the caller returns
-    /// immediately with the error already on the wire.
-    Automation,
-    /// The session was deleted while the gate was waiting.
+/// `Started` — it is this message's turn: it has left the queue and the
+/// caller renders it as the turn's first row. Every other variant means the
+/// caller returns here: the message never became history.
+enum QueueOutcome {
+    /// It won the line and is now running — holding these model slots.
+    Started(Vec<std::sync::Arc<agl::queue::Permit>>),
+    /// The user took it back before it ran. Nothing of it was recorded, so
+    /// there is nothing to undo — its text goes back to the composer.
+    Dequeued,
+    /// The session went away while the message waited.
     Deleted,
-    /// The user stopped the turn while the gate was waiting.
-    Stopped,
-    /// The deadline elapsed while the session stayed unconfigured.
-    TimedOut,
+    /// An automation whose session cannot run it must fail fast: no person
+    /// is watching to configure the session later.
+    Refused(String),
 }
 
-/// The park loop behind the session-properties gate, factored out of the
-/// two turn paths so the waiting logic is testable without a model.
+/// Put one message in the queue, and wait for its turn.
 ///
-/// `load` re-reads the session header each iteration — the embedded hook may
-/// repair the meta between iterations, so the loop never caches the first
-/// answer — `check` is the embedder's readiness question, `stopped` is the
-/// user's stop switch, `elapsed` is the (injectable) clock, `sleep` the
-/// (injectable) wait. The first outcome reached wins.
-fn wait_for_props(
-    load: impl Fn() -> Option<Value>,
-    check: impl Fn(&Value) -> Result<(), String>,
-    stopped: impl Fn() -> bool,
-    elapsed: impl Fn() -> Duration,
+/// A message is pending work from the moment it is sent: it is drawn inside
+/// the "waiting for" card — with why it waits and a way to take it back —
+/// and only [`QueueOutcome::Started`] turns it into a user prompt card in
+/// the transcript. While it waits, its row carries the reason, and the head
+/// of the line's reason is what explains the whole line.
+///
+/// `check` is the embedder's readiness question for the agent this message
+/// runs as (an agent with a Containerfile needs no workspace root or
+/// checkout at all); `sleep`/`tick` are injectable so the loop is testable
+/// without wall time. **There is no deadline**: a queued message waits
+/// until it runs, is taken back, or its session goes away.
+#[allow(clippy::too_many_arguments)]
+fn queue_wait(
+    queues: &crate::queue::Queues,
+    store: &ConvStore,
+    session_id: &str,
+    item_id: &str,
+    is_automation: bool,
+    check: &dyn Fn(&Value) -> Result<(), String>,
+    bump: &dyn Fn(),
+    slots: &[String],
     sleep: impl Fn(Duration),
-    deadline: Duration,
     tick: Duration,
-) -> GateOutcome {
+) -> QueueOutcome {
+    let bump = bump;
+    let mut last_reason: Option<String> = None;
     loop {
-        if stopped() {
-            return GateOutcome::Stopped;
-        }
-        let Some(meta) = load() else {
-            return GateOutcome::Deleted;
+        // The card says why this message waits, so its row says so before
+        // anything is decided about it — including on the very first look,
+        // so a message about to start is still seen in the queue first.
+        let meta = store.load(session_id).unwrap_or(Value::Null);
+        let gate_ok = match check(&meta) {
+            Ok(()) => true,
+            Err(reason) => {
+                if is_automation {
+                    store.queue_remove(session_id, item_id);
+                    bump();
+                    return QueueOutcome::Refused(reason);
+                }
+                false
+            }
         };
-        if check(&meta).is_ok() {
-            return GateOutcome::Proceed;
+        let reason = crate::queue::reason(store, queues, session_id, item_id, gate_ok, slots);
+        if last_reason.as_deref() != Some(reason.as_str()) {
+            store.queue_set_reason(session_id, item_id, &reason);
+            bump();
+            last_reason = Some(reason);
         }
-        if elapsed() >= deadline {
-            return GateOutcome::TimedOut;
+        // A message reaches for the floor only when its session can run it:
+        // a session that is not configured holds the whole line, and the
+        // card says so (the gate reason is the head's).
+        if gate_ok {
+            match queues.try_start(store, session_id, item_id, slots) {
+                crate::queue::Start::Won(permits) => {
+                    bump();
+                    return QueueOutcome::Started(permits);
+                }
+                crate::queue::Start::Gone => {
+                    return if store.load(session_id).is_none() {
+                        QueueOutcome::Deleted
+                    } else {
+                        QueueOutcome::Dequeued
+                    };
+                }
+                crate::queue::Start::Later => {}
+            }
+        } else if store.queue_row(session_id, item_id).is_none() {
+            // Taken back while the gate held it — a dequeue is not a start.
+            return if store.load(session_id).is_none() {
+                QueueOutcome::Deleted
+            } else {
+                QueueOutcome::Dequeued
+            };
         }
         sleep(tick);
     }
-}
-
-/// Run the session-properties gate for one turn.
-///
-/// Emits, in order: nothing when the session is already configured; one
-/// queued card when it is parked (a durable event plus the card, shaped like
-/// the turn queue's own queued card); the error card and done row on
-/// fail-fast/failure. All of it at most once per turn.
-///
-/// `elapsed`/`sleep`/`deadline`/`tick` are injectable so the park loop can
-/// be tested without a second of wall time — production passes the real
-/// clock, a 250 ms tick and a 30-minute deadline.
-#[allow(clippy::too_many_arguments)]
-fn gate_props(
-    store: &ConvStore,
-    session_id: &str,
-    mark: &TurnMark,
-    is_automation: bool,
-    is_group: bool,
-    check: &dyn Fn(&Value) -> Result<(), String>,
-    stopped: impl Fn() -> bool,
-    elapsed: impl Fn() -> Duration,
-    sleep: impl Fn(Duration),
-    deadline: Duration,
-    tick: Duration,
-    emit: &mut dyn FnMut(&Value) -> bool,
-) -> GateOutcome {
-    let meta = store.load(session_id).unwrap_or(Value::Null);
-    if let Err(reason) = check(&meta) {
-        // Automations never park: a scheduled run that cannot configure
-        // itself must fail fast, not sit on a 30-minute timer.
-        if is_automation {
-            let text = format!("cannot run: the session is not configured — {reason}");
-            store.set_status(session_id, "error");
-            emit(&json!({ "type": "card", "card": { "kind": "error", "text": text } }));
-            emit(&json!({ "type": "done", "ok": false, "error": text, "sessionId": session_id }));
-            return GateOutcome::Automation;
-        }
-        // Durable and on screen before the wait begins, like the turn
-        // queue's queued card: a parked turn must look like a parked turn.
-        let w = store.append_event(
-            session_id,
-            mark.ev("queued", json!({ "spec": "session properties", "position": 0, "marker": "properties" })),
-        );
-        let event_id = w.map(|x| x.event_id).unwrap_or_default();
-        let mut card = json!({
-            "kind": "queued",
-            "text": "waiting for the session's workspace root and worktree — this message will run once they are set",
-            "spec": "session properties",
-            "position": 0,
-            "marker": "properties",
-            "eventId": event_id,
-            "turn": mark.id,
-            "handle": mark.handle,
-            "visible": true,
-        });
-        if is_group {
-            card["participantId"] = json!(mark.participant);
-        }
-        emit(&json!({ "type": "card", "card": card }));
-
-        match wait_for_props(
-            || store.load(session_id),
-            |m| check(m),
-            stopped,
-            elapsed,
-            sleep,
-            deadline,
-            tick,
-        ) {
-            GateOutcome::Proceed => {}
-            GateOutcome::Deleted => {
-                let text = "session was deleted while waiting";
-                emit(&json!({ "type": "card", "card": { "kind": "error", "text": text } }));
-                emit(&json!({ "type": "done", "ok": false, "error": text, "sessionId": session_id }));
-                return GateOutcome::Deleted;
-            }
-            GateOutcome::Stopped => return GateOutcome::Stopped,
-            GateOutcome::TimedOut => {
-                let text = "timed out waiting for the session's workspace root and worktree";
-                store.set_status(session_id, "error");
-                emit(&json!({ "type": "card", "card": { "kind": "error", "text": text } }));
-                emit(&json!({ "type": "done", "ok": false, "error": text, "sessionId": session_id }));
-                return GateOutcome::TimedOut;
-            }
-            GateOutcome::Automation => unreachable!("automation never parks"),
-        }
-    }
-    GateOutcome::Proceed
 }
 
 /// Run one turn, emitting protocol rows through `emit`.
@@ -1038,12 +992,8 @@ pub fn run_turn(
             .filter(|m| !m.trim().is_empty()))
         .unwrap_or_else(|| DEFAULT_MODEL.into());
     let session_id = resolve_session(store, tabs, &req)?;
-    // Stoppable from here on. The session id is the key the stop button
-    // uses, so this is the earliest point the turn *can* be registered —
-    // and `Cancels::begin` hands back an already-thrown switch if the user
-    // got there first, which is the race on a brand-new session.
-    let stop = Armed::new(cancels, &session_id);
-    // Name the turn before setup so Stop can address even a stalled connection.
+    // Name the turn before anything waits: the client must be able to
+    // address the session — and dequeue a message — while it is queued.
     emit(&json!({ "type": "session", "tabId": req.tab_id, "sessionId": session_id }));
 
     tabs.set(
@@ -1055,20 +1005,98 @@ pub fn run_turn(
             ..Default::default()
         },
     );
+
+    // The message enters the queue first. Until it is its turn it is not
+    // history and not a user prompt card — it is pending work, drawn inside
+    // the "waiting for" card with why it waits and a way to take it back.
+    let item_id = store.queue_push(
+        &session_id,
+        &content,
+        req.from.as_deref().unwrap_or_default(),
+        &def.name,
+        &model,
+        &req.tab_id,
+    );
+    // The model this turn will run on: its slot is taken with the start,
+    // so by the time the message is running it can never wait for its own
+    // model again.
+    let slot_specs = vec![agl::agent::queue_spec(&model)];
+    let mut held_slots: std::collections::HashMap<String, std::sync::Arc<agl::queue::Permit>> =
+        std::collections::HashMap::new();
+    match queue_wait(
+        &app.queues,
+        store,
+        &session_id,
+        &item_id,
+        req.tab_id == "automation",
+        &|m: &Value| crate::session_props::check(m, def),
+        &|| {
+            if let Some(send) = &app.queue_sender {
+                send();
+            }
+        },
+        &slot_specs,
+        |_| std::thread::sleep(Duration::from_millis(250)),
+        Duration::from_millis(250),
+    ) {
+        QueueOutcome::Started(permits) => {
+            for (spec, p) in slot_specs.iter().cloned().zip(permits) {
+                held_slots.insert(spec, p);
+            }
+        }
+        QueueOutcome::Dequeued => {
+            // Taken back before it ever ran. Nothing of it was recorded, so
+            // the transcript has nothing to show and the composer has the
+            // text back.
+            emit(&json!({ "type": "done", "ok": true, "dequeued": true, "sessionId": session_id }));
+            return Ok(());
+        }
+        QueueOutcome::Deleted => {
+            let text = "session was deleted while waiting";
+            emit(&json!({ "type": "card", "card": { "kind": "error", "text": text } }));
+            emit(&json!({ "type": "done", "ok": false, "error": text, "sessionId": session_id }));
+            return Ok(());
+        }
+        QueueOutcome::Refused(reason) => {
+            let text = format!("cannot run: the session is not configured — {reason}");
+            store.set_status(&session_id, "error");
+            emit(&json!({ "type": "card", "card": { "kind": "error", "text": text } }));
+            emit(&json!({ "type": "done", "ok": false, "error": text, "sessionId": session_id }));
+            return Ok(());
+        }
+    }
+    // The floor is ours until the turn ends — on every return path below.
+    let _running = crate::queue::Running::new(&app.queues, &session_id, &item_id);
+    // Stoppable from here on. The stop switch belongs to the running turn,
+    // never to a message still waiting its turn in the queue — a queued
+    // message is taken back by dequeuing it, not by stopping.
+    let stop = Armed::new(cancels, &session_id);
+
+    // It left the queue, so this is where it becomes history: the user
+    // prompt card the transcript draws, backed by the durable row the next
+    // turn's context reads. `from` names the human who said it — a
+    // multi-human room is unreadable without it.
     title_from_first_message(store, &session_id, &content);
     store.set_status(&session_id, "running");
-
-    // The user's message is durable before any inference runs: if the model
-    // call fails, the prompt is still in the transcript. `from` names the
-    // human who said it — a multi-human room is unreadable without it.
     let mut user_payload = serde_json::json!({ "role": "user", "content": content });
     if let Some(from) = req.from.as_ref().filter(|f| !f.trim().is_empty()) {
         user_payload["from"] = json!(from.trim());
     }
-    let _ = store.append_event(
-        &session_id,
-        NewEvent::new("context_window", user_payload),
-    );
+    let (event_id, ts) = match store.append_event(&session_id, NewEvent::new("context_window", user_payload)) {
+        Ok(w) => (w.event_id, w.ts),
+        Err(_) => (String::new(), String::new()),
+    };
+    emit(&json!({
+        "type": "card",
+        "card": {
+            "kind": "user",
+            "text": content,
+            "from": req.from.as_deref().unwrap_or_default(),
+            "eventId": event_id,
+            "ts": ts,
+            "visible": true,
+        },
+    }));
 
     // One mark for this whole turn, made before anything it covers — the
     // engagement decision included, so the decision card shares the turn's
@@ -1079,41 +1107,6 @@ pub fn run_turn(
         me.as_ref().map(|p| p.id),
         0,
     );
-
-    // Session-properties gate: nothing runs until the session's workspace
-    // root and worktree are configured — no container, no model call, no
-    // engagement decision. The gate parks, it does not silently wait.
-    let started_gate = std::time::Instant::now();
-    match gate_props(
-        store,
-        &session_id,
-        &mark,
-        req.tab_id == "automation",
-        false,
-        &|m: &Value| crate::session_props::check(m),
-        || stop.stopped(),
-        || started_gate.elapsed(),
-        |_| std::thread::sleep(Duration::from_millis(250)),
-        Duration::from_secs(1800),
-        Duration::from_millis(250),
-        emit,
-    ) {
-        GateOutcome::Proceed => {}
-        GateOutcome::Stopped => {
-            // The Ran::Stopped block, minus the flush — nothing was said yet.
-            let _ = store.append_event(
-                &session_id,
-                mark.ev("stopped", json!({ "reason": "user" })),
-            );
-            // `record_turn_complete` sets the status ready itself, and it
-            // counts the turn — which this was: the user spent one.
-            store.record_turn_complete(&session_id, None);
-            emit(&json!({ "type": "done", "ok": true, "stopped": true, "sessionId": session_id }));
-            return Ok(());
-        }
-        // Automation / Deleted / TimedOut: the rows were emitted by the gate.
-        _ => return Ok(()),
-    }
 
     // A lone invoked agent is implicitly addressed by the user's message;
     // relevant agents still pass through their relevance decision.
@@ -1219,6 +1212,7 @@ pub fn run_turn(
         .unwrap_or_else(|| content.clone());
     let mut agent = Agent::factory(Factory {
         model: Some(model.clone()),
+        slot: held_slots.get(&agl::agent::queue_spec(&model)).cloned(),
         reasoning_effort: turn_reasoning(def, store.load(&session_id).as_ref()),
         system_prompt: Some(system.clone()).filter(|p| !p.trim().is_empty()),
         retain_history: Some(true),
@@ -1366,23 +1360,11 @@ pub fn run_turn(
         // once it finishes.
         let who = mark.handle.clone();
         let mut on_event = |e: TurnEvent<'_>| match e {
-            // The turn queue: this turn is waiting for a free slot of its
-            // `provider:model`. Durable and on screen immediately — the
-            // user must see why nothing is streaming yet.
-            TurnEvent::Queued { spec, position } => {
-                let w = store.append_event(
-                    &sid,
-                    mark.ev("queued", json!({ "spec": spec, "position": position })),
-                );
-                let event_id = w.map(|x| x.event_id).unwrap_or_default();
-                emit(&json!({
-                    "type": "card",
-                    "card": { "kind": "queued", "text": format!("waiting for {spec} slot…"),
-                              "spec": spec, "position": position,
-                              "eventId": event_id, "turn": mark.id, "handle": who,
-                              "visible": true },
-                }));
-            }
+            // Waiting for a free slot of its `provider:model`. Not a card
+            // and not history: the "waiting for" card is the message queue's
+            // projection and nothing else — a stall is already visible as a
+            // turn that is still working.
+            TurnEvent::Queued { .. } => {}
             TurnEvent::Delta { text, channel } => {
                 if first_token_at.is_none() {
                     first_token_at = Some(started.elapsed());
@@ -1957,258 +1939,151 @@ for line in sys.stdin:
     /// A fake clock that only advances when the injected sleep is called —
     /// so a park loop either terminates in a dozen instant iterations or it
     /// runs against a deadline that has not moved.
-    fn fake_clock(tick_ms: u64) -> (Arc<std::sync::atomic::AtomicU64>, impl Fn() -> Duration, impl Fn(Duration)) {
-        let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let now2 = Arc::clone(&now);
-        let elapsed = move || Duration::from_millis(now2.load(std::sync::atomic::Ordering::SeqCst));
-        let now3 = Arc::clone(&now);
-        let sleep = move |_d: Duration| {
-            now3.fetch_add(tick_ms, std::sync::atomic::Ordering::SeqCst);
-        };
-        (now, elapsed, sleep)
-    }
-
-    fn capturing_emit() -> (Arc<std::sync::Mutex<Vec<Value>>>, impl FnMut(&Value) -> bool) {
-        let rows = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let rows2 = Arc::clone(&rows);
-        let emit = move |v: &Value| {
-            rows2.lock().unwrap().push(v.clone());
-            true
-        };
-        (rows, emit)
-    }
-
-    fn gate_mark() -> TurnMark {
-        TurnMark::new("bob", None, 0)
-    }
-
+    /// A park-loop sleep that costs nothing: nothing reads a clock any
+    /// more, so the loop only needs its wait to return.
     #[test]
-    fn the_gate_parks_then_proceeds_once_the_session_is_configured() {
+    fn a_queued_message_waits_for_its_turn_and_then_runs() {
         let (_t, s) = store();
         let id = s.create(NewSession::default()).unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
-        let mark = gate_mark();
-        let (_now, elapsed, sleep) = fake_clock(250);
+        let q = crate::queue::Queues::new();
+        let item = s.queue_push(&id, "hello", "", "coder", "", "1");
+        // Unconfigured for the first three looks, then configured.
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let calls2 = Arc::clone(&calls);
         let check = move |_m: &Value| {
-            // Err twice (the initial check and the first park iteration),
-            // then the session configures itself.
-            if calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
-                Err("no workspace root".into())
+            if calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3 {
+                Err("no worktree".into())
             } else {
                 Ok(())
             }
         };
-        let (rows, mut emit) = capturing_emit();
-        let outcome = gate_props(
-            &s, &id, &mark, false, false, &check,
-            || false, elapsed, sleep,
-            Duration::from_secs(30), Duration::from_millis(250), &mut emit,
+        let outcome = queue_wait(
+            &q, &s, &id, &item, false, &check, &|| {}, &[], |_| {}, Duration::from_millis(250),
         );
-        assert_eq!(outcome, GateOutcome::Proceed);
-
-        let rows = rows.lock().unwrap().clone();
-        let queued: Vec<_> = rows.iter().filter(|r| r["type"] == "card" && r["card"]["kind"] == "queued").collect();
-        assert_eq!(queued.len(), 1, "one queued card per turn");
-        let card = &queued[0]["card"];
-        assert_eq!(card["kind"], "queued");
-        assert_eq!(card["spec"], "session properties");
-        assert_eq!(card["position"], 0);
-        assert_eq!(card["marker"], "properties");
-        assert_eq!(card["turn"], mark.id);
-        assert_eq!(card["handle"], "bob");
-        assert_eq!(card["visible"], true);
-        assert!(card["eventId"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
-        assert_eq!(card["text"], "waiting for the session's workspace root and worktree — this message will run once they are set");
-        // The queued event is durable, like the turn queue's.
-        assert!(s.list_events(&id).iter().any(|e| e.event_type == "queued"));
+        assert!(matches!(outcome, QueueOutcome::Started(_)));
+        // It left the queue: the row is gone (its prompt node is the record
+        // now) and the floor belongs to its turn.
+        assert!(s.queue_row(&id, &item).is_none());
+        assert!(q.busy(&id));
     }
 
     #[test]
-    fn the_group_queued_card_carries_participant_id() {
+    fn a_queued_message_says_why_it_waits() {
         let (_t, s) = store();
         let id = s.create(NewSession::default()).unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
-        // The round's gate mark has no participant yet — the room has not been classified.
-        let mark = gate_mark();
-        let (_now, elapsed, sleep) = fake_clock(250);
-        let check = |_m: &Value| Err("no workspace root".to_string());
-        let (rows, mut emit) = capturing_emit();
-        let outcome = gate_props(
-            &s, &id, &mark, false, true, &check,
-            || true, elapsed, sleep,
-            Duration::from_secs(30), Duration::from_millis(250), &mut emit,
-        );
-        assert_eq!(outcome, GateOutcome::Stopped);
-        let rows = rows.lock().unwrap().clone();
-        let card = &rows[0]["card"];
-        assert_eq!(card["kind"], "queued");
-        assert!(card.get("participantId").is_some(), "the group card carries participantId");
-    }
-
-    #[test]
-    fn automation_turns_fail_fast_without_parking() {
-        let (_t, s) = store();
-        let id = s.create(NewSession::default()).unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let mark = gate_mark();
-        let check = |_m: &Value| Err("no workspace root".to_string());
-        let (rows, mut emit) = capturing_emit();
-        let outcome = gate_props(
-            &s, &id, &mark, true, false, &check,
-            || false, || Duration::from_millis(0), |_| {},
-            Duration::from_secs(30), Duration::from_millis(250), &mut emit,
-        );
-        assert_eq!(outcome, GateOutcome::Automation);
-
-        let rows = rows.lock().unwrap().clone();
-        assert_eq!(rows.len(), 2, "error card + done, nothing else");
-        assert_eq!(rows[0]["type"], "card");
-        assert_eq!(rows[0]["card"]["kind"], "error");
-        assert_eq!(
-            rows[0]["card"]["text"],
-            "cannot run: the session is not configured — no workspace root"
-        );
-        assert_eq!(rows[1]["type"], "done");
-        assert_eq!(rows[1]["ok"], false);
-        assert_eq!(rows[1]["error"], "cannot run: the session is not configured — no workspace root");
-        assert!(!s.list_events(&id).iter().any(|e| e.event_type == "queued"),
-            "automations never park");
-    }
-
-    #[test]
-    fn the_gate_times_out_when_the_session_never_configures() {
-        let (_t, s) = store();
-        let id = s.create(NewSession::default()).unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let mark = gate_mark();
-        let (_now, elapsed, sleep) = fake_clock(250);
+        let q = crate::queue::Queues::new();
+        let item = s.queue_push(&id, "hello", "", "coder", "", "1");
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ticks = std::sync::atomic::AtomicU32::new(0);
         let check = |_m: &Value| Err("no worktree".to_string());
-        let (rows, mut emit) = capturing_emit();
-        let outcome = gate_props(
-            &s, &id, &mark, false, false, &check,
-            || false, elapsed, sleep,
-            Duration::from_millis(500), Duration::from_millis(250), &mut emit,
+        // The sleep sees the row exactly as the card would, every tick —
+        // and dequeues the message at the third one, which is how a user
+        // takes a queued message back.
+        let sleep = |_d: Duration| {
+            if let Some(row) = s.queue_row(&id, &item) {
+                seen.lock()
+                    .unwrap()
+                    .push(row.get("reason").and_then(Value::as_str).unwrap_or_default().to_string());
+            }
+            if ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2 {
+                s.queue_remove(&id, &item);
+            }
+        };
+        let outcome = queue_wait(
+            &q, &s, &id, &item, false, &check, &|| {}, &[], sleep, Duration::from_millis(250),
         );
-        assert_eq!(outcome, GateOutcome::TimedOut);
-
-        let rows = rows.lock().unwrap().clone();
-        // queued card + error card + done
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1]["card"]["kind"], "error");
-        assert_eq!(
-            rows[1]["card"]["text"],
-            "timed out waiting for the session's workspace root and worktree"
+        assert!(matches!(outcome, QueueOutcome::Dequeued));
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "the card had a reason to show");
+        assert!(
+            seen.iter().all(|r| r == crate::queue::REASON_GATE),
+            "the message waits on the session properties: {seen:?}"
         );
-        assert_eq!(rows[2]["type"], "done");
-        assert_eq!(rows[2]["ok"], false);
     }
 
     #[test]
-    fn the_gate_stops_when_the_switch_is_thrown_while_parked() {
+    fn a_queued_message_waits_indefinitely_rather_than_evaporating() {
+        // No deadline exists. A message that vanishes on a timer is text the
+        // user typed and never got back — so the loop outlasts anything a
+        // deadline would have allowed: 10 000 ticks is over an hour at the
+        // production tick.
         let (_t, s) = store();
         let id = s.create(NewSession::default()).unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
-        let mark = gate_mark();
-        let (_now, elapsed, sleep) = fake_clock(250);
+        let q = crate::queue::Queues::new();
+        let item = s.queue_push(&id, "hello", "", "coder", "", "1");
+        let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ticks2 = Arc::clone(&ticks);
+        let sleep = move |_d: Duration| {
+            ticks2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = Arc::clone(&calls);
+        let check = move |_m: &Value| {
+            if calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 10_000 {
+                Err("no worktree".into())
+            } else {
+                Ok(())
+            }
+        };
+        let outcome = queue_wait(
+            &q, &s, &id, &item, false, &check, &|| {}, &[], sleep, Duration::from_millis(250),
+        );
+        assert!(matches!(outcome, QueueOutcome::Started(_)));
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::SeqCst) >= 10_000,
+            "the message survived every tick it was asked to"
+        );
+    }
+
+    #[test]
+    fn an_automation_fails_fast_instead_of_waiting() {
+        // A scheduled run that cannot configure itself must say so now: no
+        // person is watching to fix the session later.
+        let (_t, s) = store();
+        let id = s.create(NewSession::default()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let q = crate::queue::Queues::new();
+        let item = s.queue_push(&id, "nightly", "", "coder", "", "automation");
         let check = |_m: &Value| Err("no workspace root".to_string());
-        let (rows, mut emit) = capturing_emit();
-        let outcome = gate_props(
-            &s, &id, &mark, false, false, &check,
-            || true, elapsed, sleep,
-            Duration::from_secs(30), Duration::from_millis(250), &mut emit,
+        let outcome = queue_wait(
+            &q, &s, &id, &item, true, &check, &|| {}, &[], |_| {}, Duration::from_millis(250),
         );
-        assert_eq!(outcome, GateOutcome::Stopped);
-        // The queued card is still on the wire — the user must see the turn parked.
-        let rows = rows.lock().unwrap().clone();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["card"]["kind"], "queued");
+        match outcome {
+            QueueOutcome::Refused(reason) => assert_eq!(reason, "no workspace root"),
+            other => panic!("expected a refusal, got {:?}", std::mem::discriminant(&other)),
+        }
+        // A refused message does not sit in the queue afterwards.
+        assert!(s.queue_row(&id, &item).is_none());
     }
 
     #[test]
-    fn the_gate_reports_a_deleted_session() {
+    fn a_message_whose_session_dies_is_reported() {
         let (_t, s) = store();
         let id = s.create(NewSession::default()).unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
+        let q = crate::queue::Queues::new();
+        let item = s.queue_push(&id, "hello", "", "coder", "", "1");
+        // Deleting the session takes its queue with it — and a dequeue and
+        // a dead session are different answers to the same vanished row.
         assert!(s.delete(&id));
-        let mark = gate_mark();
-        let (_now, elapsed, sleep) = fake_clock(250);
-        let check = |_m: &Value| Err("no workspace root".to_string());
-        let (rows, mut emit) = capturing_emit();
-        let outcome = gate_props(
-            &s, &id, &mark, false, false, &check,
-            || false, elapsed, sleep,
-            Duration::from_secs(30), Duration::from_millis(250), &mut emit,
+        let check = |_m: &Value| Ok(());
+        let outcome = queue_wait(
+            &q, &s, &id, &item, false, &check, &|| {}, &[], |_| {}, Duration::from_millis(250),
         );
-        assert_eq!(outcome, GateOutcome::Deleted);
-        let rows = rows.lock().unwrap().clone();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1]["card"]["kind"], "error");
-        assert_eq!(rows[1]["card"]["text"], "session was deleted while waiting");
-        assert_eq!(rows[2]["type"], "done");
-        assert_eq!(rows[2]["ok"], false);
-    }
-
-    #[test]
-    fn the_wait_loop_is_first_outcome_wins() {
-        // A load that starts answering null: nothing may fall through to a
-        // later outcome (the park loop returns the first thing it sees).
-        let outcome = wait_for_props(
-            || None,
-            |_m: &Value| Ok(()),
-            || false,
-            || Duration::from_secs(0),
-            |_| {},
-            Duration::from_secs(10),
-            Duration::from_millis(1),
-        );
-        assert_eq!(outcome, GateOutcome::Deleted);
-
-        let outcome = wait_for_props(
-            || Some(Value::Null),
-            |_m: &Value| Ok(()),
-            || false,
-            || Duration::from_secs(0),
-            |_| {},
-            Duration::from_secs(10),
-            Duration::from_millis(1),
-        );
-        assert_eq!(outcome, GateOutcome::Proceed);
-
-        let outcome = wait_for_props(
-            || Some(Value::Null),
-            |_m: &Value| Err("no".into()),
-            || false,
-            || Duration::from_secs(5),
-            |_| {},
-            Duration::from_secs(1),
-            Duration::from_millis(1),
-        );
-        assert_eq!(outcome, GateOutcome::TimedOut);
-
-        let outcome = wait_for_props(
-            || Some(Value::Null),
-            |_m: &Value| Err("no".into()),
-            || true,
-            || Duration::from_secs(0),
-            |_| {},
-            Duration::from_secs(10),
-            Duration::from_millis(1),
-        );
-        assert_eq!(outcome, GateOutcome::Stopped);
+        assert!(matches!(outcome, QueueOutcome::Deleted));
     }
 
     #[test]
@@ -2283,9 +2158,9 @@ pub fn run_round(
         return Err(TurnError::EmptyContent);
     }
     let conv = resolve_session(store, tabs, &req)?;
-    // One switch for the whole round, not one per speaker: "stop" means stop
-    // the conversation, not hand the floor to the next agent.
-    let stop = Armed::new(cancels, &conv);
+    // Name the conversation before anything waits — the client must be able
+    // to dequeue a message while it is queued (see `run_turn`).
+    emit(&json!({ "type": "session", "tabId": req.tab_id, "sessionId": conv }));
     tabs.set(
         &req.tab_id,
         TabEntry {
@@ -2295,11 +2170,69 @@ pub fn run_round(
             ..Default::default()
         },
     );
+
+    // The message enters the queue first, exactly as the single-agent path
+    // does: pending work inside the "waiting for" card until it is its
+    // turn, and only then a user prompt card in the transcript.
+    let item_id = store.queue_push(
+        &conv,
+        &content,
+        req.from.as_deref().unwrap_or_default(),
+        &def.name,
+        req.model.as_deref().unwrap_or_default(),
+        &req.tab_id,
+    );
+    let slot_specs = round_slot_specs(store, &conv, def);
+    let mut held_slots: std::collections::HashMap<String, std::sync::Arc<agl::queue::Permit>> =
+        std::collections::HashMap::new();
+    match queue_wait(
+        &app.queues,
+        store,
+        &conv,
+        &item_id,
+        req.tab_id == "automation",
+        &|m: &Value| crate::session_props::check(m, def),
+        &|| {
+            if let Some(send) = &app.queue_sender {
+                send();
+            }
+        },
+        &slot_specs,
+        |_| std::thread::sleep(Duration::from_millis(250)),
+        Duration::from_millis(250),
+    ) {
+        QueueOutcome::Started(permits) => {
+            for (spec, p) in slot_specs.iter().cloned().zip(permits) {
+                held_slots.insert(spec, p);
+            }
+        }
+        QueueOutcome::Dequeued => {
+            emit(&json!({ "type": "done", "ok": true, "dequeued": true, "sessionId": conv }));
+            return Ok(());
+        }
+        QueueOutcome::Deleted => {
+            let text = "session was deleted while waiting";
+            emit(&json!({ "type": "card", "card": { "kind": "error", "text": text } }));
+            emit(&json!({ "type": "done", "ok": false, "error": text, "sessionId": conv }));
+            return Ok(());
+        }
+        QueueOutcome::Refused(reason) => {
+            let text = format!("cannot run: the session is not configured — {reason}");
+            store.set_status(&conv, "error");
+            emit(&json!({ "type": "card", "card": { "kind": "error", "text": text } }));
+            emit(&json!({ "type": "done", "ok": false, "error": text, "sessionId": conv }));
+            return Ok(());
+        }
+    }
+    let _running = crate::queue::Running::new(&app.queues, &conv, &item_id);
+    // One switch for the whole round, not one per speaker: "stop" means stop
+    // the conversation, not hand the floor to the next agent.
+    let stop = Armed::new(cancels, &conv);
+
+    // It left the queue, so now it is history. `from` names the human who
+    // said it (PLAN44 A6) — same rule as the single-agent path.
     title_from_first_message(store, &conv, &content);
     store.set_status(&conv, "running");
-
-    // The user's message is durable before any model runs. `from` names the
-    // human who said it (PLAN44 A6) — same rule as the single-agent path.
     let mut user_payload = serde_json::json!({ "role": "user", "content": content });
     if let Some(from) = req.from.as_ref().filter(|f| !f.trim().is_empty()) {
         user_payload["from"] = json!(from.trim());
@@ -2307,40 +2240,19 @@ pub fn run_round(
     let user_node = store
         .append_event(&conv, NewEvent::new("context_window", user_payload))
         .map_err(|e| TurnError::Store(e.to_string()))?;
+    emit(&json!({
+        "type": "card",
+        "card": {
+            "kind": "user",
+            "text": content,
+            "from": req.from.as_deref().unwrap_or_default(),
+            "eventId": user_node.event_id,
+            "ts": user_node.ts,
+            "visible": true,
+        },
+    }));
 
     let roster = store.participants(&conv);
-
-    // Session-properties gate, before the round's classification and the
-    // speakers' containers: nothing runs until the session's workspace root
-    // and worktree are configured. The round has no per-participant mark yet
-    // — the gate covers the whole conversation before anyone is chosen.
-    // (Automations fail fast instead of parking.)
-    let gate_mark = TurnMark::new(&def.name, None, 0);
-    let started_gate = std::time::Instant::now();
-    match gate_props(
-        store,
-        &conv,
-        &gate_mark,
-        req.tab_id == "automation",
-        true,
-        &|m: &Value| crate::session_props::check(m),
-        || stop.stopped(),
-        || started_gate.elapsed(),
-        |_| std::thread::sleep(Duration::from_millis(250)),
-        Duration::from_secs(1800),
-        Duration::from_millis(250),
-        emit,
-    ) {
-        GateOutcome::Proceed => {}
-        GateOutcome::Stopped => {
-            // Same shape as a speaker's stop in the round: run_round hands the
-            // error up with the turn's mark and no done row — the room has no
-            // round to settle (nothing was published yet).
-            return Err(TurnError::Stopped);
-        }
-        // Automation / Deleted / TimedOut: the rows were emitted by the gate.
-        _ => return Ok(()),
-    }
 
     let header = store.load(&conv).unwrap_or(Value::Null);
 
@@ -2524,7 +2436,7 @@ pub fn run_round(
             }
             let reply = match run_participant(
                 app, store, rt, &stop.switch, approvals, &servers, &participant_def, &conv, &me,
-                &task, &model, &mark, emit,
+                &task, &model, &held_slots, &mark, emit,
             ) {
                 Ok(r) => r,
                 // Not an error card: the user did this on purpose. Leaving
@@ -2644,6 +2556,40 @@ pub fn run_round(
     Ok(())
 }
 
+/// Every model spec a round's speakers may hold a slot on: each seated
+/// agent resolves its own model exactly as [`run_participant`] will, so the
+/// round can take all of them with its start. A speaker whose spec is not
+/// here (the session's model changed mid-round) acquires its own — correct,
+/// just without the atomic handoff.
+fn round_slot_specs(store: &ConvStore, conv: &str, def: &AgentDef) -> Vec<String> {
+    let header = store.load(conv).unwrap_or(Value::Null);
+    let agents = store.agents();
+    let mut out: Vec<String> = Vec::new();
+    for me in store.agent_participants(conv) {
+        let pdef = me
+            .agent_name
+            .as_deref()
+            .and_then(|n| agents.get(n))
+            .unwrap_or_else(|| def.clone());
+        let model = Some(pdef.model.clone())
+            .filter(|m| !m.trim().is_empty())
+            .or_else(|| {
+                header
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .filter(|m| !m.trim().is_empty())
+            })
+            .unwrap_or_else(|| DEFAULT_MODEL.into());
+        let spec = agl::agent::queue_spec(&model);
+        if !out.contains(&spec) {
+            out.push(spec);
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Advance a participant's watermark past what it has now seen.
 fn advance(store: &ConvStore, conv: &str, pid: &i64, seq: i64, round: i64, task_id: &str) {
     store.set_participant_view(conv, *pid, seq, round, false, Some(task_id), Some("running"));
@@ -2668,6 +2614,7 @@ fn run_participant(
     me: &crate::conv_store::Participant,
     task: &crate::group::Task,
     model: &str,
+    held_slots: &std::collections::HashMap<String, std::sync::Arc<agl::queue::Permit>>,
     mark: &TurnMark,
     emit: &mut dyn FnMut(&Value) -> bool,
 ) -> Result<String, TurnError> {
@@ -2688,6 +2635,7 @@ fn run_participant(
     };
     let mut agent = Agent::factory(Factory {
         model: Some(model.to_string()),
+        slot: held_slots.get(&agl::agent::queue_spec(model)).cloned(),
         reasoning_effort: turn_reasoning(def, store.load(conv).as_ref()),
         system_prompt: Some(system.clone()),
         // The history is pushed explicitly below, and must not also
@@ -2773,21 +2721,8 @@ fn run_participant(
     let pid = me.id;
     let answer = {
         let mut on_event = |e: TurnEvent<'_>| match e {
-            // Same turn queue as the single-agent path: waiting for a slot.
-            TurnEvent::Queued { spec, position } => {
-                let w = store.append_event(
-                    conv,
-                    mark.ev("queued", json!({ "spec": spec, "position": position })),
-                );
-                let event_id = w.map(|x| x.event_id).unwrap_or_default();
-                emit(&json!({
-                    "type": "card",
-                    "card": { "kind": "queued", "text": format!("waiting for {spec} slot…"),
-                              "spec": spec, "position": position,
-                              "eventId": event_id, "participantId": pid,
-                              "turn": mark.id, "handle": handle, "visible": true },
-                }));
-            }
+            // Same as the single-agent path: a slot wait is not a card.
+            TurnEvent::Queued { .. } => {}
             TurnEvent::Delta { text, channel } => match channel {
                 Channel::Reasoning => {
                     said.reasoning.push_str(text);

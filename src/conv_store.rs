@@ -640,6 +640,7 @@ impl ConvStore {
                 .execute("DELETE FROM conversation WHERE id = ?1", params![id])
                 .unwrap_or(0);
             let _ = c.execute("DELETE FROM nodes WHERE conversation_id = ?1", params![id]);
+            let _ = c.execute("DELETE FROM queue_items WHERE conversation_id = ?1", params![id]);
             n
         });
         // The pre-migration files, if this project still has them: the user
@@ -663,6 +664,7 @@ impl ConvStore {
             let _ = c.execute("PRAGMA defer_foreign_keys = ON", []);
             let n = c.execute("DELETE FROM conversation", []).unwrap_or(0);
             let _ = c.execute("DELETE FROM nodes", []);
+            let _ = c.execute("DELETE FROM queue_items", []);
             n
         })
     }
@@ -1065,6 +1067,152 @@ impl ConvStore {
     /// a named user seat is what makes a room appear in their Projects tree
     /// and lets them speak in it). `name` is the account name; the seat's
     /// handle is its lowercased form — what [`Self::invite_user`] writes.
+    // ── the message queue ─────────────────────────────────────────────
+    //
+    // Prompts waiting to become turns. Kept apart from `nodes` on purpose:
+    // a queued message is not history, it is pending work. Its row here is
+    // deleted the moment its turn starts, and the `context_window` node it
+    // then appends becomes the durable record.
+
+    /// Put a message in the queue. Returns its id.
+    pub fn queue_push(
+        &self,
+        conv: &str,
+        text: &str,
+        from: &str,
+        agent: &str,
+        model: &str,
+        tab_id: &str,
+    ) -> String {
+        let id = format!("q{}", &crate::session_store::new_event_id_pub()[1..]);
+        let _ = self.with(|c| {
+            let seq: i64 = c
+                .query_row(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM queue_items WHERE conversation_id = ?1",
+                    params![conv],
+                    |r| r.get(0),
+                )
+                .unwrap_or(1);
+            c.execute(
+                "INSERT INTO queue_items
+                   (id, conversation_id, seq, text, from_name, agent, model, tab_id, reason, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![id, conv, seq, text, from, agent, model, tab_id, "", now_iso()],
+            )
+        });
+        id
+    }
+
+    /// One queued row, or None when it is gone (started, or dequeued).
+    pub fn queue_row(&self, conv: &str, id: &str) -> Option<Value> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT id, text, from_name, agent, model, tab_id, reason, ts
+                   FROM queue_items WHERE id = ?1 AND conversation_id = ?2",
+                params![id, conv],
+                |r| {
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "text": r.get::<_, String>(1)?,
+                        "from": r.get::<_, String>(2)?,
+                        "agent": r.get::<_, String>(3)?,
+                        "model": r.get::<_, String>(4)?,
+                        "tabId": r.get::<_, String>(5)?,
+                        "reason": r.get::<_, String>(6)?,
+                        "ts": r.get::<_, String>(7)?,
+                    }))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
+    }
+
+    /// This session's waiting messages, oldest first — what the "waiting
+    /// for" card draws.
+    pub fn queue_list(&self, conv: &str) -> Vec<Value> {
+        self.with(|c| {
+            let mut st = match c.prepare(
+                "SELECT id, text, from_name, reason, ts FROM queue_items
+                  WHERE conversation_id = ?1 ORDER BY seq ASC",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let out = match st.query_map(params![conv], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "text": r.get::<_, String>(1)?,
+                    "from": r.get::<_, String>(2)?,
+                    "reason": r.get::<_, String>(3)?,
+                    "ts": r.get::<_, String>(4)?,
+                }))
+            }) {
+                Ok(it) => it.filter_map(|r| r.ok()).collect(),
+                Err(_) => Vec::new(),
+            };
+            out
+        })
+    }
+
+    /// Every queued row, every session — the feed's snapshot and the boot
+    /// recovery's work list.
+    pub fn queue_all(&self) -> Vec<Value> {
+        self.with(|c| {
+            let mut st = match c.prepare(
+                "SELECT id, conversation_id, text, from_name, agent, model, tab_id, reason, ts
+                   FROM queue_items ORDER BY conversation_id, seq ASC",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let out = match st.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "sessionId": r.get::<_, String>(1)?,
+                    "text": r.get::<_, String>(2)?,
+                    "from": r.get::<_, String>(3)?,
+                    "agent": r.get::<_, String>(4)?,
+                    "model": r.get::<_, String>(5)?,
+                    "tabId": r.get::<_, String>(6)?,
+                    "reason": r.get::<_, String>(7)?,
+                    "ts": r.get::<_, String>(8)?,
+                }))
+            }) {
+                Ok(it) => it.filter_map(|r| r.ok()).collect(),
+                Err(_) => Vec::new(),
+            };
+            out
+        })
+    }
+
+    /// Take a message back out of the queue — the dequeue. Answers the row
+    /// it removed, or None when it was no longer queued (a message that has
+    /// started has no row here: its turn owns it now).
+    pub fn queue_remove(&self, conv: &str, id: &str) -> Option<Value> {
+        let row = self.queue_row(conv, id)?;
+        self.with(|c| {
+            let _ = c.execute(
+                "DELETE FROM queue_items WHERE id = ?1 AND conversation_id = ?2",
+                params![id, conv],
+            );
+        });
+        Some(row)
+    }
+
+    /// Record why one message is waiting, for the card.
+    pub fn queue_set_reason(&self, conv: &str, id: &str, reason: &str) -> bool {
+        self.with(|c| {
+            c.execute(
+                "UPDATE queue_items SET reason = ?1 WHERE id = ?2 AND conversation_id = ?3",
+                params![reason, id, conv],
+            )
+            .unwrap_or(0)
+                > 0
+        })
+    }
+
     pub fn sessions_seating(&self, user_name: &str) -> Vec<String> {
         let handle = handle_from(user_name).to_ascii_lowercase();
         self.with(|c| {

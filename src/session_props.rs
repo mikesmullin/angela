@@ -4,24 +4,30 @@
 //! A session carries a `workspaceRoot` (the host file-io jail its tools
 //! believe the disk begins at) and a `worktree` record (its git checkout,
 //! provisioned and mounted read-write into its sandbox). Until the embedder
-//! answers "both are set", every turn parks. That answer is a hook: the
-//! embedder may repair the meta first (e.g. re-provision a worktree that
-//! vanished) and only then answer — so [`set_check`] never reflects anything
-//! other than what the embedder just did.
+//! answers "ready", every turn parks. That answer is a hook: the embedder may
+//! repair the meta first (e.g. re-provision a worktree that vanished) and
+//! only then answer — so [`set_check`] never reflects anything other than
+//! what the embedder just did.
+//!
+//! The hook is **agent-aware**: it is told the agent whose turn is asking,
+//! and may answer differently per agent. An agent that runs in its own
+//! container never gets gated — the container is the containment boundary,
+//! so no host path or checkout is required of it.
 //!
 //! The two hooks are process-wide and first-call-wins, like every other
 //! seam in this crate: [`set_check`] answers "is this session ready?", and
 //! [`set_on_deleted`] gets told the session went away, so the embedder can
 //! reap the worktree the session owned.
 
+use crate::agent_loader::AgentDef;
 use serde_json::Value;
 use std::sync::OnceLock;
 
-/// The embedder answers: is this session's meta fully configured (workspace
-/// root + provisioned worktree)? `Err(reason)` = not yet (the reason is a
-/// short human phrase for logs; the card text is fixed). The hook may repair
-/// meta (e.g. re-provision a vanished worktree) before answering.
-pub type Check = std::sync::Arc<dyn Fn(&Value) -> Result<(), String> + Send + Sync>;
+/// The embedder answers: is this session's meta fully configured for the
+/// turn, given the agent and the meta? `Err(reason)` = not yet (the reason
+/// is a short human phrase for logs; the card text is fixed). The hook may
+/// repair meta (e.g. re-provision a vanished worktree) before answering.
+pub type Check = std::sync::Arc<dyn Fn(&Value, &AgentDef) -> Result<(), String> + Send + Sync>;
 
 /// The embedder is told a session was deleted. Best-effort: the hook owns
 /// the session's worktree and may reap it.
@@ -41,12 +47,12 @@ pub fn set_on_deleted(f: Deleted) {
     let _ = DELETED.set(f);
 }
 
-/// Answer the readiness question for `meta`. Ok(()) when no hook is
-/// registered — a standalone binary has no embedder to ask, so it must not
-/// park every turn.
-pub fn check(meta: &Value) -> Result<(), String> {
+/// Answer the readiness question for `meta`, for `agent` — the agent whose
+/// turn is asking. Ok(()) when no hook is registered — a standalone binary
+/// has no embedder to ask, so it must not park every turn.
+pub fn check(meta: &Value, agent: &AgentDef) -> Result<(), String> {
     match CHECK.get() {
-        Some(f) => f(meta),
+        Some(f) => f(meta, agent),
         None => Ok(()),
     }
 }
@@ -62,10 +68,12 @@ pub fn on_session_deleted(id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loader::AgentDef;
 
     #[test]
     fn with_no_hook_registered_the_check_passes() {
-        assert!(check(&serde_json::json!({ "id": "s1" })).is_ok());
-        assert!(check(&Value::Null).is_ok());
+        let agent = AgentDef::default();
+        assert!(check(&serde_json::json!({ "id": "s1" }), &agent).is_ok());
+        assert!(check(&Value::Null, &agent).is_ok());
     }
 }

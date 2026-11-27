@@ -231,45 +231,15 @@ pub fn ensure(
         // Stale: the container is gone. Drop the mapping; recreate below.
         store.forget_sandbox(session_id, &def.name);
     }
-    // The session's provisioned checkout — the mount the seam binds in
-    // (empty is fine: a transcription sandbox needs no worktree).
-    let (worktree, git_dir) = session_checkout(store, session_id);
+    // The container is the containment boundary: an agent that runs in one
+    // never mounts the host's checkout or workspace root. No mount means
+    // no host path, no git state, nothing to repair — the session's git
+    // record stays with the editor as bookkeeping.
+    let (worktree, git_dir) = (String::new(), String::new());
     let cid = create_and_wait(cancel, &image_for(containerfile), &worktree, &git_dir)
         .map_err(|e| format!("could not start the sandbox for @{}: {e}", def.name))?;
     store.set_sandbox(session_id, &def.name, &cid);
     Ok(Some(cid))
-}
-
-/// The session's provisioned worktree path — empty when the session has no
-/// provisioned worktree. A legacy plain-string `worktree` column (or anything
-/// that is not an object with `provisioned == true` and a non-empty `path`)
-/// answers empty, never a guess.
-/// The session's checkout as the mounts a sandbox needs: the worktree
-/// directory (mounted at `SANDBOX_MOUNT`) and the repo's `.git` directory
-/// (mounted at its own absolute path — the worktree's gitdir pointer is an
-/// absolute host path, and git inside the guest only works while it
-/// resolves). Both empty when the session has no provisioned worktree.
-fn session_checkout(store: &ConvStore, session_id: &str) -> (String, String) {
-    let meta = store.load(session_id).unwrap_or(Value::Null);
-    let Some(record) = meta.get("worktree") else {
-        return (String::new(), String::new());
-    };
-    let Some(obj) = record.as_object() else {
-        return (String::new(), String::new());
-    };
-    let provisioned = obj.get("provisioned").and_then(Value::as_bool).unwrap_or(false);
-    let path = obj.get("path").and_then(Value::as_str).unwrap_or_default();
-    if !provisioned || path.trim().is_empty() {
-        return (String::new(), String::new());
-    }
-    let git_dir = obj
-        .get("repoPath")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|p| format!("{p}/.git"))
-        .unwrap_or_default();
-    (path.to_string(), git_dir)
 }
 
 /// Destroy every container the session owns (PLAN55 D2 cascade). Best-effort

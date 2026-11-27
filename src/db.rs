@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when the DDL below changes in a way an existing file must be
 /// brought forward to. Recorded in `schema_meta`.
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -292,6 +292,25 @@ CREATE TABLE IF NOT EXISTS participant_session (
 
 -- Which message index each renderable node is. Dense, append-only, assigned
 -- in `seq` order, so the tree's coordinates stay stable as the chat grows.
+-- The message queue: prompts waiting to become turns. Deliberately NOT
+-- `nodes` — a queued message is not history. It is drawn inside the
+-- "waiting for" card, and only becomes a user prompt card when its turn
+-- starts (at which point its row here is gone and the `context_window` node
+-- takes over as the durable record). Durable anyway, because typed text
+-- must survive a reload — or a server restart — without having been sent.
+CREATE TABLE IF NOT EXISTS queue_items (
+    id              TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    text            TEXT NOT NULL,
+    from_name       TEXT NOT NULL DEFAULT '',
+    agent           TEXT NOT NULL DEFAULT '',
+    model           TEXT NOT NULL DEFAULT '',
+    tab_id          TEXT NOT NULL DEFAULT '',
+    reason          TEXT NOT NULL DEFAULT '',
+    ts              TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS memory_leaves (
     conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     i               INTEGER NOT NULL,
@@ -424,6 +443,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_gen_conv       ON nodes(conversation_id, se
 CREATE INDEX IF NOT EXISTS idx_psession_part        ON participant_session(participant_id, seq);
 CREATE INDEX IF NOT EXISTS idx_view_conv_part       ON participant_view(conversation_id, participant_id);
 CREATE INDEX IF NOT EXISTS idx_memory_slot          ON memory_nodes(conversation_id, slot);
+CREATE INDEX IF NOT EXISTS idx_queue_conv_seq       ON queue_items(conversation_id, seq);
 CREATE INDEX IF NOT EXISTS idx_participants_conv    ON participants(conversation_id, seat);
 CREATE INDEX IF NOT EXISTS idx_agents_name          ON agents(name);
 "#;

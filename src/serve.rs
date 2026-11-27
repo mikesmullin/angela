@@ -58,6 +58,13 @@ pub struct AppState {
     /// one). `None` on a bare host makes the tool say so instead of
     /// pretending.
     pub prompt_sender: Option<PromptSender>,
+    /// The message queue: prompts waiting to become turns (the run-time
+    /// half — the waiting rows live in the store).
+    pub queues: crate::queue::Queues,
+    /// How a queue change reaches the host the moment it happens (see
+    /// [`QueueSender`]): the "waiting for" card is live state, and a queued
+    /// message must appear in it without waiting for a poll.
+    pub queue_sender: Option<QueueSender>,
     /// How a roster change reaches the host the moment it happens (see
     /// [`SeatSender`]): an invited person's sidebar updates in real time.
     pub seat_sender: Option<SeatSender>,
@@ -76,6 +83,12 @@ pub type PromptSender = std::sync::Arc<dyn Fn(&str, String, String, String) + Se
 /// appear in their sidebar at once: seating rewrites no session row, so the
 /// feed's change-detector alone would stay silent until an unrelated edit.
 pub type SeatSender = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// `queue_sender()` — fire-and-forget, called the moment the message queue
+/// changes (a message queued, started, or dequeued). The host wires this to
+/// its live event feed so every open browser's "waiting for" card follows
+/// the queue as it happens.
+pub type QueueSender = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// Tell the host a session's roster just changed (see [`SeatSender`]).
 fn seat_changed(st: &AppState, session: &str) {
@@ -140,6 +153,8 @@ impl AppState {
                 .enable_all()
                 .build()?,
             prompt_sender: None,
+            queues: crate::queue::Queues::new(),
+            queue_sender: None,
             seat_sender: None,
         })
     }
@@ -404,20 +419,10 @@ pub fn reconstruct_from_events(events: Vec<EventWrapper>) -> Vec<Value> {
             }));
             continue;
         }
-        // The turn queue: this turn waited for a free slot of its model
-        // before inference could start. Kept because "why did nothing
-        // happen for a minute?" is answered by it.
-        if wrap.event_type == "queued" {
-            let spec = po.get("spec").and_then(Value::as_str).unwrap_or("");
-            let position = po.get("position").and_then(Value::as_i64).unwrap_or(1);
-            messages.push(json!({
-                "id": eid, "eventId": eid, "kind": "queued",
-                "text": format!("waiting for {spec} slot…"),
-                "spec": spec, "position": position,
-                "visible": visible, "goto": goto,
-            }));
-            continue;
-        }
+        // `queued` events produce no row: the "waiting for" card is live
+        // state (the queue projection), never history. A wait that has
+        // passed leaves nothing behind — including the model-slot waits of
+        // old turns, which this used to rebuild as rows.
         // A question the person was asked mid-turn, and what they said.
         // Kept because "why did it not read that file?" is answered by the
         // denial, and because an approval already given is the record that
@@ -1218,6 +1223,10 @@ impl Server {
                             &json!({
                                 "session": meta,
                                 "messages": reconstruct_messages(&st.store, id),
+                                // Pending work, not history: the messages
+                                // still in the queue are drawn by the
+                                // "waiting for" card and nowhere else.
+                                "queue": crate::queue::snapshot(&st.store, id),
                                 // The roster and the cursor are what the
                                 // multi-participant UI draws from; a
                                 // two-seat chat simply has two entries.
@@ -1533,6 +1542,47 @@ impl Server {
                 // `Cancels::stop`.
                 let stopped = st.cancels.stop(&session);
                 sink.json(200, &json!({ "ok": true, "stopped": stopped, "sessionId": session }))
+            }
+
+            // ---- dequeue ---------------------------------------------------
+            //
+            // Take a queued message back before it ever runs. Only a message
+            // still waiting can be taken back: one that has started has no
+            // queue row left (its turn owns it now), so the answer to
+            // dequeueing a running turn is "no longer queued" — a running
+            // turn is stopped, not taken back.
+            ("POST", path) if path.starts_with("/api/sessions/") && path.ends_with("/dequeue") => {
+                let rest = &path["/api/sessions/".len()..];
+                let session = rest.trim_end_matches('/').trim_end_matches("dequeue").trim_end_matches('/');
+                let body = req.json();
+                let item = body
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if session.is_empty() || item.is_empty() {
+                    sink.json(400, &json!({ "ok": false, "error": "sessionId and itemId required" }));
+                    return;
+                }
+                match st.store.queue_remove(session, &item) {
+                    Some(row) => {
+                        if let Some(send) = &st.queue_sender {
+                            send();
+                        }
+                        // The text goes back to the composer: it was typed
+                        // and never said.
+                        sink.json(200, &json!({
+                            "ok": true,
+                            "sessionId": session,
+                            "itemId": item,
+                            "text": row.get("text").cloned().unwrap_or(Value::Null),
+                        }))
+                    }
+                    None => sink.json(
+                        404,
+                        &json!({ "ok": false, "error": "that message is no longer queued" }),
+                    ),
+                }
             }
 
             // Not ported yet — answered explicitly so the UI sees a clear

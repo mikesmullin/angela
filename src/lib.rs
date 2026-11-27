@@ -53,6 +53,7 @@ pub mod migrate;
 pub mod mcp_presets;
 pub mod media;
 pub mod project;
+pub mod queue;
 pub mod relevance;
 pub mod sandbox;
 pub mod serve;
