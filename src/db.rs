@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when the DDL below changes in a way an existing file must be
 /// brought forward to. Recorded in `schema_meta`.
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 16;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS conversation (
     routing          TEXT NOT NULL DEFAULT 'everyone',
     purpose          TEXT,
     notes            TEXT,
+    soul_appendage   TEXT,
     -- memory tree budget; NULL = the module default
     memory_high      INTEGER,
     -- 'jsonl' on a conversation that came in from the legacy files
@@ -111,6 +112,8 @@ CREATE TABLE IF NOT EXISTS session_sandbox (
     agent_name   TEXT NOT NULL,                  -- agents.name; no FK (the definition may be renamed later)
     container_id TEXT NOT NULL,                  -- sbox-b's id, == the container id
     created_at   TEXT NOT NULL,
+    mount_path   TEXT,
+    git_dir      TEXT,
     PRIMARY KEY (session_id, agent_name)
 );
 
@@ -498,6 +501,8 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
     // fragile than reading `pragma_table_info` for each one.
     for stmt in [
         "ALTER TABLE projects ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE session_sandbox ADD COLUMN mount_path TEXT",
+        "ALTER TABLE session_sandbox ADD COLUMN git_dir TEXT",
         "ALTER TABLE participants ADD COLUMN engagement TEXT",
         "ALTER TABLE agents ADD COLUMN accent_color TEXT",
         "ALTER TABLE agents ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''",
@@ -509,6 +514,7 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE conversation ADD COLUMN worktree TEXT",
         "ALTER TABLE conversation ADD COLUMN branch_ref TEXT",
         "ALTER TABLE conversation ADD COLUMN workspace_root TEXT",
+        "ALTER TABLE conversation ADD COLUMN soul_appendage TEXT",
         // Per-user profile (the settings panel stopped being global): a
         // user's location is theirs alone, and starts empty — a new account
         // inherits nothing (PLAN44). The username is immutable: it lives in

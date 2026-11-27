@@ -1206,7 +1206,10 @@ pub fn run_turn(
     let system = task
         .as_ref()
         .map(|t| t.system_prompt.clone())
-        .unwrap_or_else(|| def.system_prompt());
+        .unwrap_or_else(|| {
+            let view = store.effective_session(&session_id).unwrap_or(Value::Null);
+            def.system_prompt_with_appendage(view["effective"]["soulAppendage"].as_str().unwrap_or(""))
+        });
     let prompt = task
         .as_ref()
         .map(|t| t.prompt.clone())
@@ -2640,7 +2643,8 @@ fn run_participant(
         // Fall back to the agent definition, with the participant's identity
         // appended: an agent that does not know its own handle cannot be
         // told apart from its peers in the flattened room.
-        let base = def.system_prompt();
+        let view = store.effective_session(conv).unwrap_or(Value::Null);
+        let base = def.system_prompt_with_appendage(view["effective"]["soulAppendage"].as_str().unwrap_or(""));
         format!(
             "{base}\n\nYou are @{} in a conversation with other participants. \
              Reply as yourself only.",
@@ -3002,7 +3006,10 @@ fn decide_now(
         .agent_name
         .as_deref()
         .and_then(|n| store.agents().get(n))
-        .map(|d| d.system_prompt())
+        .map(|d| {
+            let view = store.effective_session(conv).unwrap_or(Value::Null);
+            d.system_prompt_with_appendage(view["effective"]["soulAppendage"].as_str().unwrap_or(""))
+        })
         .unwrap_or_else(|| me.system_prompt.clone());
     let verdict = crate::relevance::should_speak(rt, stop, me, &identity, &history);
 

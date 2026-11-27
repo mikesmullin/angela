@@ -474,9 +474,12 @@ pub fn plan(
         .agent_name
         .as_deref()
         .and_then(|n| store.agents().get(n))
-        .map(|d| d.system_prompt())
+        .map(|d| d.system_prompt_with_appendage(header.get("soulAppendage").and_then(|v| v.as_str()).unwrap_or("")))
         .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| me.system_prompt.clone());
+        .unwrap_or_else(|| {
+            let extra = header.get("soulAppendage").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if extra.is_empty() { me.system_prompt.clone() } else { format!("{}\n\n{}", me.system_prompt.trim(), extra) }
+        });
     let name = if me.display_name.trim().is_empty() {
         me.handle.clone()
     } else {
@@ -1203,6 +1206,25 @@ mod tests {
         assert!(sys.contains("Never paste secrets."));
         // Standing framing belongs in the system prompt, said once.
         assert_eq!(sys.matches("Coordinate incident response").count(), 1);
+    }
+
+    #[test]
+    fn soul_appendage_is_inherited_and_resolved_on_each_turn() {
+        let (store, id, roster) = room();
+        let alice = roster.iter().find(|p| p.handle == "alice").unwrap().clone();
+        let def = crate::agent_loader::AgentDef { name: "alice".into(), soul: "Original soul".into(), goals: "Goals text".into(), ..Default::default() };
+        store.agents().save(&def, None).unwrap();
+        store.assign_project(&id, "parent/child").unwrap();
+        store.set_project_props("parent", &json!({"soulAppendage":"Group instructions"})).unwrap();
+        let before = plan(&store, &id, &alice, 0, true, "x").unwrap().system_prompt;
+        assert!(before.contains("Original soul\n\nGroup instructions\n\n## Goals"));
+        let mut patch = serde_json::Map::new();
+        patch.insert("soulAppendage".into(), json!("Session override"));
+        store.update_meta(&id, patch).unwrap();
+        let after = plan(&store, &id, &alice, 0, true, "x").unwrap().system_prompt;
+        assert!(after.contains("Original soul\n\nSession override\n\n## Goals"));
+        assert!(!after.contains("Group instructions"));
+        assert_eq!(store.agents().get("alice").unwrap().soul, "Original soul");
     }
 
     #[test]

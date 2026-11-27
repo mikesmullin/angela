@@ -81,6 +81,8 @@ pub trait Backend: Send + Sync {
         worktree_path: &str,
         repo_git_dir: &str,
     ) -> Result<String, String>;
+    /// Make the explicitly mounted checkout usable by Git inside the guest.
+    fn prepare_worktree(&self, _id: &str) -> Result<(), String> { Ok(()) }
     /// The container's state (`ready`, `starting`, …), `None` when sbox-b no
     /// longer tracks it.
     fn state(&self, id: &str) -> Option<String>;
@@ -213,6 +215,50 @@ fn create_and_wait(
 /// * `Err(msg)` — the agent has a Containerfile but no sandbox could be
 ///   provided. **Not** a fallback to the host: an agent that is defined to run
 ///   in a sandbox must never quietly write to the host instead.
+/// Resolve the checkout or workspace actually mounted at /work. Authored
+/// worktrees win; inherited records are kept separately from authored meta.
+fn session_mount(store: &ConvStore, session_id: &str) -> Result<(String, String), String> {
+    let view = store.effective_session(session_id).ok_or("session not found")?;
+    let session = &view["session"];
+    let effective = &view["effective"];
+    let authored = session.get("worktree").filter(|v| v.is_object());
+    let inherited_configured = effective.get("worktree").is_some_and(Value::is_object);
+    let record = authored.cloned().or_else(|| {
+        if !inherited_configured { return None; }
+        let config = &effective["worktree"];
+        store.inherited_worktree(session_id).filter(|record| {
+            ["repoId", "branchPattern", "pathPattern"].iter().all(|key| {
+                record.get(*key).and_then(Value::as_str).unwrap_or("")
+                    == config.get(*key).and_then(Value::as_str).unwrap_or("")
+            })
+        })
+    });
+    if let Some(record) = record {
+        if !record.get("provisioned").and_then(Value::as_bool).unwrap_or(false) {
+            return Err("worktree is not provisioned".into());
+        }
+        let path = record.get("path").and_then(Value::as_str).unwrap_or("");
+        if !Path::new(path).is_absolute() || !Path::new(path).is_dir() {
+            return Err("worktree path is not an existing absolute directory".into());
+        }
+        let output = std::process::Command::new("git")
+            .args(["-C", path, "rev-parse", "--git-common-dir"])
+            .output().map_err(|e| format!("cannot inspect worktree git directory: {e}"))?;
+        if !output.status.success() { return Err("cannot inspect worktree git directory".into()); }
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let common = Path::new(&raw);
+        let common = if common.is_absolute() { common.to_path_buf() } else { Path::new(path).join(common) };
+        let common = common.canonicalize().map_err(|e| format!("cannot resolve worktree git directory: {e}"))?;
+        return Ok((path.to_string(), common.to_string_lossy().into_owned()));
+    }
+    if inherited_configured { return Err("inherited worktree is not provisioned".into()); }
+    let workspace = effective.get("workspaceRoot").and_then(Value::as_str).unwrap_or("").trim();
+    if !workspace.is_empty() && (!Path::new(workspace).is_absolute() || !Path::new(workspace).is_dir()) {
+        return Err("workspace root is not an existing absolute directory".into());
+    }
+    Ok((workspace.to_string(), String::new()))
+}
+
 pub fn ensure(
     store: &ConvStore,
     session_id: &str,
@@ -223,22 +269,30 @@ pub fn ensure(
     if containerfile.is_empty() {
         return Ok(None);
     }
-    // Reuse a living one if this (session, agent) already has one.
+    // Recheck for the actual participant as well as the queue's agent: a
+    // group turn can launch a different sandboxed participant.
+    let effective = store.effective_session(session_id).ok_or("session not found")?["effective"].clone();
+    crate::session_props::check(&effective, def)?;
+    let (worktree, git_dir) = session_mount(store, session_id)?;
     if let Some(cid) = store.sandbox_for(session_id, &def.name) {
         if live(backend().ok().and_then(|be| be.state(&cid)).as_deref()) {
+            let prior = store.sandbox_mount(session_id, &def.name);
+            let matches = prior.as_ref().is_some_and(|(p, g)| p == &worktree && g == &git_dir)
+                || (prior.is_none() && worktree.is_empty() && git_dir.is_empty());
+            if !matches {
+                return Err(format!("the existing sandbox for @{} has different or unknown mounts; remove it before starting a turn with the new checkout", def.name));
+            }
+            if !git_dir.is_empty() { backend()?.prepare_worktree(&cid)?; }
             return Ok(Some(cid));
         }
-        // Stale: the container is gone. Drop the mapping; recreate below.
         store.forget_sandbox(session_id, &def.name);
     }
-    // The container is the containment boundary: an agent that runs in one
-    // never mounts the host's checkout or workspace root. No mount means
-    // no host path, no git state, nothing to repair — the session's git
-    // record stays with the editor as bookkeeping.
-    let (worktree, git_dir) = (String::new(), String::new());
     let cid = create_and_wait(cancel, &image_for(containerfile), &worktree, &git_dir)
         .map_err(|e| format!("could not start the sandbox for @{}: {e}", def.name))?;
     store.set_sandbox(session_id, &def.name, &cid);
+    store.set_sandbox_mount(session_id, &def.name, &worktree, &git_dir)
+        .map_err(|e| format!("could not record sandbox mounts: {e}"))?;
+    if !git_dir.is_empty() { backend()?.prepare_worktree(&cid)?; }
     Ok(Some(cid))
 }
 
@@ -360,15 +414,17 @@ mod tests {
     struct MockBackend {
         boot_polls: Arc<AtomicU32>,
         destroyed: Arc<Mutex<Vec<String>>>,
+        mounts: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl Backend for MockBackend {
         fn create(
             &self,
             _image: &str,
-            _worktree_path: &str,
-            _repo_git_dir: &str,
+            worktree_path: &str,
+            repo_git_dir: &str,
         ) -> Result<String, String> {
+            self.mounts.lock().unwrap().push((worktree_path.to_string(), repo_git_dir.to_string()));
             Ok("mock-container".into())
         }
         fn state(&self, _id: &str) -> Option<String> {
@@ -398,12 +454,34 @@ mod tests {
     }
 
     #[test]
+    fn inherited_checkout_and_its_git_directory_are_mounts() {
+        let root = std::env::temp_dir().join(format!("sandbox-mount-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let status = std::process::Command::new("git").args(["init", "-q"]).arg(&root).status().unwrap();
+        assert!(status.success());
+        let store = ConvStore::memory(&root).unwrap();
+        let session = store.create(crate::session_store::NewSession::default()).unwrap();
+        let id = session["id"].as_str().unwrap();
+        store.assign_project(id, "parent/child").unwrap();
+        store.set_project_props("parent", &json!({"workspaceRoot": "/tmp", "worktree": {"repoId": "repo", "branchPattern": "chat/{{hex}}"}})).unwrap();
+        let path = root.canonicalize().unwrap();
+        store.set_inherited_worktree(id, &json!({"path": path, "provisioned": true, "repoId": "repo", "branchPattern": "chat/{{hex}}"})).unwrap();
+        let (mount, git) = session_mount(&store, id).unwrap();
+        assert_eq!(std::path::PathBuf::from(mount), path);
+        assert_eq!(std::path::PathBuf::from(git), path.join(".git").canonicalize().unwrap());
+        assert!(store.load(id).unwrap()["worktree"].is_null());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn a_first_turn_boots_the_container_and_the_session_owns_it() {
         let probes = Arc::new(AtomicU32::new(0));
         let destroyed = Arc::new(Mutex::new(Vec::new()));
+        let mounts = Arc::new(Mutex::new(Vec::new()));
         set_backend(Box::new(MockBackend {
             boot_polls: Arc::clone(&probes),
             destroyed: Arc::clone(&destroyed),
+            mounts: Arc::clone(&mounts),
         }));
 
         let store = ConvStore::memory("/tmp/sandbox-policy-test").unwrap();
@@ -421,16 +499,24 @@ mod tests {
         let host_def = AgentDef::default();
         assert_eq!(ensure(&store, &id, &host_def, &Cancel::never()).unwrap(), None);
 
+        store.assign_project(&id, "a/child").unwrap();
+        store.set_project_props("a", &json!({"workspaceRoot": "/tmp"})).unwrap();
         // The sandboxed agent: the turn must block until the box is ready —
         // several state probes, not zero.
         let got = ensure(&store, &id, &def, &Cancel::never()).unwrap();
         assert_eq!(got.as_deref(), Some("mock-container"));
+        assert_eq!(*mounts.lock().unwrap(), vec![("/tmp".to_string(), String::new())]);
         let polled = probes.load(Ordering::SeqCst);
         assert!(polled >= 3, "the turn polled the state {polled} times — it must wait for ready");
         assert_eq!(store.sandbox_for(&id, "video").as_deref(), Some("mock-container"));
 
         // A second turn reuses the mapping — no new container.
         assert_eq!(ensure(&store, &id, &def, &Cancel::never()).unwrap().as_deref(), Some("mock-container"));
+
+        // A changed mount cannot silently reuse a living sandbox.
+        store.set_project_props("a", &json!({"workspaceRoot": "/"})).unwrap();
+        assert!(ensure(&store, &id, &def, &Cancel::never()).unwrap_err().contains("different or unknown mounts"));
+        store.set_project_props("a", &json!({"workspaceRoot": "/tmp"})).unwrap();
 
         // The menu annotates the container with its (session, agent).
         let menu = list_for_menu(&store).unwrap();

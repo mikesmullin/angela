@@ -182,7 +182,16 @@ impl AgentDef {
     /// cannot tell its own standing instructions from a note it left itself
     /// last week — and it is allowed to rewrite only the latter.
     pub fn system_prompt(&self) -> String {
+        self.system_prompt_with_appendage("")
+    }
+
+    pub fn system_prompt_with_appendage(&self, appendage: &str) -> String {
         let mut out = self.soul.trim().to_string();
+        let extra = appendage.trim();
+        if !extra.is_empty() {
+            if !out.is_empty() { out.push_str("\n\n"); }
+            out.push_str(extra);
+        }
         let goals = self.goals.trim();
         if !goals.is_empty() {
             if !out.is_empty() {

@@ -372,7 +372,7 @@ impl ConvStore {
                         context_window, mcp, project_root, project, sandbox, worktree,
                         branch_ref, config, overrides, turns,
                         round_index, round_status, routing, purpose, notes, memory_high,
-                        legacy_format, created_at, updated_at, workspace_root
+                        legacy_format, created_at, updated_at, workspace_root, soul_appendage
                    FROM conversation WHERE id = ?1",
                 params![id],
                 |r| {
@@ -416,6 +416,7 @@ impl ConvStore {
                         "createdAt": r.get::<_, String>(31)?,
                         "updatedAt": r.get::<_, String>(32)?,
                         "workspaceRoot": r.get::<_, Option<String>>(33)?,
+                        "soulAppendage": r.get::<_, Option<String>>(34)?,
                         // The stored record is a JSON text; anything else — a
                         // legacy plain string (a bare id), or junk — is not a
                         // checkout, and reads back as null.
@@ -500,6 +501,7 @@ impl ConvStore {
             "roundStatus" | "round_status" => "round_status",
             "routing" => "routing",
             "purpose" => "purpose",
+            "soulAppendage" | "soul_appendage" => "soul_appendage",
             "notes" => "notes",
             "memoryHigh" | "memory_high" => "memory_high",
             // JSON-valued columns
@@ -997,6 +999,22 @@ impl ConvStore {
                 params![conv, agent, container_id, now_iso()],
             );
         })
+    }
+
+    /// Remember the bind mounts so a running sandbox is never reused after
+    /// its session's checkout changes. NULL identifies an older unknown mount.
+    pub fn sandbox_mount(&self, conv: &str, agent: &str) -> Option<(String, String)> {
+        self.with(|c| c.query_row(
+            "SELECT mount_path, git_dir FROM session_sandbox WHERE session_id = ?1 AND agent_name = ?2",
+            params![conv, agent], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+        ).optional().ok().flatten().and_then(|(path, git)| Some((path?, git?))))
+    }
+
+    pub fn set_sandbox_mount(&self, conv: &str, agent: &str, path: &str, git: &str) -> rusqlite::Result<()> {
+        self.with(|c| c.execute(
+            "UPDATE session_sandbox SET mount_path = ?1, git_dir = ?2 WHERE session_id = ?3 AND agent_name = ?4",
+            params![path, git, conv, agent],
+        ).and_then(|n| if n == 1 { Ok(()) } else { Err(rusqlite::Error::QueryReturnedNoRows) }))
     }
 
     /// Every (agent, container_id) pair the session owns, for a teardown on delete.

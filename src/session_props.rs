@@ -10,9 +10,8 @@
 //! what the embedder just did.
 //!
 //! The hook is **agent-aware**: it is told the agent whose turn is asking,
-//! and may answer differently per agent. An agent that runs in its own
-//! container never gets gated — the container is the containment boundary,
-//! so no host path or checkout is required of it.
+//! and may answer differently per agent. Configured sandbox mounts must be
+//! validated before a container is created.
 //!
 //! The two hooks are process-wide and first-call-wins, like every other
 //! seam in this crate: [`set_check`] answers "is this session ready?", and

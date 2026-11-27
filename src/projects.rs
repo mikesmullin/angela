@@ -89,7 +89,7 @@ fn is_descendant(to: &str, from: &str) -> bool {
 
 /// Properties that a project can supply to descendants. Identity, roster and
 /// runtime state are intentionally excluded. Empty and null values inherit.
-pub const INHERITABLE: &[&str] = &["purpose", "notes", "routing", "memoryHigh", "workspaceRoot", "worktree"];
+pub const INHERITABLE: &[&str] = &["purpose", "notes", "routing", "memoryHigh", "workspaceRoot", "worktree", "soulAppendage", "defaultAgents"];
 
 pub fn ancestors(raw: &str) -> Vec<String> {
     let Ok(name) = normalize(raw) else { return Vec::new() };
@@ -155,6 +155,20 @@ impl ConvStore {
             if !obj.get(key).is_some_and(present) { obj.insert(key.clone(), value.clone()); }
         }
         Some(json!({"session": session, "effective": effective, "inherited": inherited, "chain": chain}))
+    }
+
+    /// The nearest explicit list replaces the parent list, including an
+    /// explicitly empty list. It is used only when a session is created.
+    pub fn project_default_agents(&self, project: &str) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        for ancestor in ancestors(project) {
+            let props = self.project_props(&ancestor);
+            if let Some(value) = props.get("defaultAgents") {
+                let list = value.as_array().ok_or("invalid default agents")?;
+                names = list.iter().map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_string).ok_or_else(|| "invalid default agent name".to_string())).collect::<Result<Vec<_>, _>>()?;
+            }
+        }
+        Ok(names)
     }
 
     pub fn inherited_worktree(&self, id: &str) -> Option<Value> {
@@ -464,6 +478,17 @@ mod tests {
         s.rename_project("a", "z").unwrap();
         assert_eq!(s.project_props("z")["notes"], "root notes");
         assert_eq!(s.effective_session(&id).unwrap()["effective"]["notes"], "root notes");
+    }
+
+    #[test]
+    fn default_agents_follow_nearest_project_and_empty_list_overrides() {
+        let s = store();
+        s.set_project_props("a", &json!({"defaultAgents":["alice", "bob"]})).unwrap();
+        assert_eq!(s.project_default_agents("a/b/c").unwrap(), vec!["alice", "bob"]);
+        s.set_project_props("a/b", &json!({"defaultAgents":["coder"]})).unwrap();
+        assert_eq!(s.project_default_agents("a/b/c").unwrap(), vec!["coder"]);
+        s.set_project_props("a/b/c", &json!({"defaultAgents":[]})).unwrap();
+        assert!(s.project_default_agents("a/b/c").unwrap().is_empty());
     }
 
     #[test]

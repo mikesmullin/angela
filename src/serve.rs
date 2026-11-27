@@ -909,6 +909,23 @@ impl Server {
                 let body = req.json();
                 let agent = body.get("agent").and_then(|v| v.as_str()).map(String::from);
                 let model = body.get("model").and_then(|v| v.as_str()).map(String::from);
+                let project = body.get("project").and_then(Value::as_str).unwrap_or("").trim();
+                if !project.is_empty() {
+                    if let Err(error) = crate::projects::normalize(project) {
+                        sink.json(400, &json!({"ok": false, "error": error}));
+                        return;
+                    }
+                }
+                let mut default_agents = Vec::new();
+                match st.store.project_default_agents(project) {
+                    Ok(names) => for name in names {
+                        match st.store.agents().get(&name) {
+                            Some(def) => default_agents.push(def),
+                            None => { sink.json(400, &json!({"ok": false, "error": format!("default agent no longer exists: {name}")})); return; }
+                        }
+                    },
+                    Err(error) => { sink.json(400, &json!({"ok": false, "error": error})); return; }
+                }
                 match st.store.create(NewSession {
                     agent,
                     model,
@@ -918,7 +935,27 @@ impl Server {
                         .map(String::from),
                     ..Default::default()
                 }) {
-                    Ok(s) => sink.json(200, &json!({ "ok": true, "session": s })),
+                    Ok(s) => {
+                        if !project.is_empty() {
+                            let id = s["id"].as_str().unwrap_or("");
+                            if let Err(error) = st.store.assign_project(id, project) {
+                                sink.json(500, &json!({"ok": false, "error": error}));
+                                return;
+                            }
+                            let mut seated = 0;
+                            for def in &default_agents {
+                                if st.store.invite_mentioned_agent(id, def).is_none() {
+                                    sink.json(500, &json!({"ok": false, "error": format!("could not invite default agent: {}", def.name)}));
+                                    return;
+                                }
+                                seated += 1;
+                            }
+                            if seated > 0 { seat_changed(st, id); }
+                            sink.json(200, &json!({ "ok": true, "session": st.store.load(id) }))
+                        } else {
+                            sink.json(200, &json!({ "ok": true, "session": s }))
+                        }
+                    }
                     Err(e) => sink.json(500, &json!({ "error": e.to_string() })),
                 }
             }
@@ -1198,7 +1235,7 @@ impl Server {
                 }
                 let body = req.json();
                 let mut patch = Map::new();
-                for key in ["purpose", "notes", "routing", "memoryHigh", "title", "workspaceRoot", "worktree"] {
+                for key in ["purpose", "notes", "routing", "memoryHigh", "title", "workspaceRoot", "worktree", "soulAppendage"] {
                     if let Some(v) = body.get(key) {
                         patch.insert(key.to_string(), v.clone());
                     }
