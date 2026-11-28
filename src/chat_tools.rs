@@ -9,6 +9,14 @@ use crate::serve::AppState;
 
 const PREFIX: &str = "chat";
 
+pub type ExtraTools = Arc<dyn Fn(&mut Agent, &str) + Send + Sync>;
+
+static EXTRA: std::sync::OnceLock<ExtraTools> = std::sync::OnceLock::new();
+
+pub fn set_extra_tools(f: ExtraTools) {
+    let _ = EXTRA.set(f);
+}
+
 const READ_CAP: usize = 48 * 1024;
 
 fn tool_name(tool: &str) -> String {
@@ -88,6 +96,10 @@ pub fn register(
 ) -> usize {
     let enforce = !policy_mode.eq_ignore_ascii_case("auto");
     let mut n = 0;
+
+    if let Some(extra) = EXTRA.get() {
+        extra(agent, session);
+    }
 
     let a = Arc::clone(app);
     if one(

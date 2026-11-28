@@ -11,6 +11,12 @@ pub const CAPABILITIES: &[&str] = &[
     "automation.create",
     "project.create",
     "sandbox.create",
+    "repo.manage",
+    "pr.create",
+    "pr.review",
+    "pr.merge",
+    "job.manage",
+    "job.trigger",
 ];
 
 pub const PRIVILEGES: &[&str] = &[

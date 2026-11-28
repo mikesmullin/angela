@@ -6,6 +6,8 @@ use crate::session_store::now_iso;
 pub const KEYS: &[(&str, &str)] = &[
     ("user__full_name", "The user's full name"),
     ("location", "Where the user is, e.g. \"City, State\""),
+    ("vcs__merge_name", "Merge commit identity: name"),
+    ("vcs__merge_email", "Merge commit identity: email"),
 ];
 
 pub fn is_known(key: &str) -> bool {
